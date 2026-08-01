@@ -636,41 +636,110 @@ bool AudioSink::ResolveDeviceEpoch(int64_t timestamp_frame,
             resume_restart_origin_.load(std::memory_order_acquire);
     const int64_t continuing_write_head = current_app_frame - continuing_origin;
     const int64_t restarted_write_head = current_app_frame - restart_origin;
+    const int64_t stream_lifetime_write_head = current_app_frame;
     const int64_t max_queue_frames = static_cast<int64_t>(
             kMaxTrustedOutputLatencySeconds * sample_rate_);
     const int64_t continuing_queue = continuing_write_head - timestamp_frame;
     const int64_t restarted_queue = restarted_write_head - timestamp_frame;
+    const int64_t stream_lifetime_queue =
+            stream_lifetime_write_head - timestamp_frame;
     const bool continuing_plausible = continuing_write_head >= 0 &&
             continuing_queue >= 0 && continuing_queue <= max_queue_frames;
     const bool restarted_plausible = restarted_write_head >= 0 &&
             restarted_queue >= 0 && restarted_queue <= max_queue_frames;
+    const bool stream_lifetime_plausible = stream_lifetime_write_head >= 0 &&
+            stream_lifetime_queue >= 0 &&
+            stream_lifetime_queue <= max_queue_frames;
     const int64_t reference =
             resume_reference_timestamp_frame_.load(std::memory_order_acquire);
 
+    constexpr uint64_t kUnresolvedEpochLogIntervalCallbacks = 128;
+    const auto log_unresolved_epoch = [&]() {
+        const uint64_t callbacks = callback_count_.load(std::memory_order_relaxed);
+        if (callbacks == 0 || callbacks % kUnresolvedEpochLogIntervalCallbacks == 0) {
+            __android_log_print(
+                    ANDROID_LOG_WARN, kTag,
+                    "AAudio resume epoch unresolved: timestamp=%lld continuing_queue=%lld restarted_queue=%lld stream_lifetime_queue=%lld",
+                    static_cast<long long>(timestamp_frame),
+                    static_cast<long long>(continuing_queue),
+                    static_cast<long long>(restarted_queue),
+                    static_cast<long long>(stream_lifetime_queue));
+        }
+    };
+
     bool restarted = false;
-    if (reference >= 0 && timestamp_frame < reference) {
-        restarted = true;
-    } else if (restarted_plausible && !continuing_plausible) {
-        restarted = true;
-    } else if (continuing_plausible && !restarted_plausible) {
-        restarted = false;
-    } else if (continuing_plausible && restarted_plausible) {
-        // Both epochs can look numerically sane after a very short pre-pause
-        // run. Choose the continuing mapping: if the HAL actually restarted,
-        // this produces a bounded lag instead of putting the media clock ahead
-        // of queued audio. The start-hint convergence guard can recover later.
-        restarted = false;
-        __android_log_print(
-                ANDROID_LOG_WARN, kTag,
-                "AAudio resume epoch is ambiguous: timestamp=%lld continuing_queue=%lld restarted_queue=%lld; choosing conservative continuing epoch",
-                static_cast<long long>(timestamp_frame),
-                static_cast<long long>(continuing_queue),
-                static_cast<long long>(restarted_queue));
+    int64_t resolved_origin = continuing_origin;
+    if (continuing_origin == 0 || restart_origin == 0) {
+        // Keep the original two-candidate behavior when origin zero is already
+        // represented by either existing candidate.
+        if (reference >= 0 && timestamp_frame < reference) {
+            restarted = true;
+        } else if (restarted_plausible && !continuing_plausible) {
+            restarted = true;
+        } else if (continuing_plausible && !restarted_plausible) {
+            restarted = false;
+        } else if (continuing_plausible && restarted_plausible) {
+            // Both epochs can look numerically sane after a very short pre-pause
+            // run. Choose the continuing mapping: if the HAL actually restarted,
+            // this produces a bounded lag instead of putting the media clock ahead
+            // of queued audio. The start-hint convergence guard can recover later.
+            restarted = false;
+            __android_log_print(
+                    ANDROID_LOG_WARN, kTag,
+                    "AAudio resume epoch is ambiguous: timestamp=%lld continuing_queue=%lld restarted_queue=%lld; choosing conservative continuing epoch",
+                    static_cast<long long>(timestamp_frame),
+                    static_cast<long long>(continuing_queue),
+                    static_cast<long long>(restarted_queue));
+        } else {
+            log_unresolved_epoch();
+            return false;
+        }
+        resolved_origin = restarted ? restart_origin : continuing_origin;
     } else {
-        return false;
+        const int plausible_candidates =
+                static_cast<int>(continuing_plausible) +
+                static_cast<int>(restarted_plausible) +
+                static_cast<int>(stream_lifetime_plausible);
+        if (reference >= 0 && timestamp_frame < reference) {
+            // Preserve the strong Samsung restart signal over numeric
+            // plausibility, as in the original two-candidate resolver.
+            restarted = true;
+            resolved_origin = restart_origin;
+        } else if (plausible_candidates == 1) {
+            if (continuing_plausible) {
+                resolved_origin = continuing_origin;
+            } else if (restarted_plausible) {
+                restarted = true;
+                resolved_origin = restart_origin;
+            } else {
+                resolved_origin = 0;
+            }
+        } else if (plausible_candidates > 1) {
+            // Origin zero is valid only as the sole plausible mapping. When
+            // mappings are ambiguous, prefer the existing continuing epoch;
+            // otherwise prefer the explicit restart candidate.
+            if (continuing_plausible) {
+                if (restarted_plausible) {
+                    __android_log_print(
+                            ANDROID_LOG_WARN, kTag,
+                            "AAudio resume epoch is ambiguous: timestamp=%lld continuing_queue=%lld restarted_queue=%lld; choosing conservative continuing epoch",
+                            static_cast<long long>(timestamp_frame),
+                            static_cast<long long>(continuing_queue),
+                            static_cast<long long>(restarted_queue));
+                }
+                resolved_origin = continuing_origin;
+            } else {
+                // With more than one plausible candidate, this path can only
+                // be reached with the restart and stream-lifetime candidates.
+                restarted = true;
+                resolved_origin = restart_origin;
+            }
+        } else {
+            log_unresolved_epoch();
+            return false;
+        }
     }
 
-    const int64_t resolved_origin = restarted ? restart_origin : continuing_origin;
     device_frame_origin_submitted_.store(resolved_origin, std::memory_order_release);
     device_epoch_mode_.store(
             static_cast<int>(resolved_origin == 0
