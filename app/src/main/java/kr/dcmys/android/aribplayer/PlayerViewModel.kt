@@ -1,9 +1,11 @@
 package kr.dcmys.android.aribplayer
 
+import android.content.ContentProviderClient
 import android.content.Context
 import android.content.Intent
 import android.database.Cursor
 import android.net.Uri
+import android.os.ParcelFileDescriptor
 import android.provider.OpenableColumns
 import android.view.Surface
 import androidx.lifecycle.ViewModel
@@ -27,6 +29,7 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import org.json.JSONObject
 import java.io.File
+import java.util.ArrayDeque
 
 enum class PlaybackState {
     IDLE,
@@ -96,6 +99,24 @@ enum class PlayerScreenDestination {
     PLAYER
 }
 
+private class PlaybackSourceLease(
+    val pfd: ParcelFileDescriptor,
+    private val client: ContentProviderClient?,
+) {
+    fun close() {
+        try {
+            pfd.close()
+        } catch (_: Exception) {
+            // Ignore close failures during playback teardown.
+        }
+        try {
+            client?.close()
+        } catch (_: Exception) {
+            // Ignore close failures during playback teardown.
+        }
+    }
+}
+
 class PlayerViewModel : ViewModel() {
     private val _uiState = MutableStateFlow(PlayerUiState())
     val uiState: StateFlow<PlayerUiState> = _uiState.asStateFlow()
@@ -135,6 +156,9 @@ class PlayerViewModel : ViewModel() {
         }
 
         override fun onState(state: Int) {
+            if (state == NativePlaybackState.CLOSED) {
+                releaseLeaseAfterClose()
+            }
             updateState { it.copy(playbackState = state.toUiPlaybackState()) }
         }
 
@@ -193,6 +217,8 @@ class PlayerViewModel : ViewModel() {
     private var captionIgnoreBackground = false
     private var captionForceOutlineText = false
     private var statsPollingJob: Job? = null
+    private var playbackSourceLease: PlaybackSourceLease? = null
+    private val leasesAwaitingClose = ArrayDeque<PlaybackSourceLease>()
 
     fun openDocument(context: Context, uri: Uri, startPositionMs: Long = 0L): Boolean {
         val safeStartPositionMs = startPositionMs.coerceAtLeast(0L)
@@ -238,15 +264,15 @@ class PlayerViewModel : ViewModel() {
         }
 
         return try {
-            context.contentResolver.openFileDescriptor(uri, "r").use { descriptor ->
-                checkNotNull(descriptor) { "The selected document could not be opened." }
-                if (controllerHolder.isInitialized()) controller.close()
+            val lease = context.openPlaybackSource(uri)
+            try {
+                if (controllerHolder.isInitialized()) closeCurrentSource()
                 check(controller.setCaptionStyle(
                     captionIgnoreBackground,
                     captionForceOutlineText,
                 )) { "The playback engine could not apply caption preferences." }
                 check(controller.open(
-                    descriptor.fd,
+                    lease.pfd.fd,
                     fontPath = context.ensureAribFontPath(),
                     displayName = displayName,
                     startPositionMs = safeStartPositionMs,
@@ -256,7 +282,11 @@ class PlayerViewModel : ViewModel() {
                 controller.setVideoMode(VideoMode.AUTO)
                 controller.setSubtitlesEnabled(_uiState.value.subtitlesEnabled)
                 attachedSurface?.let(controller::setSurface)
+                playbackSourceLease = lease
                 startStatsPolling()
+            } catch (error: Exception) {
+                lease.close()
+                throw error
             }
             true
         } catch (error: Exception) {
@@ -366,14 +396,37 @@ class PlayerViewModel : ViewModel() {
     fun closePlayer() {
         statsPollingJob?.cancel()
         statsPollingJob = null
-        if (controllerHolder.isInitialized()) runCatching { controller.close() }
+        closeCurrentSource()
         _uiState.value = PlayerUiState()
     }
 
     override fun onCleared() {
         statsPollingJob?.cancel()
-        if (controllerHolder.isInitialized()) controller.release()
+        if (controllerHolder.isInitialized()) runCatching { controller.release() }
+        playbackSourceLease?.close()
+        playbackSourceLease = null
+        while (leasesAwaitingClose.isNotEmpty()) leasesAwaitingClose.removeFirst().close()
         super.onCleared()
+    }
+
+    private fun closeCurrentSource() {
+        val lease = playbackSourceLease
+        playbackSourceLease = null
+        if (!controllerHolder.isInitialized()) {
+            lease?.close()
+            return
+        }
+        val closeAccepted = runCatching { controller.close() }.getOrDefault(false)
+        if (lease == null) return
+        if (closeAccepted) {
+            leasesAwaitingClose.addLast(lease)
+        } else {
+            lease.close()
+        }
+    }
+
+    private fun releaseLeaseAfterClose() {
+        if (leasesAwaitingClose.isNotEmpty()) leasesAwaitingClose.removeFirst().close()
     }
 
     private fun startStatsPolling() {
@@ -471,6 +524,27 @@ private fun JSONObject.optNullableString(name: String): String? =
     takeIf { has(name) && !isNull(name) }
         ?.optString(name)
         ?.takeIf { it.isNotBlank() }
+
+private fun Context.openPlaybackSource(uri: Uri): PlaybackSourceLease {
+    if (uri.scheme == "content") {
+        val client = uri.authority?.let { authority ->
+            runCatching { contentResolver.acquireContentProviderClient(authority) }.getOrNull()
+        }
+        if (client != null) {
+            val descriptor = runCatching { client.openFile(uri, "r") }.getOrNull()
+            if (descriptor != null) return PlaybackSourceLease(descriptor, client)
+            try {
+                client.close()
+            } catch (_: Exception) {
+                // Ignore close failures before resolver fallback.
+            }
+        }
+    }
+    val descriptor = checkNotNull(contentResolver.openFileDescriptor(uri, "r")) {
+        "The selected document could not be opened."
+    }
+    return PlaybackSourceLease(descriptor, null)
+}
 
 private fun Context.ensureAribFontPath(): String? = runCatching {
     val target = File(filesDir, "fonts/WLCMARU2004ARIBU.TTF")
