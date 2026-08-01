@@ -1,8 +1,10 @@
 #pragma once
 
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <functional>
+#include <mutex>
 #include <thread>
 
 #include "audio/PcmRing.h"
@@ -30,7 +32,9 @@ public:
     AudioDecoder& operator=(const AudioDecoder&) = delete;
 
     void Start();
-    void Stop();
+    // Signals all queue waits before waiting for the decode thread. Returns false
+    // after detaching a non-responsive thread; the owner must abandon this decoder.
+    bool Stop(int64_t timeout_ms = 500);
     // Drops queued work and asynchronously flushes codec/resampler state on
     // the decoder thread. serial must be the new demux seek generation.
     void Flush(int serial);
@@ -42,6 +46,7 @@ public:
 
 private:
     void DecodeLoop();
+    void FinishThread();
     bool DrainDecoder(int serial);
     bool ConvertFrame(const AVFrame& frame, int serial);
     bool ConfigureResampler(const AVFrame& frame, int serial);
@@ -59,6 +64,10 @@ private:
     int input_rate_ = 0;
     AVSampleFormat input_format_ = AV_SAMPLE_FMT_NONE;
     std::thread thread_;
+    std::mutex thread_mutex_;
+    std::condition_variable thread_cv_;
+    bool thread_finished_ = true;
+    bool thread_abandoned_ = false;
     std::atomic<bool> running_{false};
     std::atomic<bool> stop_requested_{false};
     std::atomic<int> requested_flush_serial_{-1};

@@ -3,6 +3,7 @@
 #include <android/log.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -52,6 +53,14 @@ SubtitleDecoder::~SubtitleDecoder() {
 
 void SubtitleDecoder::Start() {
     if (decoder_ == nullptr || running_.exchange(true, std::memory_order_acq_rel)) return;
+    {
+        std::lock_guard<std::mutex> lock(thread_mutex_);
+        if (thread_abandoned_) {
+            running_.store(false, std::memory_order_release);
+            return;
+        }
+        thread_finished_ = false;
+    }
     stop_requested_.store(false, std::memory_order_release);
     requested_flush_serial_.store(-1, std::memory_order_release);
     last_error_.store(0, std::memory_order_release);
@@ -62,12 +71,41 @@ void SubtitleDecoder::Start() {
     thread_ = std::thread(&SubtitleDecoder::DecodeLoop, this);
 }
 
-void SubtitleDecoder::Stop() {
+bool SubtitleDecoder::Stop(int64_t timeout_ms) {
     stop_requested_.store(true, std::memory_order_release);
     packets_.Abort();
     events_.Abort();
-    if (thread_.joinable()) thread_.join();
+    if (!thread_.joinable()) {
+        std::lock_guard<std::mutex> lock(thread_mutex_);
+        return !thread_abandoned_;
+    }
+
+    std::unique_lock<std::mutex> lock(thread_mutex_);
+    const bool finished = thread_cv_.wait_for(
+            lock, std::chrono::milliseconds(std::max<int64_t>(0, timeout_ms)),
+            [this] { return thread_finished_; });
+    lock.unlock();
+    if (!finished) {
+        thread_.detach();
+        std::lock_guard<std::mutex> abandoned_lock(thread_mutex_);
+        thread_abandoned_ = true;
+        __android_log_print(ANDROID_LOG_ERROR, kTag,
+                            "teardown: detaching subtitle decoder after %lldms timeout",
+                            static_cast<long long>(timeout_ms));
+        return false;
+    }
+    thread_.join();
     running_.store(false, std::memory_order_release);
+    return true;
+}
+
+void SubtitleDecoder::FinishThread() {
+    running_.store(false, std::memory_order_release);
+    {
+        std::lock_guard<std::mutex> lock(thread_mutex_);
+        thread_finished_ = true;
+    }
+    thread_cv_.notify_all();
 }
 
 void SubtitleDecoder::Flush(int serial) {
@@ -106,7 +144,7 @@ void SubtitleDecoder::DecodeLoop() {
         eof_drained_.store(false, std::memory_order_release);
         DecodePacket(*item.packet, item.serial);
     }
-    running_.store(false, std::memory_order_release);
+    FinishThread();
 }
 
 void SubtitleDecoder::DecodePacket(const AVPacket& packet, int serial) {

@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <condition_variable>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -151,21 +152,44 @@ public:
             running_ = false;
             return false;
         }
+        {
+            std::lock_guard<std::mutex> lock(thread_mutex_);
+            if (thread_abandoned_) {
+                running_ = false;
+                return false;
+            }
+            thread_finished_ = false;
+        }
         thread_ = std::thread(&Impl::Run, this);
         return true;
     }
 
-    void Stop() {
-        const bool was_running = running_.exchange(false);
-        if (was_running) {
-            frames_->Abort();
-            if (thread_.joinable()) thread_.join();
+    bool Stop(int64_t timeout_ms = 500) {
+        running_.store(false, std::memory_order_release);
+        if (frames_ != nullptr) frames_->Abort();
+        if (thread_.joinable()) {
+            std::unique_lock<std::mutex> lock(thread_mutex_);
+            const bool finished = thread_cv_.wait_for(
+                    lock, std::chrono::milliseconds(std::max<int64_t>(0, timeout_ms)),
+                    [this] { return thread_finished_; });
+            lock.unlock();
+            if (!finished) {
+                thread_.detach();
+                std::lock_guard<std::mutex> abandoned_lock(thread_mutex_);
+                thread_abandoned_ = true;
+                __android_log_print(ANDROID_LOG_ERROR, kTag,
+                                    "teardown: detaching render thread after %lldms timeout",
+                                    static_cast<long long>(timeout_ms));
+                return false;
+            }
+            thread_.join();
         }
         std::lock_guard<std::mutex> lock(window_mutex_);
         if (pending_window_ != nullptr) {
             ANativeWindow_release(pending_window_);
             pending_window_ = nullptr;
         }
+        return true;
     }
 
     void SetWindow(ANativeWindow* window) {
@@ -252,6 +276,11 @@ private:
             }
         }
         DestroyEgl();
+        {
+            std::lock_guard<std::mutex> lock(thread_mutex_);
+            thread_finished_ = true;
+        }
+        thread_cv_.notify_all();
     }
 
     void ApplyWindow() {
@@ -739,6 +768,10 @@ private:
     std::atomic<uint64_t> superimpose_reset_generation_{0};
     std::atomic<double> av_sync_ms_{0.0};
     std::thread thread_;
+    std::mutex thread_mutex_;
+    std::condition_variable thread_cv_;
+    bool thread_finished_ = true;
+    bool thread_abandoned_ = false;
 
     std::mutex window_mutex_;
     ANativeWindow* pending_window_ = nullptr;
@@ -776,7 +809,7 @@ GlRenderer::GlRenderer(FrameQueue* frames, SubtitleQueue* caption_events,
                                       std::move(subtitle_viewport_changed))) {}
 GlRenderer::~GlRenderer() = default;
 bool GlRenderer::Start() { return impl_->Start(); }
-void GlRenderer::Stop() { impl_->Stop(); }
+bool GlRenderer::Stop(int64_t timeout_ms) { return impl_->Stop(timeout_ms); }
 void GlRenderer::SetWindow(ANativeWindow* window) { impl_->SetWindow(window); }
 void GlRenderer::SetSerial(int serial) { impl_->SetSerial(serial); }
 void GlRenderer::SetSubtitlesEnabled(bool enabled) { impl_->SetSubtitlesEnabled(enabled); }

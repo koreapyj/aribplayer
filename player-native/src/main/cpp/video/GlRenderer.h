@@ -3,6 +3,7 @@
 #include <android/native_window.h>
 
 #include <atomic>
+#include <cstdint>
 #include <functional>
 #include <memory>
 
@@ -32,7 +33,9 @@ public:
     GlRenderer& operator=(const GlRenderer&) = delete;
 
     bool Start();
-    void Stop();
+    // Returns false after detaching a non-responsive render thread; the owner
+    // must abandon this renderer and its queues.
+    bool Stop(int64_t timeout_ms = 500);
     void SetWindow(ANativeWindow* window);
     void SetSerial(int serial);
     void SetSubtitlesEnabled(bool enabled);

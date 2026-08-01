@@ -54,6 +54,8 @@ constexpr int kStatePaused = 4;
 constexpr int kStateEnded = 5;
 constexpr int kStateClosed = 6;
 constexpr int kStateError = 7;
+constexpr int64_t kSessionTeardownBudgetMs = 2400;
+constexpr int64_t kReleaseTeardownBudgetMs = 2800;
 
 std::string AvError(int error) {
     char text[AV_ERROR_MAX_STRING_SIZE]{};
@@ -504,11 +506,36 @@ public:
     }
 
     ~Impl() {
+        // JNI calls ShutdownForRelease before destroying PlayerCore. Keeping this
+        // fallback bounded avoids an unbounded destructor wait in non-JNI callers.
+        if (control_thread_.joinable()) ShutdownForRelease(kReleaseTeardownBudgetMs);
+    }
+
+    bool ShutdownForRelease(int64_t timeout_ms) {
+        if (!control_thread_.joinable()) return !teardown_degraded_.load(std::memory_order_acquire);
+
         auto done = std::make_shared<std::promise<void>>();
         auto future = done->get_future();
-        Enqueue(Command{CommandType::kShutdown, -1, {}, {}, 0, nullptr, done});
-        future.wait();
-        if (control_thread_.joinable()) control_thread_.join();
+        {
+            std::lock_guard<std::mutex> lock(command_mutex_);
+            shutting_down_.store(true, std::memory_order_release);
+            commands_.push_back(Command{CommandType::kShutdown, -1, {}, {}, 0, nullptr, done});
+        }
+        command_cv_.notify_all();
+
+        const bool finished = future.wait_for(
+                std::chrono::milliseconds(std::max<int64_t>(0, timeout_ms))) ==
+                std::future_status::ready;
+        if (!finished) {
+            control_thread_.detach();
+            teardown_degraded_.store(true, std::memory_order_release);
+            __android_log_print(ANDROID_LOG_ERROR, kTag,
+                                "teardown: detaching control thread after %lldms timeout",
+                                static_cast<long long>(timeout_ms));
+            return false;
+        }
+        control_thread_.join();
+        return !teardown_degraded_.load(std::memory_order_acquire);
     }
 
     bool Open(int fd, std::string font, std::string name, int64_t start_position_ms) {
@@ -643,9 +670,14 @@ private:
                 switch (command.type) {
                     case CommandType::kOpen:
                         CloseSession(false);
-                        StartSession(command.fd, std::move(command.text),
-                                     std::move(command.display_name), command.value);
-                        command.fd = -1;
+                        if (!teardown_degraded_.load(std::memory_order_acquire)) {
+                            StartSession(command.fd, std::move(command.text),
+                                         std::move(command.display_name), command.value);
+                            command.fd = -1;
+                        } else {
+                            __android_log_print(ANDROID_LOG_ERROR, kTag,
+                                                "teardown: refusing open after abandoned worker");
+                        }
                         break;
                     case CommandType::kPlay: ApplyPlay(); break;
                     case CommandType::kPause: ApplyPause(); break;
@@ -724,11 +756,83 @@ private:
         clock_->SetAudioSink(nullptr);
         clock_->Reset(0.0);
         callbacks_->onState(kStateOpening);
+        {
+            std::lock_guard<std::mutex> lock(demux_mutex_);
+            demux_finished_ = false;
+        }
         demux_thread_ = std::thread(
                 &Impl::DemuxLoop, this, fd, std::max<int64_t>(0, start_position_ms));
     }
 
+    void SignalDemuxFinished() {
+        {
+            std::lock_guard<std::mutex> lock(demux_mutex_);
+            demux_finished_ = true;
+        }
+        demux_cv_.notify_all();
+    }
+
+    bool JoinDemuxWithin(int64_t timeout_ms) {
+        if (!demux_thread_.joinable()) return !demux_abandoned_;
+        std::unique_lock<std::mutex> lock(demux_mutex_);
+        const bool finished = demux_cv_.wait_for(
+                lock, std::chrono::milliseconds(std::max<int64_t>(0, timeout_ms)),
+                [this] { return demux_finished_; });
+        lock.unlock();
+        if (!finished) {
+            demux_thread_.detach();
+            demux_abandoned_ = true;
+            __android_log_print(ANDROID_LOG_ERROR, kTag,
+                                "teardown: detaching demux thread after %lldms timeout",
+                                static_cast<long long>(timeout_ms));
+            return false;
+        }
+        demux_thread_.join();
+        return true;
+    }
+
+    void AbandonSessionLocked() {
+        // A detached worker can still hold references to every queue and decoder
+        // in the session. Leak the complete graph rather than freeing memory it
+        // may touch; nativeRelease keeps this Impl alive until process exit.
+        teardown_degraded_.store(true, std::memory_order_release);
+        clock_->SetAudioSink(nullptr);
+        renderer_.release();
+        video_decoder_.release();
+        audio_decoder_.release();
+        subtitle_decoder_.release();
+        superimpose_decoder_.release();
+        audio_sink_.release();
+        pcm_ring_.release();
+        video_frames_.release();
+        subtitle_events_.release();
+        superimpose_events_.release();
+        video_packets_.release();
+        audio_packets_.release();
+        subtitle_packets_.release();
+        superimpose_packets_.release();
+        if (pending_window_ != nullptr) {
+            ANativeWindow_release(pending_window_);
+            pending_window_ = nullptr;
+        }
+        prepared_.store(false, std::memory_order_release);
+        seekable_.store(false, std::memory_order_release);
+        has_audio_master_.store(false, std::memory_order_release);
+        duration_ms_.store(0, std::memory_order_release);
+        clock_->Pause();
+    }
+
     void CloseSession(bool notify) {
+        const bool had_session = demux_thread_.joinable() || renderer_ || video_decoder_ ||
+                                 audio_decoder_ || subtitle_decoder_ || superimpose_decoder_ ||
+                                 audio_sink_;
+        const auto started = std::chrono::steady_clock::now();
+        const auto deadline = started + std::chrono::milliseconds(kSessionTeardownBudgetMs);
+        const auto remaining_ms = [&deadline] {
+            return std::max<int64_t>(0, std::chrono::duration_cast<std::chrono::milliseconds>(
+                    deadline - std::chrono::steady_clock::now()).count());
+        };
+
         stop_requested_.store(true, std::memory_order_release);
         want_playing_.store(false, std::memory_order_release);
         seek_ms_.store(-1);
@@ -744,47 +848,65 @@ private:
             std::lock_guard<std::mutex> lock(session_mutex_);
             if (audio_sink_) audio_sink_->Stop();
         }
-        if (demux_thread_.joinable()) demux_thread_.join();
 
-        std::lock_guard<std::mutex> lock(session_mutex_);
-        if (video_decoder_) video_decoder_->Stop();
-        if (audio_decoder_) audio_decoder_->Stop();
-        if (subtitle_decoder_) subtitle_decoder_->Stop();
-        if (superimpose_decoder_) superimpose_decoder_->Stop();
-        if (renderer_) renderer_->Stop();
-        if (audio_sink_) audio_sink_->Close();
-        clock_->SetAudioSink(nullptr);
-        renderer_.reset();
-        video_decoder_.reset();
-        audio_decoder_.reset();
-        subtitle_decoder_.reset();
-        superimpose_decoder_.reset();
-        audio_sink_.reset();
-        pcm_ring_.reset();
-        video_frames_.reset();
-        subtitle_events_.reset();
-        superimpose_events_.reset();
-        video_packets_.reset();
-        audio_packets_.reset();
-        subtitle_packets_.reset();
-        superimpose_packets_.reset();
-        if (pending_window_ != nullptr) {
-            ANativeWindow_release(pending_window_);
-            pending_window_ = nullptr;
+        const bool demux_clean = JoinDemuxWithin(remaining_ms());
+        bool clean = !teardown_degraded_.load(std::memory_order_acquire) && demux_clean;
+        {
+            std::lock_guard<std::mutex> lock(session_mutex_);
+            if (clean) {
+                if (video_decoder_) clean = video_decoder_->Stop(remaining_ms()) && clean;
+                if (audio_decoder_) clean = audio_decoder_->Stop(remaining_ms()) && clean;
+                if (subtitle_decoder_) clean = subtitle_decoder_->Stop(remaining_ms()) && clean;
+                if (superimpose_decoder_) clean = superimpose_decoder_->Stop(remaining_ms()) && clean;
+                if (renderer_) clean = renderer_->Stop(remaining_ms()) && clean;
+            }
+            if (!clean) {
+                AbandonSessionLocked();
+            } else {
+                if (audio_sink_) {
+                    audio_sink_->Close(std::min<int64_t>(2000, remaining_ms()) * 1000000LL);
+                }
+                clock_->SetAudioSink(nullptr);
+                renderer_.reset();
+                video_decoder_.reset();
+                audio_decoder_.reset();
+                subtitle_decoder_.reset();
+                superimpose_decoder_.reset();
+                audio_sink_.reset();
+                pcm_ring_.reset();
+                video_frames_.reset();
+                subtitle_events_.reset();
+                superimpose_events_.reset();
+                video_packets_.reset();
+                audio_packets_.reset();
+                subtitle_packets_.reset();
+                superimpose_packets_.reset();
+                if (pending_window_ != nullptr) {
+                    ANativeWindow_release(pending_window_);
+                    pending_window_ = nullptr;
+                }
+                prepared_.store(false, std::memory_order_release);
+                seekable_.store(false, std::memory_order_release);
+                has_audio_master_.store(false, std::memory_order_release);
+                duration_ms_.store(0, std::memory_order_release);
+                clock_->Pause();
+            }
         }
-        prepared_.store(false);
-        seekable_.store(false);
-        has_audio_master_.store(false);
-        duration_ms_.store(0);
-        clock_->Pause();
         if (notify) callbacks_->onState(kStateClosed);
+        const int64_t elapsed_ms = std::max<int64_t>(0, std::chrono::duration_cast<
+                std::chrono::milliseconds>(std::chrono::steady_clock::now() - started).count());
+        if (had_session) {
+            __android_log_print(ANDROID_LOG_INFO, kTag, "teardown: complete in %lldms%s",
+                                static_cast<long long>(elapsed_ms),
+                                clean ? "" : " (degraded)");
+        }
     }
 
     void ApplyPlay() {
         want_playing_.store(true);
         if (!prepared_.load()) return;
         std::lock_guard<std::mutex> lock(session_mutex_);
-        if (audio_sink_ && !audio_sink_->is_running() && !audio_sink_->Start()) {
+        if (audio_sink_ && !audio_sink_->is_running() && !audio_sink_->Resume()) {
             __android_log_print(ANDROID_LOG_ERROR, kTag,
                                 "AAudio start failed; continuing with video clock");
             has_audio_master_.store(false, std::memory_order_release);
@@ -916,10 +1038,11 @@ private:
         }
         if (subtitle_decoder_) subtitle_decoder_->Flush(next_serial);
         if (superimpose_decoder_) superimpose_decoder_->Flush(next_serial);
-        // Stop old-generation writes first, then make all old PCM unreachable,
-        // and only then expose the new sink timeline generation to callbacks.
-        if (pcm_ring_) pcm_ring_->Clear();
-        if (audio_sink_) audio_sink_->ResetTimeline();
+        // Stop old-generation writes first. ResetTimeline invalidates every
+        // anchor input before clearing PCM and generation-gates the asynchronous
+        // AAudio callback across both operations.
+        if (audio_sink_) audio_sink_->ResetTimeline(position_ms / 1000.0);
+        else if (pcm_ring_) pcm_ring_->Clear();
         clock_->Reset(position_ms / 1000.0);
         video_clock_anchored_.store(true, std::memory_order_release);
         if (want_playing_.load(std::memory_order_acquire)) {
@@ -1039,11 +1162,17 @@ private:
         {
             std::lock_guard<std::mutex> lock(session_mutex_);
             if (audio_sink_) audio_sink_->Pause();
-            if (audio_decoder_) audio_decoder_->Stop();
+            if (audio_decoder_ && !audio_decoder_->Stop()) {
+                teardown_degraded_.store(true, std::memory_order_release);
+                stop_requested_.store(true, std::memory_order_release);
+                __android_log_print(ANDROID_LOG_ERROR, kTag,
+                                    "teardown: abandoning session after audio decoder timeout during switch");
+                return false;
+            }
             audio_decoder_.reset();
             audio_packets_->Reset();
-            if (pcm_ring_) pcm_ring_->Clear();
-            if (audio_sink_) audio_sink_->ResetTimeline();
+            if (audio_sink_) audio_sink_->ResetTimeline(current_position);
+            else if (pcm_ring_) pcm_ring_->Clear();
 
             if (!OpenAudioPathLocked(
                         format, stream_index, dual_mono_mode, &error,
@@ -1125,7 +1254,13 @@ private:
                             PacketQueue& packets, SubtitleQueue& events) {
         std::lock_guard<std::mutex> lock(session_mutex_);
         if (decoder) {
-            decoder->Stop();
+            if (!decoder->Stop()) {
+                teardown_degraded_.store(true, std::memory_order_release);
+                stop_requested_.store(true, std::memory_order_release);
+                __android_log_print(ANDROID_LOG_ERROR, kTag,
+                                    "teardown: abandoning session after subtitle decoder timeout during rebind");
+                return false;
+            }
             decoder.reset();
         }
         packets.Reset();
@@ -1183,6 +1318,10 @@ private:
     }
 
     void DemuxLoop(int owned_fd, int64_t requested_start_position_ms) {
+        struct CompletionSignal {
+            Impl* impl;
+            ~CompletionSignal() { impl->SignalDemuxFinished(); }
+        } completion{this};
         std::unique_ptr<FdAvio> io = FdAvio::Create(owned_fd);
         if (!io) {
             Fail(1, "Unable to create file-descriptor input");
@@ -1751,6 +1890,11 @@ private:
 
     mutable std::mutex session_mutex_;
     std::thread demux_thread_;
+    std::mutex demux_mutex_;
+    std::condition_variable demux_cv_;
+    bool demux_finished_ = true;
+    bool demux_abandoned_ = false;
+    std::atomic<bool> teardown_degraded_{false};
     std::atomic<bool> stop_requested_{true};
     std::atomic<bool> prepared_{false};
     std::atomic<bool> seekable_{false};
@@ -1819,5 +1963,6 @@ void PlayerCore::setCaptionStyle(bool ignoreBackground, bool forceOutlineText) {
 int64_t PlayerCore::durationMs() const { return impl_->Duration(); }
 std::string PlayerCore::getStats() const { return impl_->Stats(); }
 void PlayerCore::close() { impl_->Close(); }
+bool PlayerCore::release(int64_t timeoutMs) { return impl_->ShutdownForRelease(timeoutMs); }
 
 } // namespace aribplayer

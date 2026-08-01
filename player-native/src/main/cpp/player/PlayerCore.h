@@ -32,6 +32,9 @@ public:
     int64_t durationMs() const;
     std::string getStats() const;
     void close();
+    // Waits only for the bounded shutdown budget. False means an active native
+    // thread was abandoned, so the caller must retain this PlayerCore until process exit.
+    bool release(int64_t timeoutMs);
 
 private:
     class Impl;

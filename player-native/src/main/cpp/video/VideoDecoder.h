@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -51,7 +52,9 @@ public:
     // Performs filter/OpenCL preparation synchronously before PlayerCore reports
     // the session prepared.
     void Prepare();
-    void Stop();
+    // Signals all queue waits before waiting for the decode thread. Returns false
+    // after detaching a non-responsive thread; the owner must abandon this decoder.
+    bool Stop(int64_t timeout_ms = 500);
     // Drops queued packets/frames and flushes codec/filter state on the decode thread.
     void Flush(int serial);
     // Flushes for a seek and drops decoded frames before the absolute stream target.
@@ -65,6 +68,7 @@ public:
 
 private:
     void DecodeLoop();
+    void FinishThread();
     bool SendPacket(const AVPacket* packet, int serial);
     bool DrainDecoder(int serial, bool end_of_stream);
     void ApplyFlush(int serial);
@@ -106,6 +110,10 @@ private:
     AVRational last_sar_{0, 1};
 
     std::thread thread_;
+    std::mutex thread_mutex_;
+    std::condition_variable thread_cv_;
+    bool thread_finished_ = true;
+    bool thread_abandoned_ = false;
     std::atomic<bool> running_{false};
     std::atomic<bool> stop_requested_{false};
     std::atomic<bool> eof_drained_{false};

@@ -1,7 +1,9 @@
 #pragma once
 
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
+#include <mutex>
 #include <thread>
 
 #include "common/MediaQueues.h"
@@ -24,7 +26,9 @@ public:
     SubtitleDecoder& operator=(const SubtitleDecoder&) = delete;
 
     void Start();
-    void Stop();
+    // Signals all queue waits before waiting for the decode thread. Returns false
+    // after detaching a non-responsive thread; the owner must abandon this decoder.
+    bool Stop(int64_t timeout_ms = 500);
     void Flush(int serial);
 
     bool running() const { return running_.load(std::memory_order_acquire); }
@@ -33,6 +37,7 @@ public:
 
 private:
     void DecodeLoop();
+    void FinishThread();
     void ApplyFlush(int serial);
     void DecodePacket(const AVPacket& packet, int serial);
     bool BuildEvent(const AVSubtitle& subtitle, const AVPacket& packet,
@@ -46,6 +51,10 @@ private:
     const int canvas_height_;
 
     std::thread thread_;
+    std::mutex thread_mutex_;
+    std::condition_variable thread_cv_;
+    bool thread_finished_ = true;
+    bool thread_abandoned_ = false;
     std::atomic<bool> running_{false};
     std::atomic<bool> stop_requested_{false};
     std::atomic<bool> eof_drained_{false};

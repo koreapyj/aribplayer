@@ -4,6 +4,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <new>
 #include <string>
@@ -280,7 +281,16 @@ Java_kr_dcmys_android_aribplayer_nativeplayer_NativePlayer_nativeRelease(
     NativeHandle* player = fromHandle(handle);
     if (player == nullptr) return;
 #ifdef HAVE_FFMPEG
-    player->close();
+    constexpr int64_t kReleaseBudgetMs = 2800;
+    const auto started = std::chrono::steady_clock::now();
+    if (!player->release(kReleaseBudgetMs)) {
+        const int64_t elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - started).count();
+        __android_log_print(ANDROID_LOG_ERROR, kLogTag,
+                            "teardown: abandoning native player after %lldms; retaining handle until process exit",
+                            static_cast<long long>(elapsed_ms));
+        return;
+    }
 #endif
     delete player;
 }
