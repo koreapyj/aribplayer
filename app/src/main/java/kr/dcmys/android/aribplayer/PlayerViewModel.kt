@@ -117,6 +117,12 @@ private class PlaybackSourceLease(
     }
 }
 
+private data class PendingSeek(
+    val requestId: Long,
+    val targetPositionMs: Long,
+    val previousPositionMs: Long,
+)
+
 class PlayerViewModel : ViewModel() {
     private val _uiState = MutableStateFlow(PlayerUiState())
     val uiState: StateFlow<PlayerUiState> = _uiState.asStateFlow()
@@ -157,18 +163,35 @@ class PlayerViewModel : ViewModel() {
 
         override fun onState(state: Int) {
             if (state == NativePlaybackState.CLOSED) {
+                pendingSeek = null
                 releaseLeaseAfterClose()
             }
             updateState { it.copy(playbackState = state.toUiPlaybackState()) }
         }
 
         override fun onPositionMs(positionMs: Long) {
+            if (pendingSeek != null) return
             updateState { it.copy(positionMs = positionMs.coerceAtLeast(0L)) }
         }
 
-        override fun onError(error: PlayerError) {
+        override fun onSeekResult(requestId: Long, positionMs: Long, success: Boolean) {
+            val seek = pendingSeek ?: return
+            if (seek.requestId != requestId) return
+            pendingSeek = null
             updateState {
                 it.copy(
+                    positionMs = (if (success) positionMs else seek.previousPositionMs)
+                        .coerceAtLeast(0L),
+                )
+            }
+        }
+
+        override fun onError(error: PlayerError) {
+            val seek = pendingSeek
+            pendingSeek = null
+            updateState {
+                it.copy(
+                    positionMs = seek?.previousPositionMs?.coerceAtLeast(0L) ?: it.positionMs,
                     playbackState = PlaybackState.ERROR,
                     errorMessage = error.message ?: "Playback failed (code ${error.code})."
                 )
@@ -198,6 +221,7 @@ class PlayerViewModel : ViewModel() {
         }
 
         override fun onEndOfStream() {
+            if (pendingSeek != null) return
             updateState { state ->
                 state.copy(
                     playbackState = PlaybackState.ENDED,
@@ -219,9 +243,12 @@ class PlayerViewModel : ViewModel() {
     private var statsPollingJob: Job? = null
     private var playbackSourceLease: PlaybackSourceLease? = null
     private val leasesAwaitingClose = ArrayDeque<PlaybackSourceLease>()
+    private var nextSeekRequestId = 0L
+    private var pendingSeek: PendingSeek? = null
 
     fun openDocument(context: Context, uri: Uri, startPositionMs: Long = 0L): Boolean {
         val safeStartPositionMs = startPositionMs.coerceAtLeast(0L)
+        pendingSeek = null
         if (uri.scheme == "content") {
             try {
                 context.contentResolver.takePersistableUriPermission(
@@ -326,11 +353,22 @@ class PlayerViewModel : ViewModel() {
     fun seekTo(positionMs: Long) {
         if (!controllerHolder.isInitialized()) return
         val safePositionMs = positionMs.coerceIn(0L, _uiState.value.durationMs.coerceAtLeast(0L))
-        runCatching { controller.seekTo(safePositionMs) }
+        val requestId = nextSeekRequestId()
+        val seek = PendingSeek(
+            requestId = requestId,
+            targetPositionMs = safePositionMs,
+            previousPositionMs = _uiState.value.positionMs,
+        )
+        pendingSeek = seek
+        updateState { it.copy(positionMs = safePositionMs) }
+        runCatching { controller.seekTo(safePositionMs, requestId) }
             .onSuccess { accepted ->
-                if (accepted) updateState { it.copy(positionMs = safePositionMs) }
+                if (!accepted) rejectPendingSeek(requestId)
             }
-            .onFailure(::showControllerError)
+            .onFailure { error ->
+                rejectPendingSeek(requestId)
+                showControllerError(error)
+            }
     }
 
     fun setVideoMode(mode: Int) {
@@ -394,6 +432,7 @@ class PlayerViewModel : ViewModel() {
     }
 
     fun closePlayer() {
+        pendingSeek = null
         statsPollingJob?.cancel()
         statsPollingJob = null
         closeCurrentSource()
@@ -401,6 +440,7 @@ class PlayerViewModel : ViewModel() {
     }
 
     override fun onCleared() {
+        pendingSeek = null
         statsPollingJob?.cancel()
         if (controllerHolder.isInitialized()) runCatching { controller.release() }
         playbackSourceLease?.close()
@@ -444,6 +484,18 @@ class PlayerViewModel : ViewModel() {
                 delay(STATS_POLL_INTERVAL_MS)
             }
         }
+    }
+
+    private fun nextSeekRequestId(): Long {
+        nextSeekRequestId = if (nextSeekRequestId == Long.MAX_VALUE) 1L else nextSeekRequestId + 1L
+        return nextSeekRequestId
+    }
+
+    private fun rejectPendingSeek(requestId: Long) {
+        val seek = pendingSeek ?: return
+        if (seek.requestId != requestId) return
+        pendingSeek = null
+        updateState { it.copy(positionMs = seek.previousPositionMs.coerceAtLeast(0L)) }
     }
 
     private fun showControllerError(error: Throwable) {

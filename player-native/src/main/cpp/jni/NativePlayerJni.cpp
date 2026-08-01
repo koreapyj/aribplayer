@@ -171,15 +171,20 @@ Java_kr_dcmys_android_aribplayer_nativeplayer_NativePlayer_nativePause(
 #endif
 }
 
-extern "C" JNIEXPORT void JNICALL
+extern "C" JNIEXPORT jboolean JNICALL
 Java_kr_dcmys_android_aribplayer_nativeplayer_NativePlayer_nativeSeekTo(
-        JNIEnv*, jobject, jlong handle, jlong positionMs) {
+        JNIEnv*, jobject, jlong handle, jlong positionMs, jlong requestId) {
 #ifdef HAVE_FFMPEG
-    if (auto* player = fromHandle(handle)) player->seekTo(positionMs);
+    if (auto* player = fromHandle(handle)) {
+        return player->seekTo(positionMs, static_cast<std::uint64_t>(requestId))
+                ? JNI_TRUE : JNI_FALSE;
+    }
 #else
     (void)handle;
     (void)positionMs;
+    (void)requestId;
 #endif
+    return JNI_FALSE;
 }
 
 extern "C" JNIEXPORT void JNICALL

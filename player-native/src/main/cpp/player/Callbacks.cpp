@@ -55,6 +55,7 @@ Callbacks::~Callbacks() {
     onVideoSize_ = nullptr;
     onState_ = nullptr;
     onPositionMs_ = nullptr;
+    onSeekResult_ = nullptr;
     onError_ = nullptr;
     onDecoderInfo_ = nullptr;
     onFilterInfo_ = nullptr;
@@ -90,6 +91,8 @@ void Callbacks::Initialize(JNIEnv* env, jobject callback) {
     onState_ = FindMethod(env, callbackClass, "onState", "(I)V");
     onPositionMs_ = FindMethod(
             env, callbackClass, "onPositionMs", "(J)V");
+    onSeekResult_ = FindMethod(
+            env, callbackClass, "onSeekResult", "(JJZ)V");
     onError_ = FindMethod(
             env, callbackClass, "onError", "(ILjava/lang/String;)V");
     onDecoderInfo_ = FindMethod(
@@ -111,6 +114,7 @@ void Callbacks::Initialize(JNIEnv* env, jobject callback) {
         onVideoSize_ = nullptr;
         onState_ = nullptr;
         onPositionMs_ = nullptr;
+        onSeekResult_ = nullptr;
         onError_ = nullptr;
         onDecoderInfo_ = nullptr;
         onFilterInfo_ = nullptr;
@@ -279,6 +283,26 @@ void Callbacks::onPositionMs(std::int64_t positionMs) {
 
     env->CallVoidMethod(callback_, onPositionMs_,
                         static_cast<jlong>(positionMs));
+    ClearException(env);
+    ReleaseEnv(attached);
+}
+
+void Callbacks::onSeekResult(std::uint64_t requestId, std::int64_t positionMs, bool success) {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    if (!HasMethods() || onSeekResult_ == nullptr) {
+        return;
+    }
+
+    bool attached = false;
+    JNIEnv* env = GetEnv(&attached);
+    if (env == nullptr) {
+        return;
+    }
+
+    env->CallVoidMethod(callback_, onSeekResult_,
+                        static_cast<jlong>(requestId),
+                        static_cast<jlong>(positionMs),
+                        success ? JNI_TRUE : JNI_FALSE);
     ClearException(env);
     ReleaseEnv(attached);
 }

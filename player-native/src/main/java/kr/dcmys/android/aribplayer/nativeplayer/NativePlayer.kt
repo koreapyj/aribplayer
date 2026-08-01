@@ -58,6 +58,8 @@ interface PlayerListener {
 
     fun onPositionMs(positionMs: Long) = Unit
 
+    fun onSeekResult(requestId: Long, positionMs: Long, success: Boolean) = Unit
+
     fun onError(error: PlayerError) = Unit
 
     fun onDecoderInfo(codecName: String, isHardware: Boolean) = Unit
@@ -102,7 +104,7 @@ object NativePlayer {
 
     external fun nativePause(handle: Long)
 
-    external fun nativeSeekTo(handle: Long, positionMs: Long)
+    external fun nativeSeekTo(handle: Long, positionMs: Long, requestId: Long): Boolean
 
     external fun nativeSetVideoMode(handle: Long, mode: Int)
 
@@ -169,6 +171,10 @@ internal class NativeCallbackBridge(listener: PlayerListener) {
 
     fun onPositionMs(positionMs: Long) {
         notifyListener { it.onPositionMs(positionMs) }
+    }
+
+    fun onSeekResult(requestId: Long, positionMs: Long, success: Boolean) {
+        notifyListener { it.onSeekResult(requestId, positionMs, success) }
     }
 
     fun onError(code: Int, message: String?) {
@@ -253,8 +259,8 @@ class PlayerController(listener: PlayerListener = object : PlayerListener {}) {
 
     fun pause(): Boolean = withActiveHandle(NativePlayer::nativePause)
 
-    fun seekTo(positionMs: Long): Boolean = withActiveHandle { handle ->
-        NativePlayer.nativeSeekTo(handle, positionMs)
+    fun seekTo(positionMs: Long, requestId: Long): Boolean = withActiveHandle { handle ->
+        NativePlayer.nativeSeekTo(handle, positionMs, requestId)
     }
 
     fun setVideoMode(mode: Int): Boolean = withActiveHandle { handle ->

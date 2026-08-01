@@ -24,7 +24,7 @@ public:
     void setSurface(ANativeWindow* window); // Takes ownership of one window reference.
     void play();
     void pause();
-    void seekTo(int64_t positionMs);
+    bool seekTo(int64_t positionMs, uint64_t requestId);
     void setVideoMode(int mode);
     void selectAudioTrack(int streamIndex, int dualMonoMode);
     void setSubtitlesEnabled(bool enabled);

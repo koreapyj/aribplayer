@@ -35,6 +35,7 @@ public:
     void onVideoSize(int width, int height, int sarNum, int sarDen);
     void onState(int state);
     void onPositionMs(std::int64_t positionMs);
+    void onSeekResult(std::uint64_t requestId, std::int64_t positionMs, bool success);
     void onError(int code, const std::string& message);
     void onDecoderInfo(const std::string& message, bool hardwareAccelerated);
     void onFilterInfo(int filterType, const std::string& message);
@@ -57,6 +58,7 @@ private:
     jmethodID onVideoSize_ = nullptr;
     jmethodID onState_ = nullptr;
     jmethodID onPositionMs_ = nullptr;
+    jmethodID onSeekResult_ = nullptr;
     jmethodID onError_ = nullptr;
     jmethodID onDecoderInfo_ = nullptr;
     jmethodID onFilterInfo_ = nullptr;

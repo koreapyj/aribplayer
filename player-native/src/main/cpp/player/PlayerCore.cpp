@@ -26,6 +26,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -558,11 +559,44 @@ public:
 
     void Play() { Enqueue(Command{CommandType::kPlay}); }
     void Pause() { Enqueue(Command{CommandType::kPause}); }
-    void SeekUi(int64_t position_ms) {
+    bool SeekUi(int64_t position_ms, uint64_t request_id) {
+        if (shutting_down_.load(std::memory_order_acquire) ||
+            !prepared_.load(std::memory_order_acquire) ||
+            !seekable_.load(std::memory_order_acquire)) {
+            return false;
+        }
+
+        const int64_t ui_position_ms = std::max<int64_t>(0, position_ms);
+        const int64_t offset_ms = start_offset_us_.load(std::memory_order_acquire) /
+                                  (AV_TIME_BASE / 1000);
+        const int64_t native_position_ms = ui_position_ms + offset_ms;
+        const bool was_playing = request_id != 0 &&
+                want_playing_.load(std::memory_order_acquire);
+        const int next_serial = presentation_serial_.fetch_add(
+                1, std::memory_order_acq_rel) + 1;
+        const SeekRequest request{
+                native_position_ms, ui_position_ms, next_serial, request_id, was_playing};
+        {
+            std::lock_guard<std::mutex> lock(seek_mutex_);
+            QueueSeekRequestLocked(request);
+            if (request_id != 0) {
+                latest_seek_request_id_.store(request_id, std::memory_order_release);
+                seek_pending_.store(true, std::memory_order_release);
+            }
+            std::lock_guard<std::mutex> session_lock(session_mutex_);
+            if (renderer_) renderer_->SetSerial(next_serial);
+            if (request_id != 0 && audio_sink_) audio_sink_->Pause();
+        }
+
         Command command{CommandType::kSeek};
-        command.value = std::max<int64_t>(0, position_ms) +
-                        start_offset_us_.load(std::memory_order_acquire) / (AV_TIME_BASE / 1000);
-        Enqueue(std::move(command));
+        command.value = native_position_ms;
+        command.secondary_value = next_serial;
+        command.request_id = request_id;
+        if (!Enqueue(std::move(command))) {
+            CancelSeekRequest(request);
+            return false;
+        }
+        return true;
     }
     void SetVideoMode(int mode) {
         Command command{CommandType::kVideoMode};
@@ -640,6 +674,7 @@ private:
         ANativeWindow* window = nullptr;
         std::shared_ptr<std::promise<void>> done;
         int secondary_value = -1;
+        uint64_t request_id = 0;
     };
 
     bool Enqueue(Command command) {
@@ -682,9 +717,9 @@ private:
                     case CommandType::kPlay: ApplyPlay(); break;
                     case CommandType::kPause: ApplyPause(); break;
                     case CommandType::kSeek:
-                        if (seekable_.load() && prepared_.load()) {
-                            seek_serial_.store(-1, std::memory_order_release);
-                            seek_ms_.store(command.value, std::memory_order_release);
+                        if (!seekable_.load(std::memory_order_acquire) ||
+                            !prepared_.load(std::memory_order_acquire)) {
+                            RejectQueuedSeek(command.request_id);
                         }
                         break;
                     case CommandType::kSetSurface: ApplySurface(command.window); command.window = nullptr; break;
@@ -706,7 +741,10 @@ private:
             }
 
             const auto now = std::chrono::steady_clock::now();
-            if (prepared_.load() && now - last_position >= std::chrono::milliseconds(500)) {
+            if (prepared_.load(std::memory_order_acquire) &&
+                !stop_requested_.load(std::memory_order_acquire) &&
+                !seek_pending_.load(std::memory_order_acquire) &&
+                now - last_position >= std::chrono::milliseconds(500)) {
                 const int64_t pts_ms = static_cast<int64_t>(
                         std::max(0.0, clock_->PositionSeconds()) * 1000.0);
                 const int64_t offset_ms = start_offset_us_.load(std::memory_order_acquire) /
@@ -732,9 +770,11 @@ private:
         seekable_.store(false);
         has_audio_master_.store(false);
         duration_ms_.store(0);
-        seek_ms_.store(-1);
-        seek_serial_.store(-1);
+        ClearQueuedSeek();
+        seek_pending_.store(false, std::memory_order_release);
+        latest_seek_request_id_.store(0, std::memory_order_release);
         serial_.store(0);
+        presentation_serial_.store(0);
         audio_serial_.store(0);
         requested_audio_stream_.store(-1);
         requested_dual_mono_mode_.store(-1);
@@ -835,8 +875,9 @@ private:
 
         stop_requested_.store(true, std::memory_order_release);
         want_playing_.store(false, std::memory_order_release);
-        seek_ms_.store(-1);
-        seek_serial_.store(-1);
+        ClearQueuedSeek();
+        seek_pending_.store(false, std::memory_order_release);
+        latest_seek_request_id_.store(0, std::memory_order_release);
         if (video_packets_) video_packets_->Abort();
         if (audio_packets_) audio_packets_->Abort();
         if (subtitle_packets_) subtitle_packets_->Abort();
@@ -972,13 +1013,19 @@ private:
         const int64_t position_ms = static_cast<int64_t>(
                 std::max(0.0, clock_->PositionSeconds()) * 1000.0);
         const int next_serial = serial_.fetch_add(1, std::memory_order_acq_rel) + 1;
+        const int presentation_serial = std::max(
+                next_serial, presentation_serial_.load(std::memory_order_acquire));
+        presentation_serial_.store(presentation_serial, std::memory_order_release);
+        {
+            std::lock_guard<std::mutex> lock(session_mutex_);
+            if (renderer_) renderer_->SetSerial(presentation_serial);
+        }
         const bool seekable = seekable_.load(std::memory_order_acquire);
         if (seekable) {
             // PerformSeek applies the serial flush once after avformat_seek_file.
             // Flushing here as well causes an avoidable pause/start bounce and can
             // consume the first packet of the new generation.
-            seek_serial_.store(next_serial, std::memory_order_release);
-            seek_ms_.store(position_ms, std::memory_order_release);
+            QueueSeekRequest(SeekRequest{position_ms, position_ms, next_serial, 0});
             return;
         }
         FlushPipeline(next_serial, position_ms, false);
@@ -989,7 +1036,7 @@ private:
             const QueueResult result = queue.Put(packet, serial, false);
             if (result == QueueResult::kOk) return true;
             if (result == QueueResult::kAborted) return false;
-            if (seek_ms_.load(std::memory_order_acquire) >= 0) return false;
+            if (HasQueuedSeek()) return false;
             std::this_thread::sleep_for(std::chrono::milliseconds(2));
         }
         return false;
@@ -1001,7 +1048,7 @@ private:
             const QueueResult result = queue.Put(packet, serial, false);
             if (result == QueueResult::kOk) return true;
             if (result == QueueResult::kAborted) return false;
-            if (seek_ms_.load(std::memory_order_acquire) >= 0) return false;
+            if (HasQueuedSeek()) return false;
             if (std::chrono::steady_clock::now() >= deadline) {
                 __android_log_print(ANDROID_LOG_WARN, kTag,
                                     "Subtitle packet queue remained full; dropping newest packet");
@@ -1017,16 +1064,125 @@ private:
             const QueueResult result = queue.PutEof(serial, false);
             if (result == QueueResult::kOk) return true;
             if (result == QueueResult::kAborted) return false;
-            if (seek_ms_.load(std::memory_order_acquire) >= 0) return false;
+            if (HasQueuedSeek()) return false;
             std::this_thread::sleep_for(std::chrono::milliseconds(2));
         }
         return false;
     }
 
+    struct SeekRequest {
+        int64_t native_position_ms = 0;
+        int64_t ui_position_ms = 0;
+        int reserved_serial = -1;
+        uint64_t request_id = 0;
+        bool was_playing = false;
+    };
+
+    void QueueSeekRequestLocked(const SeekRequest& request) {
+        if (request.request_id != 0) {
+            pending_seek_requests_.erase(
+                    std::remove_if(
+                            pending_seek_requests_.begin(), pending_seek_requests_.end(),
+                            [](const SeekRequest& pending) { return pending.request_id != 0; }),
+                    pending_seek_requests_.end());
+            pending_seek_requests_.push_front(request);
+        } else {
+            pending_seek_requests_.push_back(request);
+        }
+    }
+
+    void QueueSeekRequest(const SeekRequest& request) {
+        std::lock_guard<std::mutex> lock(seek_mutex_);
+        QueueSeekRequestLocked(request);
+    }
+
+    std::optional<SeekRequest> TakeSeekRequest() {
+        std::lock_guard<std::mutex> lock(seek_mutex_);
+        if (pending_seek_requests_.empty()) return std::nullopt;
+        const SeekRequest request = pending_seek_requests_.front();
+        pending_seek_requests_.pop_front();
+        return request;
+    }
+
+    void ClearQueuedSeek() {
+        std::lock_guard<std::mutex> lock(seek_mutex_);
+        pending_seek_requests_.clear();
+    }
+
+    bool HasQueuedSeek() const {
+        std::lock_guard<std::mutex> lock(seek_mutex_);
+        return !pending_seek_requests_.empty();
+    }
+
+    bool IsLatestSeek(uint64_t request_id) const {
+        return request_id != 0 && seek_pending_.load(std::memory_order_acquire) &&
+               latest_seek_request_id_.load(std::memory_order_acquire) == request_id;
+    }
+
+    void ReportSeekResult(const SeekRequest& request, bool success) {
+        std::lock_guard<std::mutex> lock(seek_mutex_);
+        if (!IsLatestSeek(request.request_id)) return;
+        if (!success) {
+            const int actual_serial = serial_.load(std::memory_order_acquire);
+            presentation_serial_.store(actual_serial, std::memory_order_release);
+            std::lock_guard<std::mutex> session_lock(session_mutex_);
+            if (renderer_) renderer_->SetSerial(actual_serial);
+            if (request.was_playing &&
+                want_playing_.load(std::memory_order_acquire) &&
+                audio_sink_ && !audio_sink_->is_running() &&
+                !audio_sink_->Resume()) {
+                __android_log_print(ANDROID_LOG_ERROR, kTag,
+                                    "AAudio resume failed after rejected seek; using video clock");
+                has_audio_master_.store(false, std::memory_order_release);
+                clock_->SetAudioSink(nullptr);
+            }
+        }
+        callbacks_->onSeekResult(request.request_id,
+                                 std::max<int64_t>(0, request.ui_position_ms), success);
+        seek_pending_.store(false, std::memory_order_release);
+    }
+
+    void CancelSeekRequest(const SeekRequest& request) {
+        {
+            std::lock_guard<std::mutex> lock(seek_mutex_);
+            const auto pending = std::find_if(
+                    pending_seek_requests_.begin(), pending_seek_requests_.end(),
+                    [&request](const SeekRequest& candidate) {
+                        return candidate.request_id == request.request_id;
+                    });
+            if (pending != pending_seek_requests_.end()) {
+                pending_seek_requests_.erase(pending);
+            }
+        }
+        ReportSeekResult(request, false);
+    }
+
+    void RejectQueuedSeek(uint64_t request_id) {
+        if (request_id == 0) return;
+        std::optional<SeekRequest> request;
+        {
+            std::lock_guard<std::mutex> lock(seek_mutex_);
+            const auto pending = std::find_if(
+                    pending_seek_requests_.begin(), pending_seek_requests_.end(),
+                    [request_id](const SeekRequest& candidate) {
+                        return candidate.request_id == request_id;
+                    });
+            if (pending != pending_seek_requests_.end()) {
+                request = *pending;
+                pending_seek_requests_.erase(pending);
+            }
+        }
+        if (request.has_value()) ReportSeekResult(*request, false);
+    }
+
     void FlushPipeline(int next_serial, int64_t position_ms, bool catch_up) {
         audio_serial_.store(next_serial, std::memory_order_release);
         std::lock_guard<std::mutex> lock(session_mutex_);
-        if (renderer_) renderer_->SetSerial(next_serial);
+        const int presentation_serial = std::max({
+                next_serial,
+                serial_.load(std::memory_order_acquire),
+                presentation_serial_.load(std::memory_order_acquire)});
+        if (renderer_) renderer_->SetSerial(presentation_serial);
         if (audio_sink_) audio_sink_->Pause();
         if (video_decoder_) {
             if (catch_up) video_decoder_->FlushForSeek(next_serial, position_ms * 1000);
@@ -1056,20 +1212,29 @@ private:
         }
     }
 
-    bool PerformSeek(AVFormatContext* format, int64_t position_ms, int reserved_serial) {
-        const int64_t target = av_rescale_q(position_ms, AVRational{1, 1000}, AV_TIME_BASE_Q);
+    bool PerformSeek(AVFormatContext* format, const SeekRequest& request) {
+        const int64_t target = av_rescale_q(
+                request.native_position_ms, AVRational{1, 1000}, AV_TIME_BASE_Q);
         const int result = avformat_seek_file(format, -1, std::numeric_limits<int64_t>::min(),
                                               target, target, AVSEEK_FLAG_BACKWARD);
         if (result < 0) {
             callbacks_->onError(6, "Seek failed: " + AvError(result));
+            ReportSeekResult(request, false);
             return false;
         }
-        const int next_serial = reserved_serial >= 0
-                ? reserved_serial : serial_.fetch_add(1, std::memory_order_acq_rel) + 1;
-        FlushPipeline(next_serial, position_ms, true);
-        const int64_t offset_ms = start_offset_us_.load(std::memory_order_acquire) /
-                                  (AV_TIME_BASE / 1000);
-        callbacks_->onPositionMs(std::max<int64_t>(0, position_ms - offset_ms));
+        const int next_serial = request.reserved_serial >= 0
+                ? std::max(request.reserved_serial,
+                           serial_.load(std::memory_order_acquire))
+                : serial_.fetch_add(1, std::memory_order_acq_rel) + 1;
+        serial_.store(next_serial, std::memory_order_release);
+        const int presentation_serial = std::max(
+                next_serial, presentation_serial_.load(std::memory_order_acquire));
+        presentation_serial_.store(presentation_serial, std::memory_order_release);
+        FlushPipeline(next_serial, request.native_position_ms, true);
+        if (request.request_id != 0 && IsLatestSeek(request.request_id)) {
+            callbacks_->onPositionMs(std::max<int64_t>(0, request.ui_position_ms));
+        }
+        ReportSeekResult(request, true);
         return true;
     }
 
@@ -1534,12 +1699,12 @@ private:
                         dual_mono_streams));
             }
 
-            const int64_t requested_seek = seek_ms_.exchange(-1, std::memory_order_acq_rel);
-            if (requested_seek >= 0) {
-                const int reserved_serial = seek_serial_.exchange(-1, std::memory_order_acq_rel);
-                if (PerformSeek(format.get(), requested_seek, reserved_serial)) {
+            const std::optional<SeekRequest> requested_seek = TakeSeekRequest();
+            if (requested_seek.has_value()) {
+                if (PerformSeek(format.get(), *requested_seek)) {
                     audio_discard_before_us = av_rescale_q(
-                            requested_seek, AVRational{1, 1000}, AV_TIME_BASE_Q);
+                            requested_seek->native_position_ms,
+                            AVRational{1, 1000}, AV_TIME_BASE_Q);
                 }
                 eof_reported = false;
                 continue;
@@ -1558,7 +1723,9 @@ private:
                     if (superimpose_enabled) PutEof(*superimpose_packets_, serial);
                     WaitForDrainOrSeek(video_enabled, audio_enabled, subtitle_enabled,
                                        superimpose_enabled);
-                    if (seek_ms_.load() < 0 && !stop_requested_.load()) {
+                    if (!HasQueuedSeek() &&
+                        !seek_pending_.load(std::memory_order_acquire) &&
+                        !stop_requested_.load()) {
                         callbacks_->onEndOfStream();
                         callbacks_->onState(kStateEnded);
                         eof_reported = true;
@@ -1729,9 +1896,9 @@ private:
                                 stop_requested_.load(std::memory_order_acquire)) return false;
                             const double position = position_seconds > 0.0
                                     ? position_seconds : std::max(0.0, clock_->PositionSeconds());
-                            seek_serial_.store(-1, std::memory_order_release);
-                            seek_ms_.store(static_cast<int64_t>(position * 1000.0),
-                                           std::memory_order_release);
+                            QueueSeekRequest(SeekRequest{
+                                    static_cast<int64_t>(position * 1000.0),
+                                    static_cast<int64_t>(position * 1000.0), -1, 0});
                             return true;
                         },
                         [this](int width, int height, AVRational frame_sar) {
@@ -1848,7 +2015,7 @@ private:
 
     void WaitForDrainOrSeek(bool has_video, bool has_audio, bool has_subtitle,
                             bool has_superimpose) {
-        while (!stop_requested_.load() && seek_ms_.load() < 0) {
+        while (!stop_requested_.load() && !HasQueuedSeek()) {
             bool drained = (!has_video || video_packets_->Size() == 0) &&
                            (!has_audio || audio_packets_->Size() == 0) &&
                            (!has_subtitle || subtitle_packets_->Size() == 0) &&
@@ -1899,11 +2066,14 @@ private:
     std::atomic<bool> prepared_{false};
     std::atomic<bool> seekable_{false};
     std::atomic<bool> want_playing_{false};
-    std::atomic<int64_t> seek_ms_{-1};
-    std::atomic<int> seek_serial_{-1};
+    mutable std::mutex seek_mutex_;
+    std::deque<SeekRequest> pending_seek_requests_;
+    std::atomic<bool> seek_pending_{false};
+    std::atomic<uint64_t> latest_seek_request_id_{0};
     std::atomic<int64_t> start_offset_us_{0};
     std::atomic<int64_t> duration_ms_{0};
     std::atomic<int> serial_{0};
+    std::atomic<int> presentation_serial_{0};
     std::atomic<int> audio_serial_{0};
     std::atomic<int> requested_audio_stream_{-1};
     std::atomic<int> requested_dual_mono_mode_{-1};
@@ -1951,7 +2121,9 @@ bool PlayerCore::open(int ownedFd, std::string fontPath, std::string displayName
 void PlayerCore::setSurface(ANativeWindow* window) { impl_->SetSurface(window); }
 void PlayerCore::play() { impl_->Play(); }
 void PlayerCore::pause() { impl_->Pause(); }
-void PlayerCore::seekTo(int64_t positionMs) { impl_->SeekUi(positionMs); }
+bool PlayerCore::seekTo(int64_t positionMs, uint64_t requestId) {
+    return impl_->SeekUi(positionMs, requestId);
+}
 void PlayerCore::setVideoMode(int mode) { impl_->SetVideoMode(mode); }
 void PlayerCore::selectAudioTrack(int streamIndex, int dualMonoMode) {
     impl_->SelectAudioTrack(streamIndex, dualMonoMode);
