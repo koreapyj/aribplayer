@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="player_seek_bar_description">Afspilningsstatus</string>
+    <string name="player_settings_description">Indstillinger</string>
+    <string name="player_pause_description">Sæt på pause</string>
+    <string name="player_play_description">Afspil</string>
+    <string name="player_rewind_description">Spol tilbage</string>
+    <plurals name="player_rewind_by_amount_description">
+        <item quantity="one">Spol %d sekund tilbage</item>
+        <item quantity="other">Spol %d sekunder tilbage</item>
+    </plurals>
+    <string name="player_fastforward_description">Spol frem</string>
+    <plurals name="player_fastforward_by_amount_description">
+        <item quantity="one">Spol %d sekund frem</item>
+        <item quantity="other">Spol %d sekunder frem</item>
+    </plurals>
+    <string name="player_cc_enabled_description">Deaktiver undertekster</string>
+    <string name="player_cc_disabled_description">Aktivér undertekster</string>
+    <string name="player_track_title_audio">Lyd</string>
+    <string name="player_track_none">Ingen</string>
+    <string name="player_track_auto">Automatisk</string>
+</resources>

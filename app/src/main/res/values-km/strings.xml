@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="player_seek_bar_description">ការចាក់​កំពុង​ដំណើរការ</string>
+    <string name="player_settings_description">ការកំណត់</string>
+    <string name="player_pause_description">ផ្អាក</string>
+    <string name="player_play_description">លេង</string>
+    <string name="player_rewind_description">ខា​ថយ​ក្រោយ</string>
+    <plurals name="player_rewind_by_amount_description">
+        <item quantity="one">ខា​ថយក្រោយ %d វិនាទី</item>
+        <item quantity="other">ខា​ថយក្រោយ %d វិនាទី</item>
+    </plurals>
+    <string name="player_fastforward_description">ទៅ​មុខ​​​រហ័ស</string>
+    <plurals name="player_fastforward_by_amount_description">
+        <item quantity="one">ខា​ទៅមុខ %d វិនាទី</item>
+        <item quantity="other">ខា​ទៅមុខ %d វិនាទី</item>
+    </plurals>
+    <string name="player_cc_enabled_description">បិទអក្សររត់</string>
+    <string name="player_cc_disabled_description">បើកអក្សររត់</string>
+    <string name="player_track_title_audio">សំឡេង</string>
+    <string name="player_track_none">គ្មាន</string>
+    <string name="player_track_auto">ស្វ័យប្រវត្តិ</string>
+</resources>

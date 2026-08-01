@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="player_seek_bar_description">Πρόοδος αναπαραγωγής</string>
+    <string name="player_settings_description">Ρυθμίσεις</string>
+    <string name="player_pause_description">Παύση</string>
+    <string name="player_play_description">Αναπαραγωγή</string>
+    <string name="player_rewind_description">Επαναφορά</string>
+    <plurals name="player_rewind_by_amount_description">
+        <item quantity="one">Μετάβαση προς τα πίσω κατά %d δευτερόλεπτο</item>
+        <item quantity="other">Μετάβαση προς τα πίσω κατά %d δευτερόλεπτα</item>
+    </plurals>
+    <string name="player_fastforward_description">Γρήγορη προώθηση</string>
+    <plurals name="player_fastforward_by_amount_description">
+        <item quantity="one">Γρήγορη προώθηση κατά %d δευτερόλεπτο</item>
+        <item quantity="other">Γρήγορη προώθηση κατά %d δευτερόλεπτα</item>
+    </plurals>
+    <string name="player_cc_enabled_description">Απενεργοποίηση υπότιτλων</string>
+    <string name="player_cc_disabled_description">Ενεργοποίηση υπότιτλων</string>
+    <string name="player_track_title_audio">Ήχος</string>
+    <string name="player_track_none">Κανένα</string>
+    <string name="player_track_auto">Αυτόματο</string>
+</resources>

@@ -1,0 +1,38 @@
+diff --git a/libavcodec/libaribcaption.c b/libavcodec/libaribcaption.c
+--- a/libavcodec/libaribcaption.c
++++ b/libavcodec/libaribcaption.c
+@@ -359,8 +359,9 @@ static int aribcaption_trans_bitmap_subtitle(ARIBCaptionContext *ctx)
+         return 0;
+
+     case ARIBCC_RENDER_STATUS_NO_IMAGE:
+-        ff_dlog(ctx, "no image\n");
+-        return 0;
++        /* A zero-region caption clears the previously rendered bitmap. */
++        ff_dlog(ctx, "no image (clear)\n");
++        return 1;
+
+     case ARIBCC_RENDER_STATUS_ERROR:
+         av_log(ctx, AV_LOG_ERROR,
+@@ -377,7 +378,8 @@ static int aribcaption_trans_bitmap_subtitle(ARIBCaptionContext *ctx)
+     if (!ctx->render_result.image_count || ctx->render_result.images == NULL) {
+         aribcc_render_result_cleanup(&ctx->render_result);
+-        ff_dlog(ctx, "no image (%d)\n", ctx->render_result.image_count);
+-        return 0;
++        /* Rendering can also produce an empty image list for a clear. */
++        ff_dlog(ctx, "no image (%d, clear)\n", ctx->render_result.image_count);
++        return 1;
+     }
+
+     sub->format = 0; /* graphic */
+@@ -917,7 +919,10 @@ static int aribcaption_decode(AVCodecContext *avctx, AVSubtitle *sub,
+         if (ctx->avpkt->pts != AV_NOPTS_VALUE)
+             sub->pts = av_rescale_q(ctx->avpkt->pts,
+                                     ctx->time_base, AV_TIME_BASE_Q);
+-        if (ctx->caption.wait_duration == ARIBCC_DURATION_INDEFINITE)
++        if (ctx->subtitle_type == SUBTITLE_BITMAP && sub->num_rects == 0)
++            /* An empty bitmap subtitle is an immediate display clear. */
++            sub->end_display_time = 0;
++        else if (ctx->caption.wait_duration == ARIBCC_DURATION_INDEFINITE)
+             sub->end_display_time = UINT32_MAX;
+         else
+             sub->end_display_time = (uint32_t)ctx->caption.wait_duration;

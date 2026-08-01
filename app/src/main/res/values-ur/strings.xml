@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="player_seek_bar_description">پلے بیک کی پیش رفت</string>
+    <string name="player_settings_description">ترتیبات</string>
+    <string name="player_pause_description">موقوف کریں</string>
+    <string name="player_play_description">چلائیں</string>
+    <string name="player_rewind_description">ریوائینڈ کریں</string>
+    <plurals name="player_rewind_by_amount_description">
+        <item quantity="one">%d سیکنڈ ریوائنڈ کریں</item>
+        <item quantity="other">%d سیکنڈز ریوائنڈ کریں</item>
+    </plurals>
+    <string name="player_fastforward_description">تیزی سے فارورڈ کریں</string>
+    <plurals name="player_fastforward_by_amount_description">
+        <item quantity="one">%d سیکنڈ تیزی سے فارورڈ کریں</item>
+        <item quantity="other">%d سیکنڈز تیزی سے فارورڈ کریں</item>
+    </plurals>
+    <string name="player_cc_enabled_description">سب ٹائٹلز کو غیر فعال کریں</string>
+    <string name="player_cc_disabled_description">سب ٹائٹلز کو فعال کریں</string>
+    <string name="player_track_title_audio">آڈیو</string>
+    <string name="player_track_none">کوئی نہیں</string>
+    <string name="player_track_auto">خودکار</string>
+</resources>

@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="player_seek_bar_description">প্লে’বেকৰ অগ্ৰগতি</string>
+    <string name="player_settings_description">ছেটিং</string>
+    <string name="player_pause_description">পজ কৰক</string>
+    <string name="player_play_description">প্লে’ কৰক</string>
+    <string name="player_rewind_description">ৰিৱাইণ্ড</string>
+    <plurals name="player_rewind_by_amount_description">
+        <item quantity="one">%d ছেকেণ্ড ৰিৱাইণ্ড কৰক</item>
+        <item quantity="other">%d ছেকেণ্ড ৰিৱাইণ্ড কৰক</item>
+    </plurals>
+    <string name="player_fastforward_description">ফাষ্ট ফৰৱাৰ্ড</string>
+    <plurals name="player_fastforward_by_amount_description">
+        <item quantity="one">%d ছেকেণ্ড ফাষ্ট ফৰৱাৰ্ড কৰক</item>
+        <item quantity="other">%d ছেকেণ্ড ফাষ্ট ফৰৱাৰ্ড কৰক</item>
+    </plurals>
+    <string name="player_cc_enabled_description">ছাবটাইটেল অক্ষম কৰক</string>
+    <string name="player_cc_disabled_description">ছাবটাইটেল সক্ষম কৰক</string>
+    <string name="player_track_title_audio">অডিঅ’</string>
+    <string name="player_track_none">নাই</string>
+    <string name="player_track_auto">স্বয়ংক্ৰিয়</string>
+</resources>

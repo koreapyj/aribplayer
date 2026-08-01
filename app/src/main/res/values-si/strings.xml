@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="player_seek_bar_description">පසුධාවන ප්‍රගතිය</string>
+    <string name="player_settings_description">සැකසීම්</string>
+    <string name="player_pause_description">විරාම කරන්න</string>
+    <string name="player_play_description">ධාවනය කරන්න</string>
+    <string name="player_rewind_description">නැවත ඔතන්න</string>
+    <plurals name="player_rewind_by_amount_description">
+        <item quantity="one">තත්පර %dක් ආපස්සට</item>
+        <item quantity="other">තත්පර %dක් ආපස්සට</item>
+    </plurals>
+    <string name="player_fastforward_description">වේගයෙන් ඉදිරියට</string>
+    <plurals name="player_fastforward_by_amount_description">
+        <item quantity="one">තත්පර %dක් වේගයෙන් ඉදිරියට</item>
+        <item quantity="other">තත්පර %dක් වේගයෙන් ඉදිරියට</item>
+    </plurals>
+    <string name="player_cc_enabled_description">උපසිරැසි අබල කරන්න</string>
+    <string name="player_cc_disabled_description">උපසිරැසි සබල කරන්න</string>
+    <string name="player_track_title_audio">ශ්‍රව්‍ය</string>
+    <string name="player_track_none">කිසිවක් නැත</string>
+    <string name="player_track_auto">ස්වයං</string>
+</resources>

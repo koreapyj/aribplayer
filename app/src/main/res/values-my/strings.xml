@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="player_seek_bar_description">ဖွင့်သည့် အနေအထား</string>
+    <string name="player_settings_description">ဆက်တင်များ</string>
+    <string name="player_pause_description">ခဏရပ်ရန်</string>
+    <string name="player_play_description">ဖွင့်ရန်</string>
+    <string name="player_rewind_description">ပြန်ရစ်ရန်</string>
+    <plurals name="player_rewind_by_amount_description">
+        <item quantity="one">နောက်သို့ %d စက္ကန့်ရစ်ရန်</item>
+        <item quantity="other">နောက်သို့ %d စက္ကန့်ရစ်ရန်</item>
+    </plurals>
+    <string name="player_fastforward_description">ရှေ့သို့ အမြန်သွားရန်</string>
+    <plurals name="player_fastforward_by_amount_description">
+        <item quantity="one">ရှေ့သို့ %d စက္ကန့်ရစ်ရန်</item>
+        <item quantity="other">ရှေ့သို့ %d စက္ကန့်ရစ်ရန်</item>
+    </plurals>
+    <string name="player_cc_enabled_description">စာတန်းထိုး ပိတ်ပါ</string>
+    <string name="player_cc_disabled_description">စာတန်းထိုး ဖွင့်ပါ</string>
+    <string name="player_track_title_audio">အသံ</string>
+    <string name="player_track_none">မရှိ</string>
+    <string name="player_track_auto">အလိုအလျောက်</string>
+</resources>

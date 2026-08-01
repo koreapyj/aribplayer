@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="player_seek_bar_description">Potek predvajanja</string>
+    <string name="player_settings_description">Nastavitve</string>
+    <string name="player_pause_description">Zaustavitev</string>
+    <string name="player_play_description">Predvajanje</string>
+    <string name="player_rewind_description">Previjanje nazaj</string>
+    <plurals name="player_rewind_by_amount_description">
+        <item quantity="one">Premik nazaj za %d sekundo</item>
+        <item quantity="two">Premik nazaj za %d sekundi</item>
+        <item quantity="few">Premik nazaj za %d sekunde</item>
+        <item quantity="other">Premik nazaj za %d sekund</item>
+    </plurals>
+    <string name="player_fastforward_description">Previjanje naprej</string>
+    <plurals name="player_fastforward_by_amount_description">
+        <item quantity="one">Premik naprej za %d sekundo</item>
+        <item quantity="two">Premik naprej za %d sekundi</item>
+        <item quantity="few">Premik naprej za %d sekunde</item>
+        <item quantity="other">Premik naprej za %d sekund</item>
+    </plurals>
+    <string name="player_cc_enabled_description">Onemogočanje podnapisov</string>
+    <string name="player_cc_disabled_description">Omogočanje podnapisov</string>
+    <string name="player_track_title_audio">Zvočni posnetki</string>
+    <string name="player_track_none">Nič</string>
+    <string name="player_track_auto">Samodejno</string>
+</resources>

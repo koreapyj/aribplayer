@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="player_seek_bar_description">ପ୍ଲେବେକର ପ୍ରୋଗ୍ରେସ</string>
+    <string name="player_settings_description">ସେଟିଂସ</string>
+    <string name="player_pause_description">ବିରତ କରନ୍ତୁ</string>
+    <string name="player_play_description">ଚଲାନ୍ତୁ</string>
+    <string name="player_rewind_description">ରିୱାଇଣ୍ଡ କରନ୍ତୁ</string>
+    <plurals name="player_rewind_by_amount_description">
+        <item quantity="one">%d ସେକେଣ୍ଡ ରିୱାଇଣ୍ଡ କରନ୍ତୁ</item>
+        <item quantity="other">%d ସେକେଣ୍ଡ ରିୱାଇଣ୍ଡ କରନ୍ତୁ</item>
+    </plurals>
+    <string name="player_fastforward_description">ଫାଷ୍ଟ ଫରୱାର୍ଡ କରନ୍ତୁ</string>
+    <plurals name="player_fastforward_by_amount_description">
+        <item quantity="one">%d ସେକେଣ୍ଡ ଫାଷ୍ଟ ଫରୱାର୍ଡ କରନ୍ତୁ</item>
+        <item quantity="other">%d ସେକେଣ୍ଡ ଫାଷ୍ଟ ଫରୱାର୍ଡ କରନ୍ତୁ</item>
+    </plurals>
+    <string name="player_cc_enabled_description">ସବଟାଇଟେଲଗୁଡ଼ିକୁ ଅକ୍ଷମ କରନ୍ତୁ</string>
+    <string name="player_cc_disabled_description">ସବଟାଇଟେଲଗୁଡ଼ିକୁ ସକ୍ଷମ କରନ୍ତୁ</string>
+    <string name="player_track_title_audio">ଅଡିଓ</string>
+    <string name="player_track_none">କିଛି ନାହିଁ</string>
+    <string name="player_track_auto">ସ୍ୱତଃ</string>
+</resources>

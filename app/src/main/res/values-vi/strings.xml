@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="player_seek_bar_description">Tiến trình phát</string>
+    <string name="player_settings_description">Cài đặt</string>
+    <string name="player_pause_description">Tạm dừng</string>
+    <string name="player_play_description">Phát</string>
+    <string name="player_rewind_description">Tua lại</string>
+    <plurals name="player_rewind_by_amount_description">
+        <item quantity="one">Tua lại %d giây</item>
+        <item quantity="other">Tua lại %d giây</item>
+    </plurals>
+    <string name="player_fastforward_description">Tua đi</string>
+    <plurals name="player_fastforward_by_amount_description">
+        <item quantity="one">Tua nhanh %d giây</item>
+        <item quantity="other">Tua nhanh %d giây</item>
+    </plurals>
+    <string name="player_cc_enabled_description">Tắt phụ đề</string>
+    <string name="player_cc_disabled_description">Bật phụ đề</string>
+    <string name="player_track_title_audio">Âm thanh</string>
+    <string name="player_track_none">Không</string>
+    <string name="player_track_auto">Tự động</string>
+</resources>

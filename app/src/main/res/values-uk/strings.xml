@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="player_seek_bar_description">Прогрес відтворення</string>
+    <string name="player_settings_description">Налаштування</string>
+    <string name="player_pause_description">Призупинити</string>
+    <string name="player_play_description">Відтворити</string>
+    <string name="player_rewind_description">Перемотати назад</string>
+    <plurals name="player_rewind_by_amount_description">
+        <item quantity="one">Перемотати назад на %d секунду</item>
+        <item quantity="few">Перемотати назад на %d секунди</item>
+        <item quantity="many">Перемотати назад на %d секунд</item>
+        <item quantity="other">Перемотати назад на %d секунди</item>
+    </plurals>
+    <string name="player_fastforward_description">Перемотати вперед</string>
+    <plurals name="player_fastforward_by_amount_description">
+        <item quantity="one">Перемотати вперед на %d секунду</item>
+        <item quantity="few">Перемотати вперед на %d секунди</item>
+        <item quantity="many">Перемотати вперед на %d секунд</item>
+        <item quantity="other">Перемотати вперед на %d секунди</item>
+    </plurals>
+    <string name="player_cc_enabled_description">Вимкнути субтитри</string>
+    <string name="player_cc_disabled_description">Увімкнути субтитри</string>
+    <string name="player_track_title_audio">Аудіо</string>
+    <string name="player_track_none">Нічого</string>
+    <string name="player_track_auto">Автоматично</string>
+</resources>

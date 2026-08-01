@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="player_seek_bar_description">Полоса прокрутки воспроизведения</string>
+    <string name="player_settings_description">Настройки</string>
+    <string name="player_pause_description">Приостановить</string>
+    <string name="player_play_description">Воспроизвести</string>
+    <string name="player_rewind_description">Перемотать назад</string>
+    <plurals name="player_rewind_by_amount_description">
+        <item quantity="one">Перемотать на %d секунду назад</item>
+        <item quantity="few">Перемотать на %d секунды назад</item>
+        <item quantity="many">Перемотать на %d секунд назад</item>
+        <item quantity="other">Перемотать на %d секунды назад</item>
+    </plurals>
+    <string name="player_fastforward_description">Перемотать вперед</string>
+    <plurals name="player_fastforward_by_amount_description">
+        <item quantity="one">Перемотать на %d секунду вперед</item>
+        <item quantity="few">Перемотать на %d секунды вперед</item>
+        <item quantity="many">Перемотать на %d секунд вперед</item>
+        <item quantity="other">Перемотать на %d секунды вперед</item>
+    </plurals>
+    <string name="player_cc_enabled_description">Выключить субтитры</string>
+    <string name="player_cc_disabled_description">Включить субтитры</string>
+    <string name="player_track_title_audio">Аудио</string>
+    <string name="player_track_none">Нет</string>
+    <string name="player_track_auto">Авто</string>
+</resources>

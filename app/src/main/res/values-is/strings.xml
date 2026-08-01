@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="player_seek_bar_description">Framvinda spilunar</string>
+    <string name="player_settings_description">Stillingar</string>
+    <string name="player_pause_description">Hlé</string>
+    <string name="player_play_description">Spila</string>
+    <string name="player_rewind_description">Spóla til baka</string>
+    <plurals name="player_rewind_by_amount_description">
+        <item quantity="one">Spóla til baka um %d sekúndu</item>
+        <item quantity="other">Spóla til baka um %d sekúndur</item>
+    </plurals>
+    <string name="player_fastforward_description">Spóla áfram</string>
+    <plurals name="player_fastforward_by_amount_description">
+        <item quantity="one">Spóla áfram um %d sekúndu</item>
+        <item quantity="other">Spóla áfram um %d sekúndur</item>
+    </plurals>
+    <string name="player_cc_enabled_description">Slökkva á skjátexta</string>
+    <string name="player_cc_disabled_description">Kveikja á skjátexta</string>
+    <string name="player_track_title_audio">Hljóð</string>
+    <string name="player_track_none">Ekkert</string>
+    <string name="player_track_auto">Sjálfvirkt</string>
+</resources>

@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="player_seek_bar_description">Afspeelvoortgang</string>
+    <string name="player_settings_description">Instellingen</string>
+    <string name="player_pause_description">Pauzeren</string>
+    <string name="player_play_description">Afspelen</string>
+    <string name="player_rewind_description">Terugspoelen</string>
+    <plurals name="player_rewind_by_amount_description">
+        <item quantity="one">%d seconde terugspoelen</item>
+        <item quantity="other">%d seconden terugspoelen</item>
+    </plurals>
+    <string name="player_fastforward_description">Vooruitspoelen</string>
+    <plurals name="player_fastforward_by_amount_description">
+        <item quantity="one">%d seconde vooruitspoelen</item>
+        <item quantity="other">%d seconden vooruitspoelen</item>
+    </plurals>
+    <string name="player_cc_enabled_description">Ondertiteling uitzetten</string>
+    <string name="player_cc_disabled_description">Ondertiteling aanzetten</string>
+    <string name="player_track_title_audio">Audio</string>
+    <string name="player_track_none">Geen</string>
+    <string name="player_track_auto">Auto</string>
+</resources>

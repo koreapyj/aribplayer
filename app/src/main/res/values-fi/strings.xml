@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="player_seek_bar_description">Toiston edistyminen</string>
+    <string name="player_settings_description">Asetukset</string>
+    <string name="player_pause_description">Keskeytä</string>
+    <string name="player_play_description">Toista</string>
+    <string name="player_rewind_description">Kelaa taaksepäin</string>
+    <plurals name="player_rewind_by_amount_description">
+        <item quantity="one">Siirry taaksepäin %d sekunti</item>
+        <item quantity="other">Siirry taaksepäin %d sekuntia</item>
+    </plurals>
+    <string name="player_fastforward_description">Kelaa eteenpäin</string>
+    <plurals name="player_fastforward_by_amount_description">
+        <item quantity="one">Siirry eteenpäin %d sekunti</item>
+        <item quantity="other">Siirry eteenpäin %d sekuntia</item>
+    </plurals>
+    <string name="player_cc_enabled_description">Poista tekstitykset käytöstä</string>
+    <string name="player_cc_disabled_description">Ota tekstitykset käyttöön</string>
+    <string name="player_track_title_audio">Ääni</string>
+    <string name="player_track_none">–</string>
+    <string name="player_track_auto">Automaattinen</string>
+</resources>

@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="player_seek_bar_description">वीडियो चलने की प्रगति</string>
+    <string name="player_settings_description">सेटिंग</string>
+    <string name="player_pause_description">रोकें</string>
+    <string name="player_play_description">चलाएं</string>
+    <string name="player_rewind_description">पीछे ले जाएं</string>
+    <plurals name="player_rewind_by_amount_description">
+        <item quantity="one">वीडियो को %d सेकंड पीछे ले जाएं</item>
+        <item quantity="other">वीडियो को %d सेकंड पीछे ले जाएं</item>
+    </plurals>
+    <string name="player_fastforward_description">तेज़ी से आगे बढ़ाएं</string>
+    <plurals name="player_fastforward_by_amount_description">
+        <item quantity="one">वीडियो को %d सेकंड आगे बढ़ाएं</item>
+        <item quantity="other">वीडियो को %d सेकंड आगे बढ़ाएं</item>
+    </plurals>
+    <string name="player_cc_enabled_description">सबटाइटल बंद करें</string>
+    <string name="player_cc_disabled_description">सबटाइटल चालू करें</string>
+    <string name="player_track_title_audio">ऑडियो</string>
+    <string name="player_track_none">कोई नहीं</string>
+    <string name="player_track_auto">अपने आप</string>
+</resources>

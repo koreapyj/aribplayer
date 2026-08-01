@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="player_seek_bar_description">Progression de la lecture</string>
+    <string name="player_settings_description">Paramètres</string>
+    <string name="player_pause_description">Pause</string>
+    <string name="player_play_description">Lecture</string>
+    <string name="player_rewind_description">Retour arrière</string>
+    <plurals name="player_rewind_by_amount_description">
+        <item quantity="one">Revenir en arrière de %d seconde</item>
+        <item quantity="other">Revenir en arrière de %d secondes</item>
+    </plurals>
+    <string name="player_fastforward_description">Avance rapide</string>
+    <plurals name="player_fastforward_by_amount_description">
+        <item quantity="one">Avancer de %d seconde</item>
+        <item quantity="other">Avancer de %d secondes</item>
+    </plurals>
+    <string name="player_cc_enabled_description">Désactiver les sous-titres</string>
+    <string name="player_cc_disabled_description">Activer les sous-titres</string>
+    <string name="player_track_title_audio">Audio</string>
+    <string name="player_track_none">Aucun</string>
+    <string name="player_track_auto">Automatique</string>
+</resources>

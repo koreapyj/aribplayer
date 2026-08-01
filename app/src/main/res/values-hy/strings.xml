@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="player_seek_bar_description">Նվագարկման ընթացքը</string>
+    <string name="player_settings_description">Կարգավորումներ</string>
+    <string name="player_pause_description">Դադարեցնել</string>
+    <string name="player_play_description">Նվագարկել</string>
+    <string name="player_rewind_description">Հետ</string>
+    <plurals name="player_rewind_by_amount_description">
+        <item quantity="one">%d վայրկյան հետ տալ</item>
+        <item quantity="other">%d վայրկյան հետ տալ</item>
+    </plurals>
+    <string name="player_fastforward_description">Առաջ</string>
+    <plurals name="player_fastforward_by_amount_description">
+        <item quantity="one">%d վայրկյան առաջ տալ</item>
+        <item quantity="other">%d վայրկյան առաջ տալ</item>
+    </plurals>
+    <string name="player_cc_enabled_description">Անջատել ենթագրերը</string>
+    <string name="player_cc_disabled_description">Միացնել ենթագրերը</string>
+    <string name="player_track_title_audio">Աուդիո</string>
+    <string name="player_track_none">Ոչ մեկը</string>
+    <string name="player_track_auto">Ավտոմատ</string>
+</resources>

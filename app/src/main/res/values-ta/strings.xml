@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="player_seek_bar_description">வீடியோவின் இயக்க நிலை</string>
+    <string name="player_settings_description">அமைப்புகள்</string>
+    <string name="player_pause_description">இடைநிறுத்து</string>
+    <string name="player_play_description">இயக்கு</string>
+    <string name="player_rewind_description">பின்செல்</string>
+    <plurals name="player_rewind_by_amount_description">
+        <item quantity="one">%d வினாடி ரீவைண்ட் ஆகும்</item>
+        <item quantity="other">%d வினாடிகள் ரீவைண்ட் ஆகும்</item>
+    </plurals>
+    <string name="player_fastforward_description">வேகமாக முன்செல்</string>
+    <plurals name="player_fastforward_by_amount_description">
+        <item quantity="one">%d வினாடி ஃபாஸ்ட் ஃபார்வர்ட் ஆகும்</item>
+        <item quantity="other">%d வினாடிகள் ஃபாஸ்ட் ஃபார்வர்ட் ஆகும்</item>
+    </plurals>
+    <string name="player_cc_enabled_description">சப்டைட்டில்களை முடக்கும்</string>
+    <string name="player_cc_disabled_description">சப்டைட்டில்களை இயக்கும்</string>
+    <string name="player_track_title_audio">ஆடியோ</string>
+    <string name="player_track_none">ஏதுமில்லை</string>
+    <string name="player_track_auto">தானியங்கு</string>
+</resources>

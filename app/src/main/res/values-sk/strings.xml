@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="player_seek_bar_description">Priebeh prehrávania</string>
+    <string name="player_settings_description">Nastavenia</string>
+    <string name="player_pause_description">Pozastaviť</string>
+    <string name="player_play_description">Prehrať</string>
+    <string name="player_rewind_description">Pretočiť späť</string>
+    <plurals name="player_rewind_by_amount_description">
+        <item quantity="one">Pretočiť späť o %d sekundu</item>
+        <item quantity="few">Pretočiť späť o %d sekundy</item>
+        <item quantity="many">Pretočiť späť o %d sekundy</item>
+        <item quantity="other">Pretočiť späť o %d sekúnd</item>
+    </plurals>
+    <string name="player_fastforward_description">Pretočiť dopredu</string>
+    <plurals name="player_fastforward_by_amount_description">
+        <item quantity="one">Pretočiť dopredu o %d sekundu</item>
+        <item quantity="few">Pretočiť dopredu o %d sekundy</item>
+        <item quantity="many">Pretočiť dopredu o %d sekundy</item>
+        <item quantity="other">Pretočiť dopredu o %d sekúnd</item>
+    </plurals>
+    <string name="player_cc_enabled_description">Zakázať titulky</string>
+    <string name="player_cc_disabled_description">Povoliť titulky</string>
+    <string name="player_track_title_audio">Zvuk</string>
+    <string name="player_track_none">Žiadne</string>
+    <string name="player_track_auto">Automaticky</string>
+</resources>

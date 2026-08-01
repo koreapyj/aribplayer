@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="player_seek_bar_description">प्लेबॅकची प्रगती</string>
+    <string name="player_settings_description">सेटिंग्ज</string>
+    <string name="player_pause_description">विराम</string>
+    <string name="player_play_description">प्‍ले करा</string>
+    <string name="player_rewind_description">रीवाइंड करा</string>
+    <plurals name="player_rewind_by_amount_description">
+        <item quantity="one">%d सेकंद रिवाइंड करा</item>
+        <item quantity="other">%d सेकंद रिवाइंड करा</item>
+    </plurals>
+    <string name="player_fastforward_description">फास्ट फॉरवर्ड करा</string>
+    <plurals name="player_fastforward_by_amount_description">
+        <item quantity="one">%d सेकंद फास्ट फॉरवर्ड करा</item>
+        <item quantity="other">%d सेकंद फास्ट फॉरवर्ड करा</item>
+    </plurals>
+    <string name="player_cc_enabled_description">सबटायटल बंद करा</string>
+    <string name="player_cc_disabled_description">सबटायटल सुरू करा</string>
+    <string name="player_track_title_audio">ऑडिओ</string>
+    <string name="player_track_none">काहीही नाही</string>
+    <string name="player_track_auto">आपोआप</string>
+</resources>

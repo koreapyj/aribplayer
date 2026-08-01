@@ -1,0 +1,20 @@
+aribplayer is distributed under the terms of the GNU General Public License,
+version 2 of the License, or (at your option) any later version.
+
+See the LICENSE file for the full text of GPL version 2.
+
+Third-party components bundled with or linked into this application are
+licensed under their own terms, which are compatible with this distribution:
+
+- jellyfin-ffmpeg / FFmpeg: LGPL-2.1-or-later (built without GPL-flagged
+  components; exact source, patch series and build scripts are provided in
+  third_party/).
+- libaribcaption: MIT License.
+- FreeType: FreeType License (FTL).
+- Khronos OpenCL headers: Apache License 2.0.
+- AndroidX / Jetpack Compose / Material Icons: Apache License 2.0.
+- Player UI strings derived from AndroidX Media3: Apache License 2.0
+  (see NOTICE).
+
+The bundled WLCMARU2004ARIBU.TTF font is subject to its own license terms;
+verify redistribution terms before redistributing this application.

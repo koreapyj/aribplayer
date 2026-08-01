@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="player_seek_bar_description">Progrés de la reproducció</string>
+    <string name="player_settings_description">Configuració</string>
+    <string name="player_pause_description">Posa en pausa</string>
+    <string name="player_play_description">Reprodueix</string>
+    <string name="player_rewind_description">Rebobina</string>
+    <plurals name="player_rewind_by_amount_description">
+        <item quantity="one">Rebobina %d segon</item>
+        <item quantity="other">Rebobina %d segons</item>
+    </plurals>
+    <string name="player_fastforward_description">Avança ràpidament</string>
+    <plurals name="player_fastforward_by_amount_description">
+        <item quantity="one">Avança ràpidament %d segon</item>
+        <item quantity="other">Avança ràpidament %d segons</item>
+    </plurals>
+    <string name="player_cc_enabled_description">Desactiva els subtítols</string>
+    <string name="player_cc_disabled_description">Activa els subtítols</string>
+    <string name="player_track_title_audio">Àudio</string>
+    <string name="player_track_none">Cap</string>
+    <string name="player_track_auto">Automàtica</string>
+</resources>

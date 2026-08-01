@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="player_seek_bar_description">Дахин тоглуулах явц</string>
+    <string name="player_settings_description">Тохиргоо</string>
+    <string name="player_pause_description">Түр зогсоох</string>
+    <string name="player_play_description">Тоглуулах</string>
+    <string name="player_rewind_description">Ухраах</string>
+    <plurals name="player_rewind_by_amount_description">
+        <item quantity="one">%d секунд ухраах</item>
+        <item quantity="other">%d секунд ухраах</item>
+    </plurals>
+    <string name="player_fastforward_description">Хурдан урагшлуулах</string>
+    <plurals name="player_fastforward_by_amount_description">
+        <item quantity="one">%d секундээр хурдан урагшлуулах</item>
+        <item quantity="other">%d секундээр хурдан урагшлуулах</item>
+    </plurals>
+    <string name="player_cc_enabled_description">Хадмалыг идэвхгүй болгох</string>
+    <string name="player_cc_disabled_description">Хадмалыг идэвхжүүлэх</string>
+    <string name="player_track_title_audio">Дуу</string>
+    <string name="player_track_none">Байхгүй</string>
+    <string name="player_track_auto">Автомат</string>
+</resources>

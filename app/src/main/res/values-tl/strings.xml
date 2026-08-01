@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="player_seek_bar_description">Progreso ng pag-playback</string>
+    <string name="player_settings_description">Mga Setting</string>
+    <string name="player_pause_description">I-pause</string>
+    <string name="player_play_description">I-play</string>
+    <string name="player_rewind_description">I-rewind</string>
+    <plurals name="player_rewind_by_amount_description">
+        <item quantity="one">I-rewind nang %d segundo</item>
+        <item quantity="other">I-rewind nang %d na segundo</item>
+    </plurals>
+    <string name="player_fastforward_description">I-fast forward</string>
+    <plurals name="player_fastforward_by_amount_description">
+        <item quantity="one">I-fast forward nang %d segundo</item>
+        <item quantity="other">I-fast forward nang %d na segundo</item>
+    </plurals>
+    <string name="player_cc_enabled_description">I-disable ang mga subtitle</string>
+    <string name="player_cc_disabled_description">I-enable ang mga subtitle</string>
+    <string name="player_track_title_audio">Audio</string>
+    <string name="player_track_none">Wala</string>
+    <string name="player_track_auto">Awtomatiko</string>
+</resources>

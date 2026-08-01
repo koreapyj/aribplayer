@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="player_seek_bar_description">Progreso de reproducción</string>
+    <string name="player_settings_description">Ajustes</string>
+    <string name="player_pause_description">Pausar</string>
+    <string name="player_play_description">Reproducir</string>
+    <string name="player_rewind_description">Rebobinar</string>
+    <plurals name="player_rewind_by_amount_description">
+        <item quantity="one">Retroceder %d segundo</item>
+        <item quantity="other">Retroceder %d segundos</item>
+    </plurals>
+    <string name="player_fastforward_description">Avanzar rápidamente</string>
+    <plurals name="player_fastforward_by_amount_description">
+        <item quantity="one">Avanzar %d segundo</item>
+        <item quantity="other">Avanzar %d segundos</item>
+    </plurals>
+    <string name="player_cc_enabled_description">Inhabilitar subtítulos</string>
+    <string name="player_cc_disabled_description">Habilitar subtítulos</string>
+    <string name="player_track_title_audio">Audio</string>
+    <string name="player_track_none">Ninguna</string>
+    <string name="player_track_auto">Automático</string>
+</resources>

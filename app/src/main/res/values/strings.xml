@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources xmlns:xliff="urn:oasis:names:tc:xliff:document:1.2">
+    <string name="player_seek_bar_description">Playback progress</string>
+    <string name="player_settings_description">Settings</string>
+    <string name="player_pause_description">Pause</string>
+    <string name="player_play_description">Play</string>
+    <string name="player_rewind_description">Rewind</string>
+    <plurals name="player_rewind_by_amount_description">
+        <item quantity="one">Rewind <xliff:g id="rewind_amount" example="1">%d</xliff:g> second</item>
+        <item quantity="other">Rewind <xliff:g id="rewind_amount" example="30">%d</xliff:g> seconds</item>
+    </plurals>
+    <string name="player_fastforward_description">Fast forward</string>
+    <plurals name="player_fastforward_by_amount_description">
+        <item quantity="one">Fast forward <xliff:g id="fastforward_amount" example="1">%d</xliff:g> second</item>
+        <item quantity="other">Fast forward <xliff:g id="fastforward_amount" example="30">%d</xliff:g> seconds</item>
+    </plurals>
+    <string name="player_cc_enabled_description">Disable subtitles</string>
+    <string name="player_cc_disabled_description">Enable subtitles</string>
+    <string name="player_track_title_audio">Audio</string>
+    <string name="player_track_none">None</string>
+    <string name="player_track_auto">Auto</string>
+    <string name="player_info_description">Information</string>
+    <string name="player_video_filter">Video filter</string>
+    <string name="player_mode_auto">Auto</string>
+    <string name="player_mode_ivtc">IVTC</string>
+    <string name="player_mode_deinterlace">Deinterlace</string>
+    <string name="player_mode_off">Off</string>
+    <string name="player_app_settings_subtitle">Default playback preferences</string>
+    <string name="player_default_video_mode">Default video mode</string>
+    <string name="player_seek_step">Seek step</string>
+    <string name="player_diagnostics">Diagnostics</string>
+    <string name="player_on">On</string>
+    <string name="player_off">Off</string>
+    <plurals name="player_seconds">
+        <item quantity="one"><xliff:g id="seconds" example="1">%d</xliff:g> second</item>
+        <item quantity="other"><xliff:g id="seconds" example="30">%d</xliff:g> seconds</item>
+    </plurals>
+    <string name="player_decoder_hardware">hardware</string>
+    <string name="player_decoder_software">software</string>
+    <string name="player_diagnostics_decoder">Decoder: <xliff:g id="decoder">%1$s</xliff:g> (<xliff:g id="implementation">%2$s</xliff:g>)</string>
+    <string name="player_diagnostics_decoder_pending">Decoder: pending</string>
+    <string name="player_diagnostics_filter">Effective filter: <xliff:g id="mode">%1$s</xliff:g> (<xliff:g id="backend">%2$s</xliff:g>)</string>
+    <string name="player_backend_opencl">OpenCL</string>
+    <string name="player_backend_software">software fallback</string>
+    <string name="player_backend_bypass">bypass</string>
+    <string name="player_backend_pending">pending</string>
+    <string name="player_diagnostics_waiting">Waiting for native statistics…</string>
+    <string name="player_open_from_file_manager">Open a video from your file manager</string>
+    <string name="player_invalid_open_request">Unable to open the selected video.</string>
+    <string name="player_unreadable_open_request">The selected video can no longer be read.</string>
+    <string name="player_resume_prompt">Continue from <xliff:g id="position">%1$s</xliff:g>?</string>
+    <string name="player_resume">Resume</string>
+    <string name="player_start_over">Start over</string>
+    <string name="player_selected_program">Selected program</string>
+</resources>

@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="player_seek_bar_description">Напредовање репродукције</string>
+    <string name="player_settings_description">Подешавања</string>
+    <string name="player_pause_description">Паузирај</string>
+    <string name="player_play_description">Пусти</string>
+    <string name="player_rewind_description">Премотај уназад</string>
+    <plurals name="player_rewind_by_amount_description">
+        <item quantity="one">Премотајте %d секунду уназад</item>
+        <item quantity="few">Премотајте %d секунде уназад</item>
+        <item quantity="other">Премотајте %d секунди уназад</item>
+    </plurals>
+    <string name="player_fastforward_description">Премотај унапред</string>
+    <plurals name="player_fastforward_by_amount_description">
+        <item quantity="one">Премотајте %d секунду унапред</item>
+        <item quantity="few">Премотајте %d секунде унапред</item>
+        <item quantity="other">Премотајте %d секунди унапред</item>
+    </plurals>
+    <string name="player_cc_enabled_description">Онемогући титлове</string>
+    <string name="player_cc_disabled_description">Омогући титлове</string>
+    <string name="player_track_title_audio">Аудио</string>
+    <string name="player_track_none">Ниједна</string>
+    <string name="player_track_auto">Аутоматски</string>
+</resources>

@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="player_seek_bar_description">ప్లేబ్యాక్ ప్రోగ్రెస్</string>
+    <string name="player_settings_description">సెట్టింగ్‌లు</string>
+    <string name="player_pause_description">పాజ్ చేయండి</string>
+    <string name="player_play_description">ప్లే చేయండి</string>
+    <string name="player_rewind_description">రివైండ్ చేయండి</string>
+    <plurals name="player_rewind_by_amount_description">
+        <item quantity="one">%d సెకండ్ రివైండ్ చేయండి</item>
+        <item quantity="other">%d సెకన్లు రివైండ్ చేయండి</item>
+    </plurals>
+    <string name="player_fastforward_description">వేగంగా ఫార్వర్డ్ చేయండి</string>
+    <plurals name="player_fastforward_by_amount_description">
+        <item quantity="one">%d సెకండ్ వేగంగా ఫార్వర్డ్ చేయండి</item>
+        <item quantity="other">%d సెకన్లు వేగంగా ఫార్వర్డ్ చేయండి</item>
+    </plurals>
+    <string name="player_cc_enabled_description">ఉప శీర్షికలను డిజేబుల్ చేయి</string>
+    <string name="player_cc_disabled_description">ఉప శీర్షికలను ఎనేబుల్ చేయి</string>
+    <string name="player_track_title_audio">ఆడియో</string>
+    <string name="player_track_none">ఏదీ కాదు</string>
+    <string name="player_track_auto">స్వీయ</string>
+</resources>

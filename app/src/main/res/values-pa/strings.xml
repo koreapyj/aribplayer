@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="player_seek_bar_description">ਪਲੇਬੈਕ ਪ੍ਰਗਤੀ</string>
+    <string name="player_settings_description">ਸੈਟਿੰਗਾਂ</string>
+    <string name="player_pause_description">ਰੋਕੋ</string>
+    <string name="player_play_description">ਚਲਾਓ</string>
+    <string name="player_rewind_description">ਪਿੱਛੇ ਕਰੋ</string>
+    <plurals name="player_rewind_by_amount_description">
+        <item quantity="one">%d ਸਕਿੰਟ ਪਿੱਛੇ ਕਰੋ</item>
+        <item quantity="other">%d ਸਕਿੰਟ ਪਿੱਛੇ ਕਰੋ</item>
+    </plurals>
+    <string name="player_fastforward_description">ਤੇਜ਼ੀ ਨਾਲ ਅੱਗੇ ਕਰੋ</string>
+    <plurals name="player_fastforward_by_amount_description">
+        <item quantity="one">ਤੇਜ਼ੀ ਨਾਲ %d ਸਕਿੰਟ ਅੱਗੇ ਕਰੋ</item>
+        <item quantity="other">ਤੇਜ਼ੀ ਨਾਲ %d ਸਕਿੰਟ ਅੱਗੇ ਕਰੋ</item>
+    </plurals>
+    <string name="player_cc_enabled_description">ਉਪਸਿਰਲੇਖਾਂ ਨੂੰ ਬੰਦ ਕਰੋ</string>
+    <string name="player_cc_disabled_description">ਉਪਸਿਰਲੇਖਾਂ ਨੂੰ ਚਾਲੂ ਕਰੋ</string>
+    <string name="player_track_title_audio">ਆਡੀਓ</string>
+    <string name="player_track_none">ਕੋਈ ਨਹੀਂ</string>
+    <string name="player_track_auto">ਸਵੈਚਲਿਤ</string>
+</resources>

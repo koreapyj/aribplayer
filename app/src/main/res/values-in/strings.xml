@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="player_seek_bar_description">Progres pemutaran</string>
+    <string name="player_settings_description">Setelan</string>
+    <string name="player_pause_description">Jeda</string>
+    <string name="player_play_description">Putar</string>
+    <string name="player_rewind_description">Putar Ulang</string>
+    <plurals name="player_rewind_by_amount_description">
+        <item quantity="one">Mundur %d detik</item>
+        <item quantity="other">Mundur %d detik</item>
+    </plurals>
+    <string name="player_fastforward_description">Maju cepat</string>
+    <plurals name="player_fastforward_by_amount_description">
+        <item quantity="one">Maju cepat %d detik</item>
+        <item quantity="other">Maju cepat %d detik</item>
+    </plurals>
+    <string name="player_cc_enabled_description">Nonaktifkan subtitel</string>
+    <string name="player_cc_disabled_description">Aktifkan subtitel</string>
+    <string name="player_track_title_audio">Audio</string>
+    <string name="player_track_none">Tidak ada</string>
+    <string name="player_track_auto">Otomatis</string>
+</resources>

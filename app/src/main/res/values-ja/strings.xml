@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="player_seek_bar_description">再生中</string>
+    <string name="player_settings_description">設定</string>
+    <string name="player_pause_description">一時停止</string>
+    <string name="player_play_description">再生</string>
+    <string name="player_rewind_description">巻き戻し</string>
+    <plurals name="player_rewind_by_amount_description">
+        <item quantity="one">%d 秒巻き戻し</item>
+        <item quantity="other">%d 秒巻き戻し</item>
+    </plurals>
+    <string name="player_fastforward_description">早送り</string>
+    <plurals name="player_fastforward_by_amount_description">
+        <item quantity="one">%d 秒早送り</item>
+        <item quantity="other">%d 秒早送り</item>
+    </plurals>
+    <string name="player_cc_enabled_description">字幕の無効化</string>
+    <string name="player_cc_disabled_description">字幕の有効化</string>
+    <string name="player_track_title_audio">音声</string>
+    <string name="player_track_none">なし</string>
+    <string name="player_track_auto">自動</string>
+</resources>

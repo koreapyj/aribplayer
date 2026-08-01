@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="player_seek_bar_description">પ્લેબૅક ચાલુ છે</string>
+    <string name="player_settings_description">સેટિંગ</string>
+    <string name="player_pause_description">થોભો</string>
+    <string name="player_play_description">ચલાવો</string>
+    <string name="player_rewind_description">રિવાઇન્ડ કરો</string>
+    <plurals name="player_rewind_by_amount_description">
+        <item quantity="one">%d સેકન્ડ રિવાઇન્ડ કરો</item>
+        <item quantity="other">%d સેકન્ડ રિવાઇન્ડ કરો</item>
+    </plurals>
+    <string name="player_fastforward_description">ફાસ્ટ ફૉરવર્ડ કરો</string>
+    <plurals name="player_fastforward_by_amount_description">
+        <item quantity="one">%d સેકન્ડ ફાસ્ટ ફૉરવર્ડ કરો</item>
+        <item quantity="other">%d સેકન્ડ ફાસ્ટ ફૉરવર્ડ કરો</item>
+    </plurals>
+    <string name="player_cc_enabled_description">સબટાઇટલ બંધ કરો</string>
+    <string name="player_cc_disabled_description">સબટાઇટલ ચાલુ કરો</string>
+    <string name="player_track_title_audio">ઑડિયો</string>
+    <string name="player_track_none">એકપણ નહીં</string>
+    <string name="player_track_auto">ઑટોમૅટિક રીતે</string>
+</resources>

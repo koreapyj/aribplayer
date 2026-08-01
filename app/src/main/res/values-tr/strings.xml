@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="player_seek_bar_description">Çalma ilerleme durumu</string>
+    <string name="player_settings_description">Ayarlar</string>
+    <string name="player_pause_description">Duraklat</string>
+    <string name="player_play_description">Çal</string>
+    <string name="player_rewind_description">Geri sar</string>
+    <plurals name="player_rewind_by_amount_description">
+        <item quantity="one">%d saniye geri sar</item>
+        <item quantity="other">%d saniye geri sar</item>
+    </plurals>
+    <string name="player_fastforward_description">İleri sar</string>
+    <plurals name="player_fastforward_by_amount_description">
+        <item quantity="one">%d saniye ileri sar</item>
+        <item quantity="other">%d saniye ileri sar</item>
+    </plurals>
+    <string name="player_cc_enabled_description">Altyazıları devre dışı bırak</string>
+    <string name="player_cc_disabled_description">Altyazıları etkinleştir</string>
+    <string name="player_track_title_audio">Ses</string>
+    <string name="player_track_none">Yok</string>
+    <string name="player_track_auto">Otomatik</string>
+</resources>

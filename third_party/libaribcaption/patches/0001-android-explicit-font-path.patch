@@ -1,0 +1,84 @@
+diff --git a/src/renderer/font_provider_android.cpp b/src/renderer/font_provider_android.cpp
+index 89c8dbe..68fb06f 100644
+--- a/src/renderer/font_provider_android.cpp
++++ b/src/renderer/font_provider_android.cpp
+@@ -56,6 +56,20 @@ auto FontProviderAndroid::GetFontFace(const std::string &font_name,
+                                       std::optional<uint32_t> ucs4) -> Result<FontfaceInfo, FontProviderError> {
+     FontFile* font_file = nullptr;
+ 
++    if (font_name.rfind("file:", 0) == 0) {
++        const std::string path = font_name.substr(5);
++        if (access(path.c_str(), R_OK) != 0) {
++            return Err(FontProviderError::kFontNotFound);
++        }
++
++        FontfaceInfo info;
++        info.family_name = font_name;
++        info.filename = path;
++        info.face_index = 0;
++        info.provider_type = FontProviderType::kAndroid;
++        return Ok(std::move(info));
++    }
++
+     if (iso6392_language_code_ == ThreeCC("jpn") || iso6392_language_code_ == 0) {
+         FontFamily* family = FindFallbackFamilyByLanguageAndFallbackFor("ja", font_name.c_str());
+         if (!family) {
+@@ -83,6 +97,10 @@ auto FontProviderAndroid::GetFontFace(const std::string &font_name,
+         }
+     }
+ 
++    if (!font_file) {
++        return Err(FontProviderError::kFontNotFound);
++    }
++
+     FontfaceInfo info;
+     info.family_name = font_name;
+     info.postscript_name = font_file->postscript_name;
+@@ -351,7 +369,11 @@ bool FontProviderAndroid::LMPHandleFamily(XMLElement* element) {
+ 
+ bool FontProviderAndroid::LMPHandleFont(XMLElement* element, internal::FontFamily& family) {
+     FontFile font;
+-    font.filename = element->GetText();
++    const char* lmp_font_text = element->GetText();
++    if (!lmp_font_text) {
++        return false;
++    }
++    font.filename = lmp_font_text;
+     font.weight = element->IntAttribute("weight", 400);
+     font.collection_index = element->IntAttribute("index", 0);
+ 
+@@ -366,8 +388,9 @@ bool FontProviderAndroid::LMPHandleFont(XMLElement* element, internal::FontFamil
+     }
+ 
+     if (const char* fallback_for = element->Attribute("fallbackFor")) {
++        const char* family_lang = family.languages.empty() ? "" : family.languages[0].c_str();
+         FontFamily* fallback_family =
+-                FindFallbackFamilyByLanguageAndFallbackFor(family.languages[0].c_str(),
++                FindFallbackFamilyByLanguageAndFallbackFor(family_lang,
+                                                            fallback_for);
+         if (!fallback_family) {
+             FontFamily& new_fallback_family = font_families_.emplace_back();
+@@ -469,7 +492,9 @@ bool FontProviderAndroid::JBHandleNameset(XMLElement* element, FontFamily& famil
+     element = element->FirstChildElement();
+     while (element) {
+         if (strcmp(element->Name(), "name") == 0) {
+-            family.names.emplace_back(element->GetText());
++            if (const char* name_text = element->GetText()) {
++                family.names.emplace_back(name_text);
++            }
+         }
+         element = element->NextSiblingElement();
+     }
+@@ -490,7 +515,11 @@ bool FontProviderAndroid::JBHandleFileset(XMLElement* element, FontFamily& famil
+ 
+ bool FontProviderAndroid::JBHandleFile(XMLElement* element, FontFamily& family) {
+     FontFile& font = family.fonts.emplace_back();
+-    font.filename = element->GetText();
++    const char* old_font_text = element->GetText();
++    if (!old_font_text) {
++        return false;
++    }
++    font.filename = old_font_text;
+ 
+     std::string filename_lcase(font.filename.length(), 0);
+     std::transform(font.filename.begin(),

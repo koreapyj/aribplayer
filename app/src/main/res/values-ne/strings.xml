@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="player_seek_bar_description">हालसम्म भिडियो प्ले भएको अवधि</string>
+    <string name="player_settings_description">सेटिङ</string>
+    <string name="player_pause_description">पज गर्नुहोस्</string>
+    <string name="player_play_description">प्ले गर्नुहोस्</string>
+    <string name="player_rewind_description">रिवाइन्ड गर्नुहोस्</string>
+    <plurals name="player_rewind_by_amount_description">
+        <item quantity="one">%d सेकेन्ड रिवाइन्ड गर्नुहोस्</item>
+        <item quantity="other">%d सेकेन्ड रिवाइन्ड गर्नुहोस्</item>
+    </plurals>
+    <string name="player_fastforward_description">फास्ट फर्वार्ड गर्नुहोस्</string>
+    <plurals name="player_fastforward_by_amount_description">
+        <item quantity="one">%d सेकेन्ड फास्ट फर्वार्ड गर्नुहोस्</item>
+        <item quantity="other">%d सेकेन्ड फास्ट फर्वार्ड गर्नुहोस्</item>
+    </plurals>
+    <string name="player_cc_enabled_description">सबटाइटलहरू असक्षम पार्नुहोस्</string>
+    <string name="player_cc_disabled_description">सबटाइटलहरू सक्षम पार्नुहोस्</string>
+    <string name="player_track_title_audio">अडियो</string>
+    <string name="player_track_none">कुनै पनि होइन</string>
+    <string name="player_track_auto">स्वतः</string>
+</resources>

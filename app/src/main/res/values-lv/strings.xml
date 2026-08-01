@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="player_seek_bar_description">Atskaņošanas norise</string>
+    <string name="player_settings_description">Iestatījumi</string>
+    <string name="player_pause_description">Pauzēt</string>
+    <string name="player_play_description">Atskaņot</string>
+    <string name="player_rewind_description">Attīt atpakaļ</string>
+    <plurals name="player_rewind_by_amount_description">
+        <item quantity="zero">Attīt atpakaļ par %d sekundēm</item>
+        <item quantity="one">Attīt atpakaļ par %d sekundi</item>
+        <item quantity="other">Attīt atpakaļ par %d sekundēm</item>
+    </plurals>
+    <string name="player_fastforward_description">Pārtīt uz priekšu</string>
+    <plurals name="player_fastforward_by_amount_description">
+        <item quantity="zero">Pārtīt uz priekšu par %d sekundēm</item>
+        <item quantity="one">Pārtīt uz priekšu par %d sekundi</item>
+        <item quantity="other">Pārtīt uz priekšu par %d sekundēm</item>
+    </plurals>
+    <string name="player_cc_enabled_description">Atspējot subtitrus</string>
+    <string name="player_cc_disabled_description">Iespējot subtitrus</string>
+    <string name="player_track_title_audio">Audio</string>
+    <string name="player_track_none">Nav</string>
+    <string name="player_track_auto">Automātisks</string>
+</resources>

@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="player_seek_bar_description">Progresul redării</string>
+    <string name="player_settings_description">Setări</string>
+    <string name="player_pause_description">Întrerupe</string>
+    <string name="player_play_description">Redă</string>
+    <string name="player_rewind_description">Derulează înapoi</string>
+    <plurals name="player_rewind_by_amount_description">
+        <item quantity="one">Derulează înapoi cu %d secundă</item>
+        <item quantity="few">Derulează înapoi cu %d secunde</item>
+        <item quantity="other">Derulează înapoi cu %d de secunde</item>
+    </plurals>
+    <string name="player_fastforward_description">Derulează rapid înainte</string>
+    <plurals name="player_fastforward_by_amount_description">
+        <item quantity="one">Derulează rapid înainte cu %d secundă</item>
+        <item quantity="few">Derulează rapid înainte cu %d secunde</item>
+        <item quantity="other">Derulează rapid înainte cu %d de secunde</item>
+    </plurals>
+    <string name="player_cc_enabled_description">Dezactivează subtitrările</string>
+    <string name="player_cc_disabled_description">Activează subtitrările</string>
+    <string name="player_track_title_audio">Audio</string>
+    <string name="player_track_none">Fără</string>
+    <string name="player_track_auto">Automat</string>
+</resources>

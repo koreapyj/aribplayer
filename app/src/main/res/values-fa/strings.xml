@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="player_seek_bar_description">پیشرفت بازپخش</string>
+    <string name="player_settings_description">تنظیمات</string>
+    <string name="player_pause_description">مکث</string>
+    <string name="player_play_description">پخش</string>
+    <string name="player_rewind_description">عقب بردن</string>
+    <plurals name="player_rewind_by_amount_description">
+        <item quantity="one">%d ثانیه به‌عقب بردن</item>
+        <item quantity="other">%d ثانیه به‌عقب بردن</item>
+    </plurals>
+    <string name="player_fastforward_description">جلو بردن سریع</string>
+    <plurals name="player_fastforward_by_amount_description">
+        <item quantity="one">%d ثانیه سریع به‌جلو بردن</item>
+        <item quantity="other">%d ثانیه سریع به‌جلو بردن</item>
+    </plurals>
+    <string name="player_cc_enabled_description">غیرفعال کردن زیرنویس</string>
+    <string name="player_cc_disabled_description">فعال کردن زیرنویس</string>
+    <string name="player_track_title_audio">صوتی</string>
+    <string name="player_track_none">هیچ‌کدام</string>
+    <string name="player_track_auto">خودکار</string>
+</resources>

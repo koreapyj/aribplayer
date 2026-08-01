@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="player_seek_bar_description">Erreprodukzioaren garapena</string>
+    <string name="player_settings_description">Ezarpenak</string>
+    <string name="player_pause_description">Pausatu</string>
+    <string name="player_play_description">Erreproduzitu</string>
+    <string name="player_rewind_description">Atzeratu</string>
+    <plurals name="player_rewind_by_amount_description">
+        <item quantity="one">Atzeratu %d segundo</item>
+        <item quantity="other">Atzeratu %d segundo</item>
+    </plurals>
+    <string name="player_fastforward_description">Aurreratu</string>
+    <plurals name="player_fastforward_by_amount_description">
+        <item quantity="one">Aurreratu %d segundo</item>
+        <item quantity="other">Aurreratu %d segundo</item>
+    </plurals>
+    <string name="player_cc_enabled_description">Desgaitu azpitituluak</string>
+    <string name="player_cc_disabled_description">Gaitu azpitituluak</string>
+    <string name="player_track_title_audio">Audioa</string>
+    <string name="player_track_none">Bat ere ez</string>
+    <string name="player_track_auto">Automatikoa</string>
+</resources>

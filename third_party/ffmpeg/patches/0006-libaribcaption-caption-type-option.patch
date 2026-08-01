@@ -1,0 +1,44 @@
+diff --git a/libavcodec/libaribcaption.c b/libavcodec/libaribcaption.c
+--- a/libavcodec/libaribcaption.c
++++ b/libavcodec/libaribcaption.c
+@@ -68,6 +68,7 @@ typedef struct ARIBCaptionContext {
+     aribcc_renderer_t *renderer;
+
+     int subtitle_type;
++    int caption_type;
+     int encoding_scheme;
+     int ass_single_rect;
+     char *font;
+@@ -1000,7 +1001,7 @@ static int aribcaption_init(AVCodecContext *avctx)
+     }
+     if (!aribcc_decoder_initialize(ctx->decoder,
+                                    (enum aribcc_encoding_scheme_t) ctx->encoding_scheme,
+-                                   ARIBCC_CAPTIONTYPE_CAPTION,
++                                   (enum aribcc_captiontype_t) ctx->caption_type,
+                                    profile,
+                                    ARIBCC_LANGUAGEID_FIRST)) {
+         av_log(avctx, AV_LOG_ERROR, "Failed to initialize libaribcaption decoder.\n");
+@@ -1034,7 +1035,7 @@ static int aribcaption_init(AVCodecContext *avctx)
+             return AVERROR_EXTERNAL;
+         }
+         if(!aribcc_renderer_initialize(ctx->renderer,
+-                                       ARIBCC_CAPTIONTYPE_CAPTION,
++                                       (enum aribcc_captiontype_t) ctx->caption_type,
+                                        ARIBCC_FONTPROVIDER_TYPE_AUTO,
+                                        ARIBCC_TEXTRENDERER_TYPE_AUTO)) {
+             av_log(avctx, AV_LOG_ERROR, "Failed to initialize libaribcaption renderer.\n");
+@@ -1124,6 +1125,13 @@ static const AVOption options[] = {
+       { .i64 = SUBTITLE_ASS }, .flags = SD, .unit = "type" },
+     { "caption_encoding", "encoding scheme of subtitle text",
+       OFFSET(encoding_scheme), AV_OPT_TYPE_INT, { .i64 = ARIBCC_ENCODING_SCHEME_AUTO },
+       ARIBCC_ENCODING_SCHEME_AUTO, ARIBCC_ENCODING_SCHEME_ABNT_NBR_15606_1_LATIN, SD, .unit = "encoding" },
++    { "caption_type", "ARIB caption type",
++      OFFSET(caption_type), AV_OPT_TYPE_INT, { .i64 = ARIBCC_CAPTIONTYPE_CAPTION },
++      ARIBCC_CAPTIONTYPE_CAPTION, ARIBCC_CAPTIONTYPE_SUPERIMPOSE, SD, .unit = "caption_type" },
++    { "caption", "caption service", 0, AV_OPT_TYPE_CONST,
++      { .i64 = ARIBCC_CAPTIONTYPE_CAPTION }, .flags = SD, .unit = "caption_type" },
++    { "superimpose", "superimpose service", 0, AV_OPT_TYPE_CONST,
++      { .i64 = ARIBCC_CAPTIONTYPE_SUPERIMPOSE }, .flags = SD, .unit = "caption_type" },
+     { "auto",   "automatically detect encoding scheme", 0, AV_OPT_TYPE_CONST,
+       { .i64 = ARIBCC_ENCODING_SCHEME_AUTO }, .flags = SD, .unit = "encoding" },
+     { "jis",    "8bit-char JIS encoding (Japanese ISDB captions)", 0, AV_OPT_TYPE_CONST,

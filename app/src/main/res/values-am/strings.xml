@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="player_seek_bar_description">የመልሶ ማጫወት ሂደት</string>
+    <string name="player_settings_description">ቅንብሮች</string>
+    <string name="player_pause_description">ላፍታ አቁም</string>
+    <string name="player_play_description">አጫውት</string>
+    <string name="player_rewind_description">ወደኋላ መልስ</string>
+    <plurals name="player_rewind_by_amount_description">
+        <item quantity="one">በ%d ሰከንዶች ወደኋላ ይመልሱ</item>
+        <item quantity="other">በ%d ሰከንዶች ወደኋላ ይመልሱ</item>
+    </plurals>
+    <string name="player_fastforward_description">በፍጥነት አሳልፍ</string>
+    <plurals name="player_fastforward_by_amount_description">
+        <item quantity="one">በ%d ሰከንዶች በፍጥነት ወደፊት ያሳልፉ</item>
+        <item quantity="other">በ%d ሰከንዶች በፍጥነት ወደፊት ያሳልፉ</item>
+    </plurals>
+    <string name="player_cc_enabled_description">የግርጌ ጽሑፎችን አሰናክል</string>
+    <string name="player_cc_disabled_description">የግርጌ ጽሑፎችን አንቃ</string>
+    <string name="player_track_title_audio">ኦዲዮ</string>
+    <string name="player_track_none">ምንም</string>
+    <string name="player_track_auto">ራስ-ሰር</string>
+</resources>

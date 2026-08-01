@@ -1,0 +1,54 @@
+diff --git a/libavformat/mpegts.c b/libavformat/mpegts.c
+--- a/libavformat/mpegts.c
++++ b/libavformat/mpegts.c
+@@ -2147,26 +2147,36 @@ int ff_parse_mpeg2_descriptor(AVFormatContext *fc, AVStream *st, int stream_typ
+             // Listing of data_component_ids is in STD-B10, part 2, Annex J.
+             // Component tag limits are documented in TR-B14, fascicle 2,
+             // Vol. 3, Section 2, 4.2.8.1
+             int actual_component_tag = sti->stream_identifier - 1;
+             int picked_profile = AV_PROFILE_UNKNOWN;
++            int is_superimpose = 0;
+             int data_component_id = get16(pp, desc_end);
+             if (data_component_id < 0)
+                 return AVERROR_INVALIDDATA;
+
+             switch (data_component_id) {
+             case 0x0008:
+-                // [0x30..0x37] are component tags utilized for
+-                // non-mobile captioning service ("profile A").
++                // [0x30..0x37] and [0x38..0x3f] are component tags
++                // utilized for non-mobile captioning service ("profile A").
++                // The latter range denotes a superimpose service.
+                 if (actual_component_tag >= 0x30 &&
+                     actual_component_tag <= 0x37) {
+                     picked_profile = AV_PROFILE_ARIB_PROFILE_A;
++                } else if (actual_component_tag >= 0x38 &&
++                           actual_component_tag <= 0x3f) {
++                    picked_profile = AV_PROFILE_ARIB_PROFILE_A;
++                    is_superimpose = 1;
+                 }
+                 break;
+             case 0x0012:
+-                // component tag 0x87 signifies a mobile/partial reception
+-                // (1seg) captioning service ("profile C").
++                // Component tags 0x87 and 0x88 signify mobile/partial
++                // reception (1seg) captioning services ("profile C").
++                // Tag 0x88 denotes a superimpose service.
+                 if (actual_component_tag == 0x87) {
+                     picked_profile = AV_PROFILE_ARIB_PROFILE_C;
++                } else if (actual_component_tag == 0x88) {
++                    picked_profile = AV_PROFILE_ARIB_PROFILE_C;
++                    is_superimpose = 1;
+                 }
+                 break;
+             default:
+@@ -2183,7 +2193,9 @@ int ff_parse_mpeg2_descriptor(AVFormatContext *fc, AVStream *st, int stream_typ
+                 sti->need_context_update = 1;
+             }
+             sti->request_probe = 0;
+             sti->need_parsing = 0;
++            if (is_superimpose)
++                av_dict_set(&st->metadata, "arib_type", "superimpose", 0);
+         }
+         break;
+     case 0xb0: /* DOVI video stream descriptor */

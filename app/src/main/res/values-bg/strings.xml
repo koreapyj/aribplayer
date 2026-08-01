@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="player_seek_bar_description">Напредък на възпроизвеждането</string>
+    <string name="player_settings_description">Настройки</string>
+    <string name="player_pause_description">Поставяне на пауза</string>
+    <string name="player_play_description">Възпроизвеждане</string>
+    <string name="player_rewind_description">Превъртане назад</string>
+    <plurals name="player_rewind_by_amount_description">
+        <item quantity="one">Превъртане с %d секунда назад</item>
+        <item quantity="other">Превъртане с(ъс) %d секунди назад</item>
+    </plurals>
+    <string name="player_fastforward_description">Превъртане напред</string>
+    <plurals name="player_fastforward_by_amount_description">
+        <item quantity="one">Превъртане с %d секунда напред</item>
+        <item quantity="other">Превъртане с(ъс) %d секунди напред</item>
+    </plurals>
+    <string name="player_cc_enabled_description">Деактивиране на субтитрите</string>
+    <string name="player_cc_disabled_description">Активиране на субтитрите</string>
+    <string name="player_track_title_audio">Аудиозапис</string>
+    <string name="player_track_none">Нищо</string>
+    <string name="player_track_auto">Автоматично</string>
+</resources>

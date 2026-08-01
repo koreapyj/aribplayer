@@ -1,0 +1,10 @@
+<resources>
+    <style name="Theme.ARIBPlayer" parent="android:style/Theme.Material.NoActionBar">
+        <item name="android:windowActionModeOverlay">true</item>
+        <item name="android:colorAccent">#6EA8FE</item>
+        <item name="android:windowBackground">@color/player_background</item>
+        <item name="android:statusBarColor">@color/player_background</item>
+        <item name="android:navigationBarColor">@color/player_background</item>
+        <item name="android:windowLightStatusBar">false</item>
+    </style>
+</resources>

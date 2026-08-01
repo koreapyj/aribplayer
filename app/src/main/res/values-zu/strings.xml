@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="player_seek_bar_description">Inqubekela phambili yokudlala</string>
+    <string name="player_settings_description">Amasethingi</string>
+    <string name="player_pause_description">Phumula</string>
+    <string name="player_play_description">Dlala</string>
+    <string name="player_rewind_description">Buyisela emuva</string>
+    <plurals name="player_rewind_by_amount_description">
+        <item quantity="one">Hlehlisa ngamasekhondi angu-%d</item>
+        <item quantity="other">Hlehlisa ngamasekhondi angu-%d</item>
+    </plurals>
+    <string name="player_fastforward_description">Dlulisela phambili</string>
+    <plurals name="player_fastforward_by_amount_description">
+        <item quantity="one">Dlulisela phambili ngamasekhondi angu-%d</item>
+        <item quantity="other">Dlulisela phambili ngamasekhondi angu-%d</item>
+    </plurals>
+    <string name="player_cc_enabled_description">Khubaza imibhalo engezansi</string>
+    <string name="player_cc_disabled_description">Nika amandla imibhalo engezansi</string>
+    <string name="player_track_title_audio">Umsindo</string>
+    <string name="player_track_none">Lutho</string>
+    <string name="player_track_auto">Okuzenzakalelayo</string>
+</resources>

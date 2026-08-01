@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="player_seek_bar_description">പ്ലേബാക്ക് പുരോഗതി</string>
+    <string name="player_settings_description">ക്രമീകരണം</string>
+    <string name="player_pause_description">തൽക്കാലം നിർത്തുക</string>
+    <string name="player_play_description">പ്ലേ ചെയ്യുക</string>
+    <string name="player_rewind_description">പിന്നിലേക്ക് പോവുക</string>
+    <plurals name="player_rewind_by_amount_description">
+        <item quantity="one">%d സെക്കൻഡ് പിന്നോട്ട് നീക്കുക</item>
+        <item quantity="other">%d സെക്കൻഡ് പിന്നോട്ട് നീക്കുക</item>
+    </plurals>
+    <string name="player_fastforward_description">വേഗത്തിൽ മുന്നോട്ട് പോവുക</string>
+    <plurals name="player_fastforward_by_amount_description">
+        <item quantity="one">വേഗത്തിൽ %d സെക്കൻഡ് മുന്നോട്ട് നീക്കുക</item>
+        <item quantity="other">വേഗത്തിൽ %d സെക്കൻഡ് മുന്നോട്ട് നീക്കുക</item>
+    </plurals>
+    <string name="player_cc_enabled_description">സബ്‌ടൈറ്റിലുകൾ പ്രവർത്തനരഹിതമാക്കുക</string>
+    <string name="player_cc_disabled_description">സബ്‌ടൈറ്റിലുകൾ പ്രവർത്തനക്ഷമമാക്കുക</string>
+    <string name="player_track_title_audio">ഓഡിയോ</string>
+    <string name="player_track_none">ഒന്നുമില്ല</string>
+    <string name="player_track_auto">സ്വയമേവ</string>
+</resources>

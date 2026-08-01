@@ -1,0 +1,116 @@
+name: Build Android APKs
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build ${{ matrix.abi }} APK
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        abi:
+          - arm64-v8a
+          - x86_64
+          # armeabi-v7a is intentionally deferred: 32-bit OpenCL loaders are
+          # less common and this target has not yet been validated.
+          # - armeabi-v7a
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Free disk space for native build
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost
+          sudo apt-get clean
+          df -h
+
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake pkg-config quilt git curl unzip python3 nasm ninja-build \
+            autoconf automake libtool
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+
+      - name: Restore native build cache
+        uses: actions/cache@v4
+        with:
+          path: third_party/build/${{ matrix.abi }}
+          key: native-${{ runner.os }}-${{ matrix.abi }}-${{ hashFiles('third_party/scripts/versions.env', 'third_party/**/patches/**') }}
+
+      - name: Build native FFmpeg stack
+        env:
+          ARIB_ABI: ${{ matrix.abi }}
+          ARIB_BUILD_DIR: ${{ github.workspace }}/third_party/build
+        run: bash third_party/scripts/build-all.sh
+
+      - name: Assemble debug APK
+        run: ./gradlew :app:assembleDebug -PtargetAbi=${{ matrix.abi }}
+
+      - name: Upload debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: aribplayer-${{ matrix.abi }}-debug.apk
+          path: app/build/outputs/apk/debug/aribplayer-${{ matrix.abi }}-debug.apk
+          if-no-files-found: error
+
+      # No signing credentials are present in CI by default, so app/build.gradle.kts
+      # deliberately signs release APKs with the debug key. Add a secret-backed
+      # keystore reconstruction step before distributing production-signed releases.
+      # Production signing scaffold. Create ARIB_KEYSTORE_BASE64 and
+      # ARIB_KEYSTORE_PROPERTIES repository secrets, then uncomment this step.
+      # - name: Restore release signing material
+      #   if: github.ref_type == 'tag' && startsWith(github.ref_name, 'v')
+      #   env:
+      #     ARIB_KEYSTORE_BASE64: ${{ secrets.ARIB_KEYSTORE_BASE64 }}
+      #     ARIB_KEYSTORE_PROPERTIES: ${{ secrets.ARIB_KEYSTORE_PROPERTIES }}
+      #   run: |
+      #     mkdir -p signing
+      #     printf '%s' "$ARIB_KEYSTORE_BASE64" | base64 --decode > signing/release.jks
+      #     printf '%s' "$ARIB_KEYSTORE_PROPERTIES" > signing/keystore.properties
+      - name: Assemble release APK
+        if: github.ref_type == 'tag' && startsWith(github.ref_name, 'v')
+        run: ./gradlew :app:assembleRelease -PtargetAbi=${{ matrix.abi }}
+
+      - name: Upload release APK for GitHub Release
+        if: github.ref_type == 'tag' && startsWith(github.ref_name, 'v')
+        uses: actions/upload-artifact@v4
+        with:
+          name: aribplayer-${{ matrix.abi }}-release.apk
+          path: app/build/outputs/apk/release/aribplayer-${{ matrix.abi }}-release.apk
+          if-no-files-found: error
+
+  release:
+    name: Publish tagged APKs
+    needs: build
+    if: github.ref_type == 'tag' && startsWith(github.ref_name, 'v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download release APKs
+        uses: actions/download-artifact@v4
+        with:
+          pattern: aribplayer-*-release.apk
+          path: release-apks
+          merge-multiple: true
+
+      - name: Attach APKs to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release-apks/*.apk
+          fail_on_unmatched_files: true

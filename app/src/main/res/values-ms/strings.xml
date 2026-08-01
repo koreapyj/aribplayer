@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="player_seek_bar_description">Kemajuan main balik</string>
+    <string name="player_settings_description">Tetapan</string>
+    <string name="player_pause_description">Jeda</string>
+    <string name="player_play_description">Main</string>
+    <string name="player_rewind_description">Mandir</string>
+    <plurals name="player_rewind_by_amount_description">
+        <item quantity="one">Mandir %d saat</item>
+        <item quantity="other">Mandir %d saat</item>
+    </plurals>
+    <string name="player_fastforward_description">Mundar laju</string>
+    <plurals name="player_fastforward_by_amount_description">
+        <item quantity="one">Mundar laju %d saat</item>
+        <item quantity="other">Mundar laju %d saat</item>
+    </plurals>
+    <string name="player_cc_enabled_description">Lumpuhkan sari kata</string>
+    <string name="player_cc_disabled_description">Dayakan sari kata</string>
+    <string name="player_track_title_audio">Audio</string>
+    <string name="player_track_none">Tiada</string>
+    <string name="player_track_auto">Automatik</string>
+</resources>
