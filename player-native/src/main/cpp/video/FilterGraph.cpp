@@ -5,8 +5,11 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <condition_variable>
 #include <cstdio>
+#include <memory>
 #include <sstream>
+#include <thread>
 #include <utility>
 
 extern "C" {
@@ -48,6 +51,222 @@ unsigned OpenClModeBit(VideoMode mode) {
     }
 }
 
+constexpr int64_t kOpenClProbeDeadlineMs = 1500;
+
+enum class OpenClProbeState { kUnknown, kProbing, kReady, kUnavailable };
+
+struct OpenClProbeSpec {
+    OpenClGraphKey key;
+    AVFieldOrder field_order = AV_FIELD_UNKNOWN;
+};
+
+struct OpenClProbeResult {
+    OpenClGraphKey key;
+    unsigned ready_modes = 0;
+    unsigned failed_modes = 0;
+    FilterGraph::GraphBundle ivtc;
+    FilterGraph::GraphBundle deinterlace;
+};
+
+struct OpenClProbeControl {
+    std::mutex mutex;
+    std::condition_variable condition;
+    OpenClProbeState state = OpenClProbeState::kProbing;
+    bool worker_done = false;
+    bool result_taken = false;
+    unsigned ready_modes = 0;
+    unsigned failed_modes = 0;
+    std::chrono::steady_clock::time_point deadline{};
+    OpenClGraphKey key;
+    FilterGraph::GraphBundle ivtc;
+    FilterGraph::GraphBundle deinterlace;
+};
+
+void MoveBundle(FilterGraph::GraphBundle* destination,
+                FilterGraph::GraphBundle* source) {
+    if (destination == nullptr || source == nullptr) return;
+    *destination = *source;
+    source->graph = nullptr;
+    source->source = nullptr;
+    source->sink = nullptr;
+    source->sink_time_base = AVRational{0, 1};
+}
+
+bool BuildBundleForSpec(const OpenClProbeSpec& spec, VideoMode mode, bool opencl,
+                        AVBufferRef* opencl_device, FilterGraph::GraphBundle* bundle,
+                        std::string* error);
+void RunOpenClProbe(const std::shared_ptr<OpenClProbeControl>& control,
+                    const OpenClProbeSpec& spec);
+
+class OpenClProbeCoordinator final {
+public:
+    static OpenClProbeCoordinator& Instance() {
+        static OpenClProbeCoordinator* coordinator = new OpenClProbeCoordinator();
+        return *coordinator;
+    }
+
+    void StartIfUnknown(const OpenClProbeSpec& spec) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (process_state_ == OpenClProbeState::kUnavailable || control_ != nullptr) return;
+        StartProbeLocked(spec);
+    }
+
+    bool Acquire(const OpenClProbeSpec& spec, OpenClProbeResult* result) {
+        if (result == nullptr) return false;
+        StartIfUnknown(spec);
+
+        std::shared_ptr<OpenClProbeControl> control;
+        bool wait_for_worker = false;
+        {
+            std::lock_guard<std::mutex> coordinator_lock(mutex_);
+            if (process_state_ == OpenClProbeState::kUnavailable) return false;
+            if (control_ == nullptr) StartProbeLocked(spec);
+            control = control_;
+            if (control == nullptr) return false;
+
+            OpenClProbeState worker_state;
+            bool result_taken = false;
+            OpenClGraphKey worker_key;
+            {
+                std::lock_guard<std::mutex> control_lock(control->mutex);
+                worker_state = control->state;
+                result_taken = control->result_taken;
+                worker_key = control->key;
+            }
+
+            if (worker_state == OpenClProbeState::kUnavailable) {
+                process_state_ = OpenClProbeState::kUnavailable;
+                JoinWorkerIfCurrentLocked(control);
+                return false;
+            }
+            if (worker_state == OpenClProbeState::kProbing) {
+                // A different key must not make this open wait behind another
+                // session's build. It will use software and a later open may try.
+                if (!(worker_key == spec.key)) return false;
+                wait_for_worker = true;
+            } else if (worker_state == OpenClProbeState::kReady &&
+                       (result_taken || !(worker_key == spec.key))) {
+                // The compiler is known to be healthy, but the prepared graph
+                // is single-use or keyed to another format. Join the completed
+                // worker before replacing its control block so there is still
+                // only one process-global worker at a time.
+                process_state_ = OpenClProbeState::kReady;
+                JoinWorkerIfCurrentLocked(control);
+                StartProbeLocked(spec);
+                control = control_;
+                wait_for_worker = true;
+            }
+        }
+
+        if (wait_for_worker) {
+            std::unique_lock<std::mutex> control_lock(control->mutex);
+            if (control->state == OpenClProbeState::kProbing) {
+                const auto deadline = control->deadline;
+                if (!control->condition.wait_until(control_lock, deadline, [&control] {
+                        return control->worker_done ||
+                               control->state != OpenClProbeState::kProbing;
+                    })) {
+                    control_lock.unlock();
+                    LatchTimeout(control);
+                    return false;
+                }
+            }
+        }
+
+        std::lock_guard<std::mutex> coordinator_lock(mutex_);
+        JoinWorkerIfCurrentLocked(control);
+        std::lock_guard<std::mutex> control_lock(control->mutex);
+        if (control->state == OpenClProbeState::kUnavailable) {
+            process_state_ = OpenClProbeState::kUnavailable;
+            return false;
+        }
+        if (process_state_ == OpenClProbeState::kUnavailable ||
+            control->state != OpenClProbeState::kReady || control->result_taken ||
+            !(control->key == spec.key)) {
+            return false;
+        }
+        result->key = control->key;
+        result->ready_modes = control->ready_modes;
+        result->failed_modes = control->failed_modes;
+        MoveBundle(&result->ivtc, &control->ivtc);
+        MoveBundle(&result->deinterlace, &control->deinterlace);
+        control->result_taken = true;
+        if (process_state_ == OpenClProbeState::kProbing) {
+            process_state_ = OpenClProbeState::kReady;
+        }
+        return true;
+    }
+
+    void Snapshot(OpenClProbeState* state, unsigned* ready_modes,
+                   unsigned* failed_modes) {
+        std::lock_guard<std::mutex> coordinator_lock(mutex_);
+        OpenClProbeState snapshot = process_state_;
+        if (control_ != nullptr) {
+            std::lock_guard<std::mutex> control_lock(control_->mutex);
+            if (control_->state == OpenClProbeState::kUnavailable) {
+                process_state_ = OpenClProbeState::kUnavailable;
+                snapshot = process_state_;
+            }
+        }
+        if (state) *state = snapshot;
+        if (ready_modes) *ready_modes = snapshot == OpenClProbeState::kReady ? 3U : 0U;
+        // Mode failures are per prepared key and are checked by FilterGraph;
+        // kReady here reports only that the process-wide compiler is healthy.
+        if (failed_modes) *failed_modes = 0;
+    }
+
+private:
+    OpenClProbeCoordinator() = default;
+
+    ~OpenClProbeCoordinator() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (worker_.joinable()) worker_.detach();
+    }
+
+    void StartProbeLocked(const OpenClProbeSpec& spec) {
+        control_ = std::make_shared<OpenClProbeControl>();
+        control_->key = spec.key;
+        control_->deadline = std::chrono::steady_clock::now() +
+                              std::chrono::milliseconds(kOpenClProbeDeadlineMs);
+        if (process_state_ == OpenClProbeState::kUnknown) {
+            process_state_ = OpenClProbeState::kProbing;
+        }
+        worker_ = std::thread(RunOpenClProbe, control_, spec);
+    }
+
+    void JoinWorkerIfCurrentLocked(const std::shared_ptr<OpenClProbeControl>& control) {
+        if (control_ == control && worker_.joinable()) {
+            worker_.join();
+        }
+    }
+
+    void LatchTimeout(const std::shared_ptr<OpenClProbeControl>& control) {
+        bool won = false;
+        {
+            std::lock_guard<std::mutex> coordinator_lock(mutex_);
+            if (process_state_ == OpenClProbeState::kUnavailable) return;
+            std::lock_guard<std::mutex> control_lock(control->mutex);
+            if (control->state == OpenClProbeState::kProbing) {
+                control->state = OpenClProbeState::kUnavailable;
+                control->ready_modes = 0;
+                control->failed_modes = 0;
+                process_state_ = OpenClProbeState::kUnavailable;
+                if (control_ == control && worker_.joinable()) worker_.detach();
+                won = true;
+            }
+        }
+        control->condition.notify_all();
+        if (!won) return;
+        __android_log_print(ANDROID_LOG_WARN, kTag,
+                            "OpenCL probe timed out after 1500ms; disabled for process");
+    }
+
+    mutable std::mutex mutex_;
+    OpenClProbeState process_state_ = OpenClProbeState::kUnknown;
+    std::shared_ptr<OpenClProbeControl> control_;
+    std::thread worker_;
+};
+
 }  // namespace
 
 FilterGraph::FilterGraph(AVRational time_base, AVRational frame_rate,
@@ -62,7 +281,7 @@ FilterGraph::FilterGraph(AVRational time_base, AVRational frame_rate,
 
 FilterGraph::~FilterGraph() {
     ResetInternal();
-    av_buffer_unref(&opencl_device_);
+    FreePreparedBundles();
 }
 
 void FilterGraph::SetMode(VideoMode mode) {
@@ -77,11 +296,23 @@ void FilterGraph::Prepare(const AVFrame& prototype) {
             requested_mode_.load(std::memory_order_acquire));
     if (requested == VideoMode::kOff) return;
 
-    // Warm both processing kernels whenever filtering is enabled. This keeps an
-    // AUTO resolution or a later IVTC/deinterlace switch from compiling OpenCL
-    // on the video decode thread after playback has started.
-    EnsureOpenCl(prototype, VideoMode::kIvtc);
-    EnsureOpenCl(prototype, VideoMode::kDeinterlace);
+    OpenClProbeSpec spec;
+    spec.key = MakeGraphKey(prototype);
+    spec.field_order = field_order_;
+    OpenClProbeResult result;
+    if (!OpenClProbeCoordinator::Instance().Acquire(spec, &result)) return;
+
+    FreePreparedBundles();
+    failed_opencl_modes_ = result.failed_modes;
+    prepared_opencl_modes_ = result.ready_modes;
+    if ((prepared_opencl_modes_ & OpenClModeBit(VideoMode::kIvtc)) != 0) {
+        MoveBundle(&prepared_ivtc_, &result.ivtc);
+        prepared_ivtc_key_ = result.key;
+    }
+    if ((prepared_opencl_modes_ & OpenClModeBit(VideoMode::kDeinterlace)) != 0) {
+        MoveBundle(&prepared_deinterlace_, &result.deinterlace);
+        prepared_deinterlace_key_ = result.key;
+    }
 }
 
 void FilterGraph::Reset() {
@@ -99,6 +330,7 @@ void FilterGraph::ResetInternal() {
     graph_width_ = 0;
     graph_height_ = 0;
     graph_format_ = -1;
+    active_key_ = OpenClGraphKey{};
     for (AVFrame* frame : auto_frames_) av_frame_free(&frame);
     auto_frames_.clear();
     auto_saw_repeat_ = false;
@@ -157,13 +389,12 @@ void FilterGraph::ResolveAutoIfReady(bool force) {
 bool FilterGraph::ProcessResolved(AVFrame* frame, int serial) {
     if (!effective_resolved_) return false;
     if (effective_mode_ == VideoMode::kOff) return PushBypass(*frame, serial);
-    if (active_.graph != nullptr &&
-        (frame->width != graph_width_ || frame->height != graph_height_ ||
-         frame->format != graph_format_)) {
+    if (active_.graph != nullptr && !(active_key_ == MakeGraphKey(*frame))) {
         FreeBundle(&active_);
         graph_width_ = 0;
         graph_height_ = 0;
         graph_format_ = -1;
+        active_key_ = OpenClGraphKey{};
         backend_ = "none";
         info_reported_ = false;
     }
@@ -206,11 +437,12 @@ bool FilterGraph::PushBypass(const AVFrame& frame, int serial) {
 bool FilterGraph::BuildForFrame(const AVFrame& frame) {
     std::string error;
     if (EnsureOpenCl(frame, effective_mode_) &&
-        BuildBundle(frame, effective_mode_, true, &active_, &error)) {
+        TakePreparedBundle(frame, effective_mode_, &active_)) {
         backend_ = "opencl";
         graph_width_ = frame.width;
         graph_height_ = frame.height;
         graph_format_ = frame.format;
+        active_key_ = MakeGraphKey(frame);
         ReportInfo();
         return true;
     }
@@ -222,6 +454,7 @@ bool FilterGraph::BuildForFrame(const AVFrame& frame) {
         graph_width_ = frame.width;
         graph_height_ = frame.height;
         graph_format_ = frame.format;
+        active_key_ = MakeGraphKey(frame);
         ReportInfo();
         return true;
     }
@@ -233,39 +466,76 @@ bool FilterGraph::BuildForFrame(const AVFrame& frame) {
 bool FilterGraph::EnsureOpenCl(const AVFrame& frame, VideoMode mode) {
     const unsigned mode_bit = OpenClModeBit(mode);
     if (mode_bit == 0 || (failed_opencl_modes_ & mode_bit) != 0) return false;
-    if ((prepared_opencl_modes_ & mode_bit) != 0) return true;
-    if (opencl_state_ == OpenClState::kUnavailable) return false;
 
-    if (opencl_state_ == OpenClState::kUnknown) {
-        const int result = av_hwdevice_ctx_create(&opencl_device_, AV_HWDEVICE_TYPE_OPENCL,
-                                                  nullptr, nullptr, 0);
-        if (result < 0 || opencl_device_ == nullptr) {
-            __android_log_print(ANDROID_LOG_INFO, kTag, "OpenCL unavailable: %s",
-                                AvError(result).c_str());
-            av_buffer_unref(&opencl_device_);
-            opencl_state_ = OpenClState::kUnavailable;
-            return false;
-        }
-        opencl_state_ = OpenClState::kAvailable;
-    }
-
-    GraphBundle trial;
-    std::string error;
-    if (!BuildBundle(frame, mode, true, &trial, &error)) {
-        __android_log_print(ANDROID_LOG_INFO, kTag, "OpenCL filter probe failed: %s",
-                            error.c_str());
-        FreeBundle(&trial);
-        failed_opencl_modes_ |= mode_bit;
+    OpenClProbeState state = OpenClProbeState::kUnknown;
+    unsigned ready_modes = 0;
+    unsigned failed_modes = 0;
+    OpenClProbeCoordinator::Instance().Snapshot(&state, &ready_modes, &failed_modes);
+    if (state != OpenClProbeState::kReady || (ready_modes & mode_bit) == 0 ||
+        (failed_modes & mode_bit) != 0) {
         return false;
     }
-    FreeBundle(&trial);
-    prepared_opencl_modes_ |= mode_bit;
+    return (prepared_opencl_modes_ & mode_bit) != 0 &&
+           ((mode == VideoMode::kIvtc ? prepared_ivtc_key_ : prepared_deinterlace_key_) ==
+            MakeGraphKey(frame));
+}
+
+bool FilterGraph::TakePreparedBundle(const AVFrame& frame, VideoMode mode,
+                                     GraphBundle* bundle) {
+    const unsigned mode_bit = OpenClModeBit(mode);
+    if (bundle == nullptr || (prepared_opencl_modes_ & mode_bit) == 0) return false;
+    const OpenClGraphKey key = MakeGraphKey(frame);
+    if (mode == VideoMode::kIvtc) {
+        if (!(prepared_ivtc_key_ == key)) return false;
+        MoveBundle(bundle, &prepared_ivtc_);
+        prepared_ivtc_key_ = OpenClGraphKey{};
+    } else if (mode == VideoMode::kDeinterlace) {
+        if (!(prepared_deinterlace_key_ == key)) return false;
+        MoveBundle(bundle, &prepared_deinterlace_);
+        prepared_deinterlace_key_ = OpenClGraphKey{};
+    } else {
+        return false;
+    }
+    prepared_opencl_modes_ &= ~mode_bit;
     return true;
 }
 
-bool FilterGraph::BuildBundle(const AVFrame& frame, VideoMode mode, bool opencl,
-                              GraphBundle* bundle, std::string* error) {
-    if (bundle == nullptr || (mode != VideoMode::kIvtc && mode != VideoMode::kDeinterlace)) {
+OpenClGraphKey FilterGraph::MakeGraphKey(const AVFrame& frame) const {
+    OpenClGraphKey key;
+    key.width = frame.width;
+    key.height = frame.height;
+    key.format = frame.format;
+    key.colorspace = frame.colorspace;
+    key.color_range = frame.color_range;
+    key.sample_aspect_ratio = frame.sample_aspect_ratio.num > 0 &&
+                              frame.sample_aspect_ratio.den > 0
+            ? frame.sample_aspect_ratio : stream_sar_;
+    key.time_base = time_base_;
+    key.frame_rate = frame_rate_;
+    key.top_field_first = FrameIsTopFieldFirst(frame, field_order_);
+    key.valid = key.width > 0 && key.height > 0 && key.format >= 0 &&
+                key.sample_aspect_ratio.num > 0 && key.sample_aspect_ratio.den > 0 &&
+                key.time_base.num > 0 && key.time_base.den > 0 &&
+                key.frame_rate.num > 0 && key.frame_rate.den > 0;
+    return key;
+}
+
+void FilterGraph::FreePreparedBundles() {
+    FreeBundle(&prepared_ivtc_);
+    FreeBundle(&prepared_deinterlace_);
+    prepared_opencl_modes_ = 0;
+    prepared_ivtc_key_ = OpenClGraphKey{};
+    prepared_deinterlace_key_ = OpenClGraphKey{};
+}
+
+namespace {
+
+bool BuildBundleForSpec(const OpenClProbeSpec& spec, VideoMode mode, bool opencl,
+                        AVBufferRef* opencl_device, FilterGraph::GraphBundle* bundle,
+                        std::string* error) {
+    const OpenClGraphKey& key = spec.key;
+    if (bundle == nullptr || !key.valid ||
+        (mode != VideoMode::kIvtc && mode != VideoMode::kDeinterlace)) {
         if (error) *error = "invalid graph request";
         return false;
     }
@@ -284,14 +554,12 @@ bool FilterGraph::BuildBundle(const AVFrame& frame, VideoMode mode, bool opencl,
         return false;
     }
 
-    const AVRational sar = frame.sample_aspect_ratio.num > 0 && frame.sample_aspect_ratio.den > 0
-            ? frame.sample_aspect_ratio : stream_sar_;
     char source_args[512]{};
     std::snprintf(source_args, sizeof(source_args),
                   "video_size=%dx%d:pix_fmt=%d:time_base=%d/%d:pixel_aspect=%d/%d:frame_rate=%d/%d:colorspace=%d:range=%d",
-                  frame.width, frame.height, frame.format, time_base_.num, time_base_.den,
-                  sar.num, sar.den, frame_rate_.num, frame_rate_.den,
-                  frame.colorspace, frame.color_range);
+                  key.width, key.height, key.format, key.time_base.num, key.time_base.den,
+                  key.sample_aspect_ratio.num, key.sample_aspect_ratio.den,
+                  key.frame_rate.num, key.frame_rate.den, key.colorspace, key.color_range);
     int result = avfilter_graph_create_filter(&bundle->source, buffer_filter, "in",
                                                source_args, nullptr, bundle->graph);
     if (result < 0) {
@@ -310,12 +578,16 @@ bool FilterGraph::BuildBundle(const AVFrame& frame, VideoMode mode, bool opencl,
         }
         AVFilterContext* context = nullptr;
         if (attach_device) {
+            if (opencl_device == nullptr) {
+                if (error) *error = std::string("missing OpenCL device for ") + filter_name;
+                return false;
+            }
             context = avfilter_graph_alloc_filter(bundle->graph, filter, instance_name);
             if (context == nullptr) {
                 if (error) *error = std::string("allocate ") + filter_name;
                 return false;
             }
-            context->hw_device_ctx = av_buffer_ref(opencl_device_);
+            context->hw_device_ctx = av_buffer_ref(opencl_device);
             if (context->hw_device_ctx == nullptr) {
                 if (error) *error = std::string("device ref for ") + filter_name;
                 return false;
@@ -338,11 +610,9 @@ bool FilterGraph::BuildBundle(const AVFrame& frame, VideoMode mode, bool opencl,
         return true;
     };
 
-    const bool tff = FrameIsTopFieldFirst(frame, field_order_);
-    const char* parity = tff ? "tff" : "bff";
+    const char* parity = key.top_field_first ? "tff" : "bff";
     if (opencl) {
-        if (opencl_device_ == nullptr ||
-            !add_filter("hwupload", "hwupload", nullptr, true)) {
+        if (!add_filter("hwupload", "hwupload", nullptr, true)) {
             FreeBundle(bundle);
             return false;
         }
@@ -350,7 +620,7 @@ bool FilterGraph::BuildBundle(const AVFrame& frame, VideoMode mode, bool opencl,
         const char* processing_filter = nullptr;
         if (mode == VideoMode::kIvtc) {
             processing_filter = "ivtc_opencl";
-            processing_args = std::string("tff=") + (tff ? "1" : "0");
+            processing_args = std::string("tff=") + (key.top_field_first ? "1" : "0");
         } else {
             processing_filter = "bwdif_opencl";
             processing_args = std::string("mode=send_field:parity=") + parity + ":deint=all";
@@ -393,6 +663,141 @@ bool FilterGraph::BuildBundle(const AVFrame& frame, VideoMode mode, bool opencl,
     }
     return true;
 }
+
+}  // namespace
+
+bool FilterGraph::BuildBundle(const AVFrame& frame, VideoMode mode, bool opencl,
+                              GraphBundle* bundle, std::string* error) {
+    if (opencl) {
+        if (error) *error = "OpenCL graph was not prepared before decode";
+        return false;
+    }
+    OpenClProbeSpec spec;
+    spec.key = MakeGraphKey(frame);
+    spec.field_order = field_order_;
+    return BuildBundleForSpec(spec, mode, false, nullptr, bundle, error);
+}
+
+namespace {
+
+void RunOpenClProbe(const std::shared_ptr<OpenClProbeControl>& control,
+                    const OpenClProbeSpec& spec) {
+    AVBufferRef* device = nullptr;
+    const auto device_start = std::chrono::steady_clock::now();
+    const int device_result = av_hwdevice_ctx_create(
+            &device, AV_HWDEVICE_TYPE_OPENCL, nullptr, nullptr, 0);
+    const double device_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - device_start).count();
+    __android_log_print(ANDROID_LOG_INFO, kTag,
+                        "OpenCL device-create completed in %.1f ms (result=%d)",
+                        device_ms, device_result);
+
+    if (device_result < 0 || device == nullptr) {
+        __android_log_print(ANDROID_LOG_INFO, kTag, "OpenCL unavailable: %s",
+                            AvError(device_result).c_str());
+        {
+            std::lock_guard<std::mutex> lock(control->mutex);
+            if (control->state == OpenClProbeState::kProbing) {
+                control->state = OpenClProbeState::kUnavailable;
+                control->ready_modes = 0;
+                control->failed_modes = 0;
+            }
+            control->worker_done = true;
+        }
+        control->condition.notify_all();
+        av_buffer_unref(&device);
+        return;
+    }
+
+    FilterGraph::GraphBundle ivtc;
+    FilterGraph::GraphBundle deinterlace;
+    unsigned ready_modes = 0;
+    unsigned failed_modes = 0;
+    for (const VideoMode mode : {VideoMode::kIvtc, VideoMode::kDeinterlace}) {
+        FilterGraph::GraphBundle bundle;
+        std::string error;
+        const auto build_start = std::chrono::steady_clock::now();
+        const bool ok = BuildBundleForSpec(spec, mode, true, device, &bundle, &error);
+        const double build_ms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - build_start).count();
+        const char* mode_name = mode == VideoMode::kIvtc ? "ivtc" : "bwdif";
+        __android_log_print(ANDROID_LOG_INFO, kTag,
+                            "OpenCL %s-build completed in %.1f ms%s",
+                            mode_name, build_ms, ok ? "" : " (failed)");
+        if (!ok) {
+            __android_log_print(ANDROID_LOG_INFO, kTag,
+                                "OpenCL %s filter probe failed: %s",
+                                mode_name, error.c_str());
+            FreeBundle(&bundle);
+            failed_modes |= OpenClModeBit(mode);
+        } else {
+            ready_modes |= OpenClModeBit(mode);
+            if (mode == VideoMode::kIvtc) MoveBundle(&ivtc, &bundle);
+            else MoveBundle(&deinterlace, &bundle);
+        }
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(control->mutex);
+        if (control->state != OpenClProbeState::kProbing) {
+            FreeBundle(&ivtc);
+            FreeBundle(&deinterlace);
+        } else {
+            control->key = spec.key;
+            control->ready_modes = ready_modes;
+            control->failed_modes = failed_modes;
+            MoveBundle(&control->ivtc, &ivtc);
+            MoveBundle(&control->deinterlace, &deinterlace);
+            control->state = OpenClProbeState::kReady;
+        }
+        control->worker_done = true;
+    }
+    control->condition.notify_all();
+    av_buffer_unref(&device);
+}
+
+}  // namespace
+
+void FilterGraph::StartOpenClProbe(const AVFrame& prototype, AVRational time_base,
+                                   AVRational frame_rate, AVRational stream_sar,
+                                   AVFieldOrder field_order) {
+    OpenClGraphKey key;
+    key.width = prototype.width;
+    key.height = prototype.height;
+    key.format = prototype.format;
+    key.colorspace = prototype.colorspace;
+    key.color_range = prototype.color_range;
+    key.sample_aspect_ratio = prototype.sample_aspect_ratio.num > 0 &&
+                              prototype.sample_aspect_ratio.den > 0
+            ? prototype.sample_aspect_ratio : stream_sar;
+    key.time_base = time_base;
+    key.frame_rate = frame_rate;
+    if ((prototype.flags & AV_FRAME_FLAG_TOP_FIELD_FIRST) != 0) {
+        key.top_field_first = true;
+    } else if ((prototype.flags & AV_FRAME_FLAG_INTERLACED) != 0) {
+        key.top_field_first = false;
+    } else {
+        switch (field_order) {
+            case AV_FIELD_BB:
+            case AV_FIELD_BT:
+                key.top_field_first = false;
+                break;
+            default:
+                key.top_field_first = true;
+                break;
+        }
+    }
+    key.valid = key.width > 0 && key.height > 0 && key.format >= 0 &&
+                key.sample_aspect_ratio.num > 0 && key.sample_aspect_ratio.den > 0 &&
+                key.time_base.num > 0 && key.time_base.den > 0 &&
+                key.frame_rate.num > 0 && key.frame_rate.den > 0;
+    if (!key.valid) return;
+    OpenClProbeSpec spec;
+    spec.key = key;
+    spec.field_order = field_order;
+    OpenClProbeCoordinator::Instance().StartIfUnknown(spec);
+}
+
 
 bool FilterGraph::DrainSink(int serial, int* produced, double* queue_wait_ms) {
     AVFrame* filtered = av_frame_alloc();

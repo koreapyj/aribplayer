@@ -1,0 +1,42 @@
+diff --git a/libavfilter/vf_bwdif_opencl.c b/libavfilter/vf_bwdif_opencl.c
+--- a/libavfilter/vf_bwdif_opencl.c
++++ b/libavfilter/vf_bwdif_opencl.c
+@@ -89,7 +89,1 @@ static void deint_opencl_filter(AVFilterContext *avctx, AVFrame *dst,
+-    if (!ctx->initialised) {
+-        err = deint_opencl_kernel_init(avctx);
+-        if (err < 0)
+-            goto fail;
+-    }
+-
+     for (i = 0; i < y->csp->nb_components; i++) {
+@@ -218,6 +218,8 @@ static int deint_opencl_config_output(AVFilterLink *outlink)
+     ret = ff_opencl_filter_config_output2(outlink, &ctx->ocf);
+     if (ret < 0)
+         return ret;
+-
++    if ((ret = deint_opencl_kernel_init(avctx)) < 0)
++        return ret;
++
+     y->csp = in_desc;
+     y->filter = deint_opencl_filter;
+diff --git a/libavfilter/vf_yadif_opencl.c b/libavfilter/vf_yadif_opencl.c
+--- a/libavfilter/vf_yadif_opencl.c
++++ b/libavfilter/vf_yadif_opencl.c
+@@ -89,7 +89,1 @@ static void deint_opencl_filter(AVFilterContext *avctx, AVFrame *dst,
+-    if (!ctx->initialised) {
+-        err = deint_opencl_kernel_init(avctx);
+-        if (err < 0)
+-            goto fail;
+-    }
+-
+     for (i = 0; i < y->csp->nb_components; i++) {
+@@ -211,6 +211,8 @@ static int deint_opencl_config_output(AVFilterLink *outlink)
+     ret = ff_opencl_filter_config_output2(outlink, &ctx->ocf);
+     if (ret < 0)
+         return ret;
+-
++    if ((ret = deint_opencl_kernel_init(avctx)) < 0)
++        return ret;
++
+     y->csp = in_desc;
+     y->filter = deint_opencl_filter;

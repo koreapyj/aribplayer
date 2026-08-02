@@ -57,7 +57,8 @@ if [[ ! -f "$ffmpeg/.aribplayer-patches-applied" ]]; then
     for patch in \
         "$THIRD_PARTY_DIR/ffmpeg/patches/0004-libaribcaption-bitmap-clear-events.patch" \
         "$THIRD_PARTY_DIR/ffmpeg/patches/0005-mpegts-arib-superimpose-classification.patch" \
-        "$THIRD_PARTY_DIR/ffmpeg/patches/0006-libaribcaption-caption-type-option.patch"; do
+        "$THIRD_PARTY_DIR/ffmpeg/patches/0006-libaribcaption-caption-type-option.patch" \
+        "$THIRD_PARTY_DIR/ffmpeg/patches/0007-eager-opencl-deinterlace-init.patch"; do
         if git -C "$ffmpeg" apply --check "$patch"; then
             git -C "$ffmpeg" apply "$patch"
         elif ! git -C "$ffmpeg" apply -R --check "$patch"; then

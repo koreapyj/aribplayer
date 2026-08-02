@@ -70,7 +70,7 @@ libavfilter/opencl_source.h.
 
 --- /dev/null
 +++ b/libavfilter/vf_ivtc_opencl.c
-@@ -0,0 +1,815 @@
+@@ -0,0 +1,814 @@
 +/*
 + * Copyright (c) 2026
 + *
@@ -561,9 +561,6 @@ libavfilter/opencl_source.h.
 +    int match = 0, err;
 +    AVFrame *out;
 +
-+    if (!ctx->initialised && (err = ivtc_init_cl(avctx)) < 0)
-+        return err;
-+
 +    if ((err = ivtc_pick_match(avctx, (cl_mem)prev->data[0], (cl_mem)cur->data[0],
 +                               (cl_mem)next->data[0], tff, &match)) < 0)
 +        return err;
@@ -760,6 +757,8 @@ libavfilter/opencl_source.h.
 +    int ret;
 +
 +    if ((ret = ff_opencl_filter_config_output2(outlink, &ctx->ocf)) < 0)
++        return ret;
++    if ((ret = ivtc_init_cl(avctx)) < 0)
 +        return ret;
 +
 +    // vf_decimate-style timebase: derive the output rate from the input

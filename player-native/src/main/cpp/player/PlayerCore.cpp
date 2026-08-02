@@ -1908,6 +1908,49 @@ private:
                         });
                 video_decoder_->SetVideoMode(static_cast<VideoMode>(
                         video_mode_.load(std::memory_order_acquire)));
+                if (video_mode_.load(std::memory_order_acquire) !=
+                            static_cast<int>(VideoMode::kOff)) {
+                    AVFrame* probe = av_frame_alloc();
+                    if (probe != nullptr) {
+                        probe->width = decoder->width > 0 ? decoder->width : stream->codecpar->width;
+                        probe->height = decoder->height > 0 ? decoder->height : stream->codecpar->height;
+                        const auto is_renderable = [](int format) {
+                            return format == AV_PIX_FMT_NV12 || format == AV_PIX_FMT_YUV420P ||
+                                   format == AV_PIX_FMT_YUVJ420P;
+                        };
+                        const int decoder_format = static_cast<int>(decoder->pix_fmt);
+                        probe->format = is_renderable(decoder_format)
+                                ? decoder_format
+                                : (is_renderable(stream->codecpar->format)
+                                        ? stream->codecpar->format : AV_PIX_FMT_YUV420P);
+                        probe->sample_aspect_ratio = decoder->sample_aspect_ratio.num > 0 &&
+                                                     decoder->sample_aspect_ratio.den > 0
+                                ? decoder->sample_aspect_ratio : sar;
+                        probe->colorspace = decoder->colorspace != AVCOL_SPC_UNSPECIFIED
+                                ? decoder->colorspace : stream->codecpar->color_space;
+                        probe->color_range = decoder->color_range != AVCOL_RANGE_UNSPECIFIED
+                                ? decoder->color_range : stream->codecpar->color_range;
+                        switch (stream->codecpar->field_order) {
+                            case AV_FIELD_TT:
+                            case AV_FIELD_TB:
+                                probe->flags |= AV_FRAME_FLAG_INTERLACED |
+                                                AV_FRAME_FLAG_TOP_FIELD_FIRST;
+                                break;
+                            case AV_FIELD_BB:
+                            case AV_FIELD_BT:
+                                probe->flags |= AV_FRAME_FLAG_INTERLACED;
+                                break;
+                            default:
+                                break;
+                        }
+                        if (probe->width > 0 && probe->height > 0) {
+                            FilterGraph::StartOpenClProbe(
+                                    *probe, stream->time_base, frame_rate, sar,
+                                    stream->codecpar->field_order);
+                        }
+                        av_frame_free(&probe);
+                    }
+                }
                 video_decoder_->Prepare();
                 if (initial_catchup_target_us != AV_NOPTS_VALUE) {
                     video_decoder_->FlushForSeek(

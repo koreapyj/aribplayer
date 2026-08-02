@@ -37,6 +37,30 @@ struct VideoFilterStats {
     double filter_thread_cpu_ms = 0.0;
 };
 
+struct OpenClGraphKey {
+    int width = 0;
+    int height = 0;
+    int format = -1;
+    int colorspace = 0;
+    int color_range = 0;
+    AVRational sample_aspect_ratio{0, 1};
+    AVRational time_base{0, 1};
+    AVRational frame_rate{0, 1};
+    bool top_field_first = true;
+    bool valid = false;
+
+    bool operator==(const OpenClGraphKey& other) const {
+        return valid == other.valid && width == other.width && height == other.height &&
+               format == other.format && colorspace == other.colorspace &&
+               color_range == other.color_range &&
+               sample_aspect_ratio.num == other.sample_aspect_ratio.num &&
+               sample_aspect_ratio.den == other.sample_aspect_ratio.den &&
+               time_base.num == other.time_base.num && time_base.den == other.time_base.den &&
+               frame_rate.num == other.frame_rate.num && frame_rate.den == other.frame_rate.den &&
+               top_field_first == other.top_field_first;
+    }
+};
+
 // Single-thread-owned FFmpeg video filter graph. All graph operations happen on
 // the decoder thread; only mode requests and statistics snapshots cross threads.
 class FilterGraph final {
@@ -49,6 +73,13 @@ public:
 
     FilterGraph(const FilterGraph&) = delete;
     FilterGraph& operator=(const FilterGraph&) = delete;
+
+    // Starts the single process-global probe without waiting. PlayerCore calls
+    // this on the open path; Prepare() waits for the bounded result before the
+    // decoder thread starts.
+    static void StartOpenClProbe(const AVFrame& prototype, AVRational time_base,
+                                 AVRational frame_rate, AVRational stream_sar,
+                                 AVFieldOrder field_order);
 
     void SetMode(VideoMode mode);
     // Warms the OpenCL device and processing kernels before playback packets
@@ -76,6 +107,9 @@ private:
     bool BuildBundle(const AVFrame& frame, VideoMode mode, bool opencl,
                      GraphBundle* bundle, std::string* error);
     bool EnsureOpenCl(const AVFrame& frame, VideoMode mode);
+    bool TakePreparedBundle(const AVFrame& frame, VideoMode mode, GraphBundle* bundle);
+    OpenClGraphKey MakeGraphKey(const AVFrame& frame) const;
+    void FreePreparedBundles();
     bool DrainSink(int serial, int* produced, double* queue_wait_ms = nullptr);
     void ResolveAutoIfReady(bool force);
     void ReportInfo();
@@ -105,15 +139,17 @@ private:
     int graph_width_ = 0;
     int graph_height_ = 0;
     int graph_format_ = -1;
+    OpenClGraphKey active_key_;
     std::vector<AVFrame*> auto_frames_;
     bool auto_saw_repeat_ = false;
     bool auto_saw_interlaced_ = false;
 
-    enum class OpenClState { kUnknown, kAvailable, kUnavailable };
-    OpenClState opencl_state_ = OpenClState::kUnknown;
-    AVBufferRef* opencl_device_ = nullptr;
     unsigned prepared_opencl_modes_ = 0;
     unsigned failed_opencl_modes_ = 0;
+    GraphBundle prepared_ivtc_;
+    GraphBundle prepared_deinterlace_;
+    OpenClGraphKey prepared_ivtc_key_;
+    OpenClGraphKey prepared_deinterlace_key_;
 
     mutable std::mutex stats_mutex_;
     int reported_effective_mode_ = 0;
