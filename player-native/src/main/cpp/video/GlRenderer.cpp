@@ -29,8 +29,7 @@ namespace aribplayer {
 namespace {
 constexpr char kTag[] = "aribplayer-render";
 
-constexpr char kVertexShader[] = R"(
-#version 300 es
+constexpr char kVertexShader[] = R"(#version 300 es
 layout(location = 0) in vec2 aPosition;
 layout(location = 1) in vec2 aTexCoord;
 out vec2 vTexCoord;
@@ -40,8 +39,7 @@ void main() {
 }
 )";
 
-constexpr char kFragment420[] = R"(
-#version 300 es
+constexpr char kFragment420[] = R"(#version 300 es
 precision mediump float;
 in vec2 vTexCoord;
 layout(location = 0) out vec4 outColor;
@@ -60,8 +58,7 @@ void main() {
 }
 )";
 
-constexpr char kFragmentNv12[] = R"(
-#version 300 es
+constexpr char kFragmentNv12[] = R"(#version 300 es
 precision mediump float;
 in vec2 vTexCoord;
 layout(location = 0) out vec4 outColor;
@@ -78,8 +75,7 @@ void main() {
 }
 )";
 
-constexpr char kFragmentRgba[] = R"(
-#version 300 es
+constexpr char kFragmentRgba[] = R"(#version 300 es
 precision mediump float;
 in vec2 vTexCoord;
 layout(location = 0) out vec4 outColor;
