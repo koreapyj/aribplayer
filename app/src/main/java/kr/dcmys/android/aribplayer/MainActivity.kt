@@ -45,6 +45,7 @@ import kr.dcmys.android.aribplayer.data.MediaEntry
 import kr.dcmys.android.aribplayer.data.MediaRepository
 import kr.dcmys.android.aribplayer.data.PlayerPreferences
 import kr.dcmys.android.aribplayer.data.PlayerPreferencesStore
+import kr.dcmys.android.aribplayer.nativeplayer.VideoMode
 import kr.dcmys.android.aribplayer.ui.theme.AppTheme
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
@@ -250,8 +251,10 @@ private fun AribPlayerApp(
                     displayName = entry.displayName,
                     resumePositionMs = if (needsResumeChoice) entry.resumePositionMs else 0L,
                     openAllowed = !needsResumeChoice,
-                    selectedVideoMode = entry.videoMode.takeUnless { it == UNSET_VIDEO_MODE }
-                        ?: currentPreferences.defaultVideoMode,
+                    selectedVideoMode = when (entry.videoMode) {
+                        UNSET_VIDEO_MODE, VideoMode.AUTO -> currentPreferences.defaultVideoMode
+                        else -> VideoMode.normalizeStored(entry.videoMode)
+                    },
                     audioTrackKey = entry.audioTrackKey,
                     subtitlesEnabled = entry.subtitlesEnabled,
                 )
@@ -447,7 +450,9 @@ private fun PlayerDestination(
     if (openIssued && state.screen == PlayerScreenDestination.PLAYER) {
         lastPlayback.positionMs = state.positionMs
         if (state.durationMs > 0L) lastPlayback.durationMs = state.durationMs
-        lastPlayback.selectedVideoMode = state.selectedVideoMode
+        if (state.filterBackend != null) {
+            lastPlayback.selectedVideoMode = state.selectedVideoMode
+        }
         lastPlayback.selectedTrackKey = state.selectedTrackKey
         lastPlayback.hasSubtitles = state.hasSubtitles
         lastPlayback.subtitlesEnabled = state.subtitlesEnabled
@@ -467,12 +472,12 @@ private fun PlayerDestination(
                 activity,
                 session.uriString.toUri(),
                 startPositionMs = session.resumePositionMs,
+                videoMode = session.selectedVideoMode,
             )
         ) {
             activity.finishWithMessage(R.string.player_unreadable_open_request)
             return@LaunchedEffect
         }
-        playerViewModel.setVideoMode(session.selectedVideoMode)
         val preferredAudioTrackKey = session.audioTrackKey
         if (preferredAudioTrackKey != null) {
             launch {
@@ -518,8 +523,10 @@ private fun PlayerDestination(
         }
     }
 
-    LaunchedEffect(session.uriString, openIssued, state.selectedVideoMode) {
-        if (openIssued) repository.updateVideoMode(session.uriString, state.selectedVideoMode)
+    LaunchedEffect(session.uriString, openIssued, state.selectedVideoMode, state.filterBackend) {
+        if (openIssued && state.filterBackend != null) {
+            repository.updateVideoMode(session.uriString, state.selectedVideoMode)
+        }
     }
 
     LaunchedEffect(session.uriString, openIssued, state.hasSubtitles, state.subtitlesEnabled) {

@@ -35,7 +35,9 @@ class PlayerPreferencesStore(context: Context) {
         }
         .map { storedPreferences ->
             PlayerPreferences(
-                defaultVideoMode = storedPreferences[PreferenceKeys.DEFAULT_VIDEO_MODE] ?: VideoMode.AUTO,
+                defaultVideoMode = VideoMode.normalizeDefault(
+                    storedPreferences[PreferenceKeys.DEFAULT_VIDEO_MODE] ?: VideoMode.AUTO,
+                ),
                 seekStepMs = storedPreferences[PreferenceKeys.SEEK_STEP_MS] ?: DEFAULT_SEEK_STEP_MS,
                 controlsTimeoutMs = storedPreferences[PreferenceKeys.CONTROLS_TIMEOUT_MS]
                     ?: DEFAULT_CONTROLS_TIMEOUT_MS,
@@ -44,7 +46,9 @@ class PlayerPreferencesStore(context: Context) {
         }
 
     suspend fun setDefaultVideoMode(videoMode: Int) {
-        dataStore.edit { it[PreferenceKeys.DEFAULT_VIDEO_MODE] = videoMode }
+        dataStore.edit {
+            it[PreferenceKeys.DEFAULT_VIDEO_MODE] = VideoMode.normalizeDefault(videoMode)
+        }
     }
 
     suspend fun setSeekStepMs(seekStepMs: Long) {

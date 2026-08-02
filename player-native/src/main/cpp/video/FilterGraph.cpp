@@ -11,14 +11,23 @@
 #include <sstream>
 #include <thread>
 #include <utility>
+#include <vector>
+
+#ifndef CL_TARGET_OPENCL_VERSION
+#define CL_TARGET_OPENCL_VERSION 120
+#endif
 
 extern "C" {
 #include <libavfilter/buffersink.h>
 #include <libavfilter/buffersrc.h>
 #include <libavutil/error.h>
 #include <libavutil/hwcontext.h>
+#include <libavutil/hwcontext_opencl.h>
 #include <libavutil/pixdesc.h>
 }
+
+#pragma weak clGetDeviceInfo
+#pragma weak clGetPlatformInfo
 
 namespace aribplayer {
 namespace {
@@ -28,6 +37,120 @@ std::string AvError(int error) {
     char text[AV_ERROR_MAX_STRING_SIZE]{};
     av_strerror(error, text, sizeof(text));
     return text;
+}
+
+int NormalizeVideoModeValue(int value) {
+    if (value == 1) value = static_cast<int>(VideoMode::kDeinterlace);
+    return std::clamp(value, static_cast<int>(VideoMode::kOff),
+                      static_cast<int>(VideoMode::kDeinterlace));
+}
+
+const char* PixelFormatName(int format) {
+    if (format < 0) return "none";
+    const char* name = av_get_pix_fmt_name(static_cast<AVPixelFormat>(format));
+    return name != nullptr ? name : "unknown";
+}
+
+std::string PixelFormatList(const enum AVPixelFormat* formats) {
+    if (formats == nullptr) return "unknown";
+    std::ostringstream result;
+    bool first = true;
+    for (const enum AVPixelFormat* format = formats; *format != AV_PIX_FMT_NONE; ++format) {
+        if (!first) result << '|';
+        result << PixelFormatName(*format);
+        first = false;
+    }
+    return first ? "none" : result.str();
+}
+
+bool IsRendererSupportedFormat(int format) {
+    return format == AV_PIX_FMT_NV12 || format == AV_PIX_FMT_YUV420P ||
+           format == AV_PIX_FMT_YUVJ420P;
+}
+
+bool ContainsPixelFormat(const enum AVPixelFormat* formats, int format) {
+    if (formats == nullptr) return false;
+    for (const enum AVPixelFormat* candidate = formats;
+         *candidate != AV_PIX_FMT_NONE; ++candidate) {
+        if (*candidate == format) return true;
+    }
+    return false;
+}
+
+int SelectOpenClSoftwareFormat(int input_format, const AVHWFramesConstraints* constraints) {
+    if (constraints == nullptr || constraints->valid_sw_formats == nullptr) return AV_PIX_FMT_NONE;
+    if (IsRendererSupportedFormat(input_format) &&
+        ContainsPixelFormat(constraints->valid_sw_formats, input_format)) {
+        return input_format;
+    }
+    if (ContainsPixelFormat(constraints->valid_sw_formats, AV_PIX_FMT_YUV420P)) {
+        return AV_PIX_FMT_YUV420P;
+    }
+    if (ContainsPixelFormat(constraints->valid_sw_formats, AV_PIX_FMT_NV12)) {
+        return AV_PIX_FMT_NV12;
+    }
+    return AV_PIX_FMT_NONE;
+}
+
+std::string QueryOpenClDeviceString(cl_device_id device, cl_device_info parameter) {
+    if (device == nullptr || clGetDeviceInfo == nullptr) return "unavailable";
+    size_t size = 0;
+    if (clGetDeviceInfo(device, parameter, 0, nullptr, &size) != CL_SUCCESS || size == 0) {
+        return "unavailable";
+    }
+    std::vector<char> value(size, '\0');
+    if (clGetDeviceInfo(device, parameter, value.size(), value.data(), nullptr) != CL_SUCCESS) {
+        return "unavailable";
+    }
+    return std::string(value.data());
+}
+
+std::string QueryOpenClPlatformString(cl_platform_id platform, cl_platform_info parameter) {
+    if (platform == nullptr || clGetPlatformInfo == nullptr) return "unavailable";
+    size_t size = 0;
+    if (clGetPlatformInfo(platform, parameter, 0, nullptr, &size) != CL_SUCCESS || size == 0) {
+        return "unavailable";
+    }
+    std::vector<char> value(size, '\0');
+    if (clGetPlatformInfo(platform, parameter, value.size(), value.data(), nullptr) != CL_SUCCESS) {
+        return "unavailable";
+    }
+    return std::string(value.data());
+}
+
+void LogOpenClDeviceInfo(AVBufferRef* device) {
+    const auto* device_context = device != nullptr
+            ? reinterpret_cast<const AVHWDeviceContext*>(device->data) : nullptr;
+    const auto* opencl_context = device_context != nullptr
+            ? static_cast<const AVOpenCLDeviceContext*>(device_context->hwctx) : nullptr;
+    const cl_device_id device_id = opencl_context != nullptr ? opencl_context->device_id : nullptr;
+    cl_platform_id platform = nullptr;
+    if (device_id != nullptr && clGetDeviceInfo != nullptr) {
+        clGetDeviceInfo(device_id, CL_DEVICE_PLATFORM, sizeof(platform), &platform, nullptr);
+    }
+    __android_log_print(
+            ANDROID_LOG_INFO, kTag,
+            "OpenCL device info: device=%s vendor=%s version=%s platform=%s "
+            "platform_vendor=%s platform_version=%s id=%p",
+            QueryOpenClDeviceString(device_id, CL_DEVICE_NAME).c_str(),
+            QueryOpenClDeviceString(device_id, CL_DEVICE_VENDOR).c_str(),
+            QueryOpenClDeviceString(device_id, CL_DEVICE_VERSION).c_str(),
+            QueryOpenClPlatformString(platform, CL_PLATFORM_NAME).c_str(),
+            QueryOpenClPlatformString(platform, CL_PLATFORM_VENDOR).c_str(),
+            QueryOpenClPlatformString(platform, CL_PLATFORM_VERSION).c_str(),
+            static_cast<void*>(device_id));
+}
+
+int EffectiveColorRange(const OpenClGraphKey& key) {
+    if (key.format == AV_PIX_FMT_YUVJ420P && key.color_range == AVCOL_RANGE_UNSPECIFIED) {
+        return AVCOL_RANGE_JPEG;
+    }
+    return key.color_range;
+}
+
+bool IsFullRange(const OpenClGraphKey& key) {
+    return EffectiveColorRange(key) == AVCOL_RANGE_JPEG ||
+           key.format == AV_PIX_FMT_YUVJ420P;
 }
 
 void FreeBundle(FilterGraph::GraphBundle* bundle) {
@@ -58,6 +181,7 @@ enum class OpenClProbeState { kUnknown, kProbing, kReady, kUnavailable };
 struct OpenClProbeSpec {
     OpenClGraphKey key;
     AVFieldOrder field_order = AV_FIELD_UNKNOWN;
+    int opencl_sw_format = AV_PIX_FMT_NONE;
 };
 
 struct OpenClProbeResult {
@@ -285,9 +409,7 @@ FilterGraph::~FilterGraph() {
 }
 
 void FilterGraph::SetMode(VideoMode mode) {
-    const int value = std::clamp(static_cast<int>(mode),
-                                 static_cast<int>(VideoMode::kOff),
-                                 static_cast<int>(VideoMode::kDeinterlace));
+    const int value = NormalizeVideoModeValue(static_cast<int>(mode));
     requested_mode_.store(value, std::memory_order_release);
 }
 
@@ -317,12 +439,12 @@ void FilterGraph::Prepare(const AVFrame& prototype) {
 
 void FilterGraph::Reset() {
     ResetInternal();
-    observed_mode_ = static_cast<VideoMode>(requested_mode_.load(std::memory_order_acquire));
-    effective_mode_ = observed_mode_ == VideoMode::kAuto ? VideoMode::kOff : observed_mode_;
-    effective_resolved_ = observed_mode_ != VideoMode::kAuto;
+    observed_mode_ = static_cast<VideoMode>(
+            requested_mode_.load(std::memory_order_acquire));
+    effective_mode_ = observed_mode_;
     backend_ = "none";
     info_reported_ = false;
-    if (effective_resolved_ && effective_mode_ == VideoMode::kOff) ReportInfo();
+    if (effective_mode_ == VideoMode::kOff) ReportInfo();
 }
 
 void FilterGraph::ResetInternal() {
@@ -331,10 +453,8 @@ void FilterGraph::ResetInternal() {
     graph_height_ = 0;
     graph_format_ = -1;
     active_key_ = OpenClGraphKey{};
-    for (AVFrame* frame : auto_frames_) av_frame_free(&frame);
-    auto_frames_.clear();
-    auto_saw_repeat_ = false;
-    auto_saw_interlaced_ = false;
+    failed_graph_key_ = OpenClGraphKey{};
+    failed_graph_key_valid_ = false;
 }
 
 bool FilterGraph::Process(AVFrame* frame, int serial) {
@@ -346,61 +466,40 @@ bool FilterGraph::Process(AVFrame* frame, int serial) {
     if (requested != observed_mode_) {
         ResetInternal();
         observed_mode_ = requested;
-        effective_mode_ = requested == VideoMode::kAuto ? VideoMode::kOff : requested;
-        effective_resolved_ = requested != VideoMode::kAuto;
+        effective_mode_ = requested;
         backend_ = "none";
         info_reported_ = false;
-        if (effective_resolved_ && effective_mode_ == VideoMode::kOff) ReportInfo();
+        if (effective_mode_ == VideoMode::kOff) ReportInfo();
     }
 
-    if (observed_mode_ != VideoMode::kAuto) return ProcessResolved(frame, serial);
-
-    AVFrame* copy = av_frame_clone(frame);
-    if (copy == nullptr) return false;
-    auto_saw_repeat_ = auto_saw_repeat_ || frame->repeat_pict > 0;
-    auto_saw_interlaced_ = auto_saw_interlaced_ ||
-                           ((frame->flags & AV_FRAME_FLAG_INTERLACED) != 0);
-    auto_frames_.push_back(copy);
-    ResolveAutoIfReady(static_cast<int>(auto_frames_.size()) >= kAutoProbeFrames);
-    if (!effective_resolved_) return true;
-
-    bool ok = true;
-    std::vector<AVFrame*> pending;
-    pending.swap(auto_frames_);
-    for (AVFrame* pending_frame : pending) {
-        if (ok) ok = ProcessResolved(pending_frame, serial);
-        av_frame_free(&pending_frame);
-    }
-    return ok;
-}
-
-void FilterGraph::ResolveAutoIfReady(bool force) {
-    if (effective_resolved_ || !force) return;
-    if (auto_saw_repeat_) effective_mode_ = VideoMode::kIvtc;
-    else if (auto_saw_interlaced_) effective_mode_ = VideoMode::kDeinterlace;
-    else effective_mode_ = VideoMode::kOff;
-    effective_resolved_ = true;
-    if (effective_mode_ == VideoMode::kOff) {
-        backend_ = "none";
-        ReportInfo();
-    }
+    return ProcessResolved(frame, serial);
 }
 
 bool FilterGraph::ProcessResolved(AVFrame* frame, int serial) {
-    if (!effective_resolved_) return false;
     if (effective_mode_ == VideoMode::kOff) return PushBypass(*frame, serial);
-    if (active_.graph != nullptr && !(active_key_ == MakeGraphKey(*frame))) {
+    const OpenClGraphKey key = MakeGraphKey(*frame);
+    if (active_.graph != nullptr && !(active_key_ == key)) {
         FreeBundle(&active_);
         graph_width_ = 0;
         graph_height_ = 0;
         graph_format_ = -1;
         active_key_ = OpenClGraphKey{};
+        failed_graph_key_ = OpenClGraphKey{};
+        failed_graph_key_valid_ = false;
         backend_ = "none";
         info_reported_ = false;
     }
+    if (failed_graph_key_valid_ && !(failed_graph_key_ == key)) {
+        failed_graph_key_valid_ = false;
+    }
+    if (failed_graph_key_valid_ && failed_graph_key_ == key) {
+        return PushBypass(*frame, serial);
+    }
     if (active_.graph == nullptr && !BuildForFrame(*frame)) {
         // A filter failure must not turn a playable stream into a black screen.
-        effective_mode_ = VideoMode::kOff;
+        // Keep the requested mode and bypass only this graph key until it changes.
+        failed_graph_key_ = key;
+        failed_graph_key_valid_ = true;
         backend_ = "none";
         ReportInfo();
         return PushBypass(*frame, serial);
@@ -507,6 +606,9 @@ OpenClGraphKey FilterGraph::MakeGraphKey(const AVFrame& frame) const {
     key.format = frame.format;
     key.colorspace = frame.colorspace;
     key.color_range = frame.color_range;
+    if (key.format == AV_PIX_FMT_YUVJ420P && key.color_range == AVCOL_RANGE_UNSPECIFIED) {
+        key.color_range = AVCOL_RANGE_JPEG;
+    }
     key.sample_aspect_ratio = frame.sample_aspect_ratio.num > 0 &&
                               frame.sample_aspect_ratio.den > 0
             ? frame.sample_aspect_ratio : stream_sar_;
@@ -539,6 +641,10 @@ bool BuildBundleForSpec(const OpenClProbeSpec& spec, VideoMode mode, bool opencl
         if (error) *error = "invalid graph request";
         return false;
     }
+    if (opencl && !IsRendererSupportedFormat(spec.opencl_sw_format)) {
+        if (error) *error = "OpenCL format selection unavailable";
+        return false;
+    }
     FreeBundle(bundle);
     bundle->graph = avfilter_graph_alloc();
     if (bundle->graph == nullptr) {
@@ -559,11 +665,15 @@ bool BuildBundleForSpec(const OpenClProbeSpec& spec, VideoMode mode, bool opencl
                   "video_size=%dx%d:pix_fmt=%d:time_base=%d/%d:pixel_aspect=%d/%d:frame_rate=%d/%d:colorspace=%d:range=%d",
                   key.width, key.height, key.format, key.time_base.num, key.time_base.den,
                   key.sample_aspect_ratio.num, key.sample_aspect_ratio.den,
-                  key.frame_rate.num, key.frame_rate.den, key.colorspace, key.color_range);
+                  key.frame_rate.num, key.frame_rate.den, key.colorspace,
+                  EffectiveColorRange(key));
     int result = avfilter_graph_create_filter(&bundle->source, buffer_filter, "in",
                                                source_args, nullptr, bundle->graph);
     if (result < 0) {
         if (error) *error = "buffer: " + AvError(result);
+        __android_log_print(ANDROID_LOG_ERROR, kTag,
+                            "%s buffer stage failed: %s (%d)",
+                            opencl ? "OpenCL" : "software", AvError(result).c_str(), result);
         FreeBundle(bundle);
         return false;
     }
@@ -599,11 +709,19 @@ bool BuildBundleForSpec(const OpenClProbeSpec& spec, VideoMode mode, bool opencl
         }
         if (result < 0) {
             if (error) *error = std::string(filter_name) + ": " + AvError(result);
+            __android_log_print(ANDROID_LOG_ERROR, kTag,
+                                "%s %s init stage failed: %s (%d)",
+                                opencl ? "OpenCL" : "software", filter_name,
+                                AvError(result).c_str(), result);
             return false;
         }
         result = LinkFilters(previous, context);
         if (result < 0) {
             if (error) *error = std::string("link ") + filter_name + ": " + AvError(result);
+            __android_log_print(ANDROID_LOG_ERROR, kTag,
+                                "%s link %s stage failed: %s (%d)",
+                                opencl ? "OpenCL" : "software", filter_name,
+                                AvError(result).c_str(), result);
             return false;
         }
         previous = context;
@@ -612,6 +730,18 @@ bool BuildBundleForSpec(const OpenClProbeSpec& spec, VideoMode mode, bool opencl
 
     const char* parity = key.top_field_first ? "tff" : "bff";
     if (opencl) {
+        const int selected_format = spec.opencl_sw_format;
+        const bool full_range = IsFullRange(key);
+        if (selected_format != key.format) {
+            const std::string upload_format_args =
+                    std::string("pix_fmts=") + PixelFormatName(selected_format);
+            if (!add_filter("format", "format_upload", upload_format_args.c_str(), false) ||
+                (full_range && selected_format != AV_PIX_FMT_YUVJ420P &&
+                 !add_filter("setparams", "range_upload", "range=full", false))) {
+                FreeBundle(bundle);
+                return false;
+            }
+        }
         if (!add_filter("hwupload", "hwupload", nullptr, true)) {
             FreeBundle(bundle);
             return false;
@@ -625,9 +755,13 @@ bool BuildBundleForSpec(const OpenClProbeSpec& spec, VideoMode mode, bool opencl
             processing_filter = "bwdif_opencl";
             processing_args = std::string("mode=send_field:parity=") + parity + ":deint=all";
         }
+        const std::string download_format_args =
+                std::string("pix_fmts=") + PixelFormatName(selected_format);
         if (!add_filter(processing_filter, "process", processing_args.c_str(), true) ||
             !add_filter("hwdownload", "hwdownload", nullptr, false) ||
-            !add_filter("format", "format", "pix_fmts=nv12|yuv420p", false)) {
+            !add_filter("format", "format_download", download_format_args.c_str(), false) ||
+            (full_range && selected_format != AV_PIX_FMT_YUVJ420P &&
+             !add_filter("setparams", "range_download", "range=full", false))) {
             FreeBundle(bundle);
             return false;
         }
@@ -648,10 +782,29 @@ bool BuildBundleForSpec(const OpenClProbeSpec& spec, VideoMode mode, bool opencl
 
     result = avfilter_graph_create_filter(&bundle->sink, sink_filter, "out",
                                            nullptr, nullptr, bundle->graph);
-    if (result >= 0) result = LinkFilters(previous, bundle->sink);
-    if (result >= 0) result = avfilter_graph_config(bundle->graph, nullptr);
+    if (result < 0) {
+        if (error) *error = "buffersink: " + AvError(result);
+        __android_log_print(ANDROID_LOG_ERROR, kTag,
+                            "%s buffersink init stage failed: %s (%d)",
+                            opencl ? "OpenCL" : "software", AvError(result).c_str(), result);
+        FreeBundle(bundle);
+        return false;
+    }
+    result = LinkFilters(previous, bundle->sink);
+    if (result < 0) {
+        if (error) *error = "link buffersink: " + AvError(result);
+        __android_log_print(ANDROID_LOG_ERROR, kTag,
+                            "%s link buffersink stage failed: %s (%d)",
+                            opencl ? "OpenCL" : "software", AvError(result).c_str(), result);
+        FreeBundle(bundle);
+        return false;
+    }
+    result = avfilter_graph_config(bundle->graph, nullptr);
     if (result < 0) {
         if (error) *error = "graph config: " + AvError(result);
+        __android_log_print(ANDROID_LOG_ERROR, kTag,
+                            "%s graph-config stage failed: %s (%d)",
+                            opencl ? "OpenCL" : "software", AvError(result).c_str(), result);
         FreeBundle(bundle);
         return false;
     }
@@ -693,8 +846,9 @@ void RunOpenClProbe(const std::shared_ptr<OpenClProbeControl>& control,
                         device_ms, device_result);
 
     if (device_result < 0 || device == nullptr) {
-        __android_log_print(ANDROID_LOG_INFO, kTag, "OpenCL unavailable: %s",
-                            AvError(device_result).c_str());
+        __android_log_print(ANDROID_LOG_INFO, kTag,
+                            "OpenCL unavailable: result=%d error=%s",
+                            device_result, AvError(device_result).c_str());
         {
             std::lock_guard<std::mutex> lock(control->mutex);
             if (control->state == OpenClProbeState::kProbing) {
@@ -709,6 +863,50 @@ void RunOpenClProbe(const std::shared_ptr<OpenClProbeControl>& control,
         return;
     }
 
+    LogOpenClDeviceInfo(device);
+    __android_log_print(
+            ANDROID_LOG_INFO, kTag,
+            "OpenCL probe format: %dx%d %s(%d)",
+            spec.key.width, spec.key.height, PixelFormatName(spec.key.format), spec.key.format);
+    AVHWFramesConstraints* constraints = av_hwdevice_get_hwframe_constraints(device, nullptr);
+    __android_log_print(
+            ANDROID_LOG_INFO, kTag,
+            "OpenCL valid_sw_formats: %s min=%dx%d max=%dx%d",
+            constraints != nullptr ? PixelFormatList(constraints->valid_sw_formats).c_str() : "unavailable",
+            constraints != nullptr ? constraints->min_width : 0,
+            constraints != nullptr ? constraints->min_height : 0,
+            constraints != nullptr ? constraints->max_width : 0,
+            constraints != nullptr ? constraints->max_height : 0);
+    const int selected_format = SelectOpenClSoftwareFormat(
+            spec.key.format, constraints);
+    av_hwframe_constraints_free(&constraints);
+    if (selected_format == AV_PIX_FMT_NONE) {
+        __android_log_print(
+                ANDROID_LOG_ERROR, kTag,
+                "OpenCL format selection failed: probe=%s(%d) no compatible software format",
+                PixelFormatName(spec.key.format), spec.key.format);
+        {
+            std::lock_guard<std::mutex> lock(control->mutex);
+            if (control->state == OpenClProbeState::kProbing) {
+                control->key = spec.key;
+                control->ready_modes = 0;
+                control->failed_modes = OpenClModeBit(VideoMode::kIvtc) |
+                                        OpenClModeBit(VideoMode::kDeinterlace);
+                control->state = OpenClProbeState::kReady;
+            }
+            control->worker_done = true;
+        }
+        control->condition.notify_all();
+        av_buffer_unref(&device);
+        return;
+    }
+    __android_log_print(
+            ANDROID_LOG_INFO, kTag,
+            "OpenCL selected software format: %s(%d)",
+            PixelFormatName(selected_format), selected_format);
+
+    OpenClProbeSpec build_spec = spec;
+    build_spec.opencl_sw_format = selected_format;
     FilterGraph::GraphBundle ivtc;
     FilterGraph::GraphBundle deinterlace;
     unsigned ready_modes = 0;
@@ -717,7 +915,7 @@ void RunOpenClProbe(const std::shared_ptr<OpenClProbeControl>& control,
         FilterGraph::GraphBundle bundle;
         std::string error;
         const auto build_start = std::chrono::steady_clock::now();
-        const bool ok = BuildBundleForSpec(spec, mode, true, device, &bundle, &error);
+        const bool ok = BuildBundleForSpec(build_spec, mode, true, device, &bundle, &error);
         const double build_ms = std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - build_start).count();
         const char* mode_name = mode == VideoMode::kIvtc ? "ivtc" : "bwdif";
@@ -767,6 +965,9 @@ void FilterGraph::StartOpenClProbe(const AVFrame& prototype, AVRational time_bas
     key.format = prototype.format;
     key.colorspace = prototype.colorspace;
     key.color_range = prototype.color_range;
+    if (key.format == AV_PIX_FMT_YUVJ420P && key.color_range == AVCOL_RANGE_UNSPECIFIED) {
+        key.color_range = AVCOL_RANGE_JPEG;
+    }
     key.sample_aspect_ratio = prototype.sample_aspect_ratio.num > 0 &&
                               prototype.sample_aspect_ratio.den > 0
             ? prototype.sample_aspect_ratio : stream_sar;
@@ -845,16 +1046,6 @@ bool FilterGraph::DrainSink(int serial, int* produced, double* queue_wait_ms) {
 }
 
 bool FilterGraph::EndOfStream(int serial) {
-    if (observed_mode_ == VideoMode::kAuto && !effective_resolved_) {
-        ResolveAutoIfReady(true);
-        std::vector<AVFrame*> pending;
-        pending.swap(auto_frames_);
-        for (AVFrame* frame : pending) {
-            const bool ok = ProcessResolved(frame, serial);
-            av_frame_free(&frame);
-            if (!ok) return false;
-        }
-    }
     if (active_.graph == nullptr) return true;
     int result = av_buffersrc_add_frame_flags(active_.source, nullptr, 0);
     if (result < 0 && result != AVERROR_EOF) return false;

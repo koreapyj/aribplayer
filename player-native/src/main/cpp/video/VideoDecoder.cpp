@@ -192,7 +192,9 @@ void VideoDecoder::FlushForSeek(int serial, int64_t target_us) {
 }
 
 void VideoDecoder::SetVideoMode(VideoMode mode) {
-    requested_mode_.store(static_cast<int>(mode), std::memory_order_release);
+    int value = static_cast<int>(mode);
+    if (value == 1) value = static_cast<int>(VideoMode::kDeinterlace);
+    requested_mode_.store(value, std::memory_order_release);
 }
 
 VideoDecoderStats VideoDecoder::GetStats() const {

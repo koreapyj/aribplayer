@@ -191,6 +191,8 @@ extern "C" JNIEXPORT void JNICALL
 Java_kr_dcmys_android_aribplayer_nativeplayer_NativePlayer_nativeSetVideoMode(
         JNIEnv*, jobject, jlong handle, jint mode) {
 #ifdef HAVE_FFMPEG
+    // Integer value 1 is the app-default resolution request; PlayerCore consumes it
+    // only after stream metadata is known and never forwards it to FilterGraph.
     if (auto* player = fromHandle(handle)) player->setVideoMode(mode);
 #else
     (void)handle;

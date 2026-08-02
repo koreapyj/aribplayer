@@ -57,11 +57,48 @@ constexpr int kStateClosed = 6;
 constexpr int kStateError = 7;
 constexpr int64_t kSessionTeardownBudgetMs = 2400;
 constexpr int64_t kReleaseTeardownBudgetMs = 2800;
+constexpr int kAutoVideoMode = 1;
 
 std::string AvError(int error) {
     char text[AV_ERROR_MAX_STRING_SIZE]{};
     av_strerror(error, text, sizeof(text));
     return text;
+}
+
+const char* FieldOrderName(AVFieldOrder field_order) {
+    switch (field_order) {
+        case AV_FIELD_TT: return "TT";
+        case AV_FIELD_BB: return "BB";
+        case AV_FIELD_TB: return "TB";
+        case AV_FIELD_BT: return "BT";
+        case AV_FIELD_PROGRESSIVE: return "progressive";
+        case AV_FIELD_UNKNOWN: return "unknown";
+        default: return "other";
+    }
+}
+
+int ResolveAutoVideoMode(AVFieldOrder field_order) {
+    switch (field_order) {
+        case AV_FIELD_PROGRESSIVE:
+            return static_cast<int>(VideoMode::kOff);
+        case AV_FIELD_TT:
+        case AV_FIELD_BB:
+        case AV_FIELD_TB:
+        case AV_FIELD_BT:
+        case AV_FIELD_UNKNOWN:
+        default:
+            // Broadcast TS is predominantly interlaced; unknown is conservative.
+            return static_cast<int>(VideoMode::kDeinterlace);
+    }
+}
+
+const char* VideoModeName(int mode) {
+    switch (mode) {
+        case static_cast<int>(VideoMode::kOff): return "off";
+        case static_cast<int>(VideoMode::kIvtc): return "ivtc";
+        case static_cast<int>(VideoMode::kDeinterlace): return "deinterlace";
+        default: return "unknown";
+    }
 }
 
 std::string JsonEscape(const char* value) {
@@ -766,6 +803,8 @@ private:
     void StartSession(int fd, std::string font, std::string display_name,
                       int64_t start_position_ms) {
         stop_requested_.store(false);
+        video_field_order_.store(static_cast<int>(AV_FIELD_UNKNOWN), std::memory_order_release);
+        video_field_order_known_.store(false, std::memory_order_release);
         prepared_.store(false);
         seekable_.store(false);
         has_audio_master_.store(false);
@@ -874,6 +913,8 @@ private:
         };
 
         stop_requested_.store(true, std::memory_order_release);
+        video_field_order_.store(static_cast<int>(AV_FIELD_UNKNOWN), std::memory_order_release);
+        video_field_order_known_.store(false, std::memory_order_release);
         want_playing_.store(false, std::memory_order_release);
         ClearQueuedSeek();
         seek_pending_.store(false, std::memory_order_release);
@@ -993,6 +1034,15 @@ private:
     }
 
     void ApplyVideoMode(int mode) {
+        if (mode == kAutoVideoMode) {
+            if (!video_field_order_known_.load(std::memory_order_acquire)) {
+                // Keep the app-level default pending until stream metadata is available.
+                video_mode_.store(kAutoVideoMode, std::memory_order_release);
+                return;
+            }
+            mode = ResolveAutoVideoMode(static_cast<AVFieldOrder>(
+                    video_field_order_.load(std::memory_order_acquire)));
+        }
         mode = std::clamp(mode, static_cast<int>(VideoMode::kOff),
                           static_cast<int>(VideoMode::kDeinterlace));
         const int previous = video_mode_.exchange(mode, std::memory_order_acq_rel);
@@ -1528,6 +1578,24 @@ private:
 
         const int video_index = av_find_best_stream(format.get(), AVMEDIA_TYPE_VIDEO, -1, -1,
                                                     nullptr, 0);
+        if (video_index >= 0 && format->streams[video_index] != nullptr &&
+            format->streams[video_index]->codecpar != nullptr) {
+            const AVCodecParameters* video_parameters =
+                    format->streams[video_index]->codecpar;
+            const AVFieldOrder field_order = video_parameters->field_order;
+            video_field_order_.store(static_cast<int>(field_order), std::memory_order_release);
+            video_field_order_known_.store(true, std::memory_order_release);
+            if (video_mode_.load(std::memory_order_acquire) == kAutoVideoMode) {
+                const int resolved_mode = ResolveAutoVideoMode(field_order);
+                video_mode_.store(resolved_mode, std::memory_order_release);
+                __android_log_print(
+                        ANDROID_LOG_INFO, kTag,
+                        "Video mode auto-resolved: field_order=%s(%d) resolution=%dx%d chosen=%s(%d)",
+                        FieldOrderName(field_order), static_cast<int>(field_order),
+                        video_parameters->width, video_parameters->height,
+                        VideoModeName(resolved_mode), resolved_mode);
+            }
+        }
         int audio_program_id = -1;
         int audio_index = FindProgramAudioStream(format.get(), video_index,
                                                  &audio_program_id);
@@ -2127,7 +2195,9 @@ private:
     std::atomic<int> detected_dual_mono_stream_{-1};
     std::atomic<int> active_audio_stream_{-1};
     std::atomic<int> active_dual_mono_mode_{-1};
-    std::atomic<int> video_mode_{0};
+    std::atomic<int> video_mode_{kAutoVideoMode};
+    std::atomic<int> video_field_order_{static_cast<int>(AV_FIELD_UNKNOWN)};
+    std::atomic<bool> video_field_order_known_{false};
     std::atomic<bool> subtitles_enabled_{true};
     std::atomic<bool> caption_ignore_background_{false};
     std::atomic<bool> caption_force_outline_{false};

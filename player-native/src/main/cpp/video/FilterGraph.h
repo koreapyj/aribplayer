@@ -6,7 +6,6 @@
 #include <functional>
 #include <mutex>
 #include <string>
-#include <vector>
 
 #include "common/MediaQueues.h"
 
@@ -22,7 +21,7 @@ namespace aribplayer {
 
 enum class VideoMode : int {
     kOff = 0,
-    kAuto = 1,
+    // Integer value 1 is intentionally unused by FilterGraph; PlayerCore resolves it before handoff.
     kIvtc = 2,
     kDeinterlace = 3,
 };
@@ -98,8 +97,6 @@ public:
     };
 
 private:
-    static constexpr int kAutoProbeFrames = 12;
-
     void ResetInternal();
     bool ProcessResolved(AVFrame* frame, int serial);
     bool PushBypass(const AVFrame& frame, int serial);
@@ -111,7 +108,6 @@ private:
     OpenClGraphKey MakeGraphKey(const AVFrame& frame) const;
     void FreePreparedBundles();
     bool DrainSink(int serial, int* produced, double* queue_wait_ms = nullptr);
-    void ResolveAutoIfReady(bool force);
     void ReportInfo();
     void RecordInput();
     void RecordOutput(int count);
@@ -129,10 +125,9 @@ private:
     FrameQueue& output_;
     InfoCallback info_callback_;
 
-    std::atomic<int> requested_mode_{static_cast<int>(VideoMode::kOff)};
-    VideoMode observed_mode_ = VideoMode::kOff;
-    VideoMode effective_mode_ = VideoMode::kOff;
-    bool effective_resolved_ = true;
+    std::atomic<int> requested_mode_{static_cast<int>(VideoMode::kDeinterlace)};
+    VideoMode observed_mode_ = VideoMode::kDeinterlace;
+    VideoMode effective_mode_ = VideoMode::kDeinterlace;
     bool info_reported_ = false;
     std::string backend_ = "none";
     GraphBundle active_;
@@ -140,9 +135,8 @@ private:
     int graph_height_ = 0;
     int graph_format_ = -1;
     OpenClGraphKey active_key_;
-    std::vector<AVFrame*> auto_frames_;
-    bool auto_saw_repeat_ = false;
-    bool auto_saw_interlaced_ = false;
+    OpenClGraphKey failed_graph_key_;
+    bool failed_graph_key_valid_ = false;
 
     unsigned prepared_opencl_modes_ = 0;
     unsigned failed_opencl_modes_ = 0;

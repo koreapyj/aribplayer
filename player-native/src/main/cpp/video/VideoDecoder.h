@@ -120,7 +120,7 @@ private:
     std::atomic<int> requested_flush_serial_{-1};
     std::atomic<int> requested_catchup_serial_{-1};
     std::atomic<int64_t> requested_catchup_target_us_{AV_NOPTS_VALUE};
-    std::atomic<int> requested_mode_{static_cast<int>(VideoMode::kOff)};
+    std::atomic<int> requested_mode_{static_cast<int>(VideoMode::kDeinterlace)};
     std::atomic<int> last_error_{0};
     int active_serial_ = -1;
 };

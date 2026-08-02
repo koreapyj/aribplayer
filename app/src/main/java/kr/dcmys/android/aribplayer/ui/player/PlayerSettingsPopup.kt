@@ -156,6 +156,7 @@ internal fun PlayerSettingsPopup(
                 PlayerSettingsPage.DefaultVideoMode -> VideoFilterPage(
                     title = stringResource(R.string.player_default_video_mode),
                     selectedVideoMode = preferences.defaultVideoMode,
+                    includeAuto = true,
                     onBack = { onReturnToAppSettings(AppSettingsRow.DefaultVideoMode) },
                     onSelect = { mode ->
                         onSetDefaultVideoMode(mode)
@@ -324,11 +325,17 @@ private fun AppSettingsPage(
 private fun VideoFilterPage(
     title: String,
     selectedVideoMode: Int,
+    includeAuto: Boolean = false,
     onBack: () -> Unit,
     onSelect: (Int) -> Unit,
     onInteraction: () -> Unit,
 ) {
-    val modes = listOf(VideoMode.AUTO, VideoMode.IVTC, VideoMode.DEINTERLACE, VideoMode.OFF)
+    val modes = buildList {
+        if (includeAuto) add(VideoMode.AUTO)
+        add(VideoMode.DEINTERLACE)
+        add(VideoMode.IVTC)
+        add(VideoMode.OFF)
+    }
     OptionPage(
         title = title,
         labels = modes.map { videoModeLabel(it) },
@@ -524,7 +531,7 @@ internal fun videoModeLabel(mode: Int): String = stringResource(
         VideoMode.IVTC -> R.string.player_mode_ivtc
         VideoMode.DEINTERLACE -> R.string.player_mode_deinterlace
         VideoMode.OFF -> R.string.player_mode_off
-        else -> R.string.player_mode_auto
+        else -> R.string.player_mode_deinterlace
     },
 )
 

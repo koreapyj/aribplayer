@@ -75,8 +75,8 @@ data class PlayerUiState(
     val isSeekable: Boolean = false,
     val videoWidth: Int = 0,
     val videoHeight: Int = 0,
-    val selectedVideoMode: Int = VideoMode.AUTO,
-    val effectiveVideoMode: Int = VideoMode.AUTO,
+    val selectedVideoMode: Int = VideoMode.DEINTERLACE,
+    val effectiveVideoMode: Int = VideoMode.DEINTERLACE,
     val tracks: List<AudioTrackUi> = emptyList(),
     val selectedTrackKey: String? = null,
     val filterBackend: String? = null,
@@ -205,8 +205,10 @@ class PlayerViewModel : ViewModel() {
         }
 
         override fun onFilterInfo(mode: Int, backend: String) {
+            val concreteMode = VideoMode.normalizeStored(mode)
             updateState {
-                it.copy(effectiveVideoMode = mode, filterBackend = backend)
+                it.copy(selectedVideoMode = concreteMode, effectiveVideoMode = concreteMode,
+                    filterBackend = backend)
             }
         }
 
@@ -246,8 +248,14 @@ class PlayerViewModel : ViewModel() {
     private var nextSeekRequestId = 0L
     private var pendingSeek: PendingSeek? = null
 
-    fun openDocument(context: Context, uri: Uri, startPositionMs: Long = 0L): Boolean {
+    fun openDocument(
+        context: Context,
+        uri: Uri,
+        startPositionMs: Long = 0L,
+        videoMode: Int = VideoMode.AUTO,
+    ): Boolean {
         val safeStartPositionMs = startPositionMs.coerceAtLeast(0L)
+        val initialVideoMode = VideoMode.normalizeDefault(videoMode)
         pendingSeek = null
         if (uri.scheme == "content") {
             try {
@@ -273,8 +281,8 @@ class PlayerViewModel : ViewModel() {
                 isSeekable = false,
                 videoWidth = 0,
                 videoHeight = 0,
-                selectedVideoMode = VideoMode.AUTO,
-                effectiveVideoMode = VideoMode.AUTO,
+                selectedVideoMode = VideoMode.normalizeStored(initialVideoMode),
+                effectiveVideoMode = VideoMode.normalizeStored(initialVideoMode),
                 tracks = emptyList(),
                 selectedTrackKey = null,
                 filterBackend = null,
@@ -298,6 +306,9 @@ class PlayerViewModel : ViewModel() {
                     captionIgnoreBackground,
                     captionForceOutlineText,
                 )) { "The playback engine could not apply caption preferences." }
+                check(controller.setVideoMode(initialVideoMode)) {
+                    "The playback engine could not apply the initial video mode."
+                }
                 check(controller.open(
                     lease.pfd.fd,
                     fontPath = context.ensureAribFontPath(),
@@ -306,7 +317,6 @@ class PlayerViewModel : ViewModel() {
                 )) {
                     "The playback engine could not open the selected document."
                 }
-                controller.setVideoMode(VideoMode.AUTO)
                 controller.setSubtitlesEnabled(_uiState.value.subtitlesEnabled)
                 attachedSurface?.let(controller::setSurface)
                 playbackSourceLease = lease
@@ -515,7 +525,6 @@ class PlayerViewModel : ViewModel() {
         const val STATS_POLL_INTERVAL_MS = 500L
         val supportedVideoModes = setOf(
             VideoMode.OFF,
-            VideoMode.AUTO,
             VideoMode.IVTC,
             VideoMode.DEINTERLACE,
         )

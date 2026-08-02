@@ -5,6 +5,7 @@ import android.net.Uri
 import android.provider.DocumentsContract
 import androidx.core.net.toUri
 import java.io.File
+import kr.dcmys.android.aribplayer.nativeplayer.VideoMode
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.withContext
@@ -48,7 +49,7 @@ class MediaRepository(
     }
 
     suspend fun updateVideoMode(uri: String, videoMode: Int) {
-        dao.updateVideoMode(uri, videoMode)
+        dao.updateVideoMode(uri, VideoMode.normalizeStored(videoMode))
     }
 
     suspend fun updateSubtitlesEnabled(uri: String, enabled: Boolean) {

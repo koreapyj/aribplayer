@@ -17,12 +17,24 @@ object PlaybackState {
     const val ERROR = 7
 }
 
-/** Native video filter modes accepted by [PlayerController.setVideoMode]. */
+/** Video filter modes; AUTO is an app-default request resolved once from stream metadata at open. */
 object VideoMode {
     const val OFF = 0
     const val AUTO = 1
     const val IVTC = 2
     const val DEINTERLACE = 3
+
+    /** Keeps the app preference in the supported default-mode set. */
+    fun normalizeDefault(mode: Int): Int = when (mode) {
+        AUTO, OFF, IVTC, DEINTERLACE -> mode
+        else -> AUTO
+    }
+
+    /** Converts a stored per-file value to a concrete session mode. */
+    fun normalizeStored(mode: Int): Int = when (mode) {
+        OFF, IVTC, DEINTERLACE -> mode
+        else -> DEINTERLACE
+    }
 }
 
 /** Information delivered once native demuxing has prepared an opened source. */
@@ -263,6 +275,10 @@ class PlayerController(listener: PlayerListener = object : PlayerListener {}) {
         NativePlayer.nativeSeekTo(handle, positionMs, requestId)
     }
 
+    /**
+     * Sets a concrete per-session mode, or passes the app-default AUTO request before open.
+     * AUTO is resolved once by PlayerCore from stream metadata and is not a FilterGraph mode.
+     */
     fun setVideoMode(mode: Int): Boolean = withActiveHandle { handle ->
         NativePlayer.nativeSetVideoMode(handle, mode)
     }
