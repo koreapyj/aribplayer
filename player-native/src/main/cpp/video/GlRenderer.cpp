@@ -132,13 +132,15 @@ class GlRenderer::Impl {
 public:
     Impl(FrameQueue* frames, SubtitleQueue* caption_events,
          SubtitleQueue* superimpose_events, ClockPosition clock,
-         VideoClockAnchor anchor, SubtitleViewportChanged viewport_changed)
+         VideoClockAnchor anchor, SubtitleViewportChanged viewport_changed,
+         GlRenderer::RenderError render_error)
             : frames_(frames),
               caption_layer_{caption_events, SubtitleSource::kCaption},
               superimpose_layer_{superimpose_events, SubtitleSource::kSuperimpose},
               clock_(std::move(clock)),
               anchor_(std::move(anchor)),
-              subtitle_viewport_changed_(std::move(viewport_changed)) {}
+              subtitle_viewport_changed_(std::move(viewport_changed)),
+              render_error_(std::move(render_error)) {}
 
     ~Impl() { Stop(); }
 
@@ -324,10 +326,23 @@ private:
     }
 
     void EnsureGlObjects() {
-        if (program_420_ != 0) return;
+        if (program_420_ != 0 || gl_objects_failed_) return;
         program_420_ = BuildProgram(kFragment420);
         program_nv12_ = BuildProgram(kFragmentNv12);
         program_rgba_ = BuildProgram(kFragmentRgba);
+        if (program_420_ == 0 || program_nv12_ == 0 || program_rgba_ == 0) {
+            // A context loss is recoverable (DestroyEgl clears this flag); a
+            // compiler rejection would repeat forever, so report it once and
+            // stop retrying every frame.
+            gl_objects_failed_ = true;
+            __android_log_print(ANDROID_LOG_ERROR, kTag,
+                                "Video renderer disabled: shader program build failed");
+            if (render_error_) {
+                render_error_("Video renderer initialization failed: "
+                              "GLES shader program could not be built");
+            }
+            return;
+        }
         constexpr GLfloat vertices[] = {
                 -1.f, -1.f, 0.f, 1.f,
                  1.f, -1.f, 1.f, 1.f,
@@ -735,6 +750,7 @@ private:
         display_ = EGL_NO_DISPLAY;
         config_ = nullptr;
         program_420_ = program_nv12_ = program_rgba_ = vao_ = vbo_ = 0;
+        gl_objects_failed_ = false;
         std::memset(textures_, 0, sizeof(textures_));
         for (SubtitleLayer* layer : {&caption_layer_, &superimpose_layer_}) {
             layer->textures.clear();
@@ -756,6 +772,7 @@ private:
     ClockPosition clock_;
     VideoClockAnchor anchor_;
     SubtitleViewportChanged subtitle_viewport_changed_;
+    GlRenderer::RenderError render_error_;
     std::atomic<bool> running_{false};
     std::atomic<bool> subtitles_enabled_{true};
     std::atomic<int> serial_{0};
@@ -782,6 +799,7 @@ private:
     GLuint program_420_ = 0;
     GLuint program_nv12_ = 0;
     GLuint program_rgba_ = 0;
+    bool gl_objects_failed_ = false;
     GLuint vao_ = 0;
     GLuint vbo_ = 0;
     GLuint textures_[3]{};
@@ -798,11 +816,13 @@ GlRenderer::GlRenderer(FrameQueue* frames, SubtitleQueue* caption_events,
                        SubtitleQueue* superimpose_events,
                        ClockPosition clock_position,
                        VideoClockAnchor anchor_video_clock,
-                       SubtitleViewportChanged subtitle_viewport_changed)
+                       SubtitleViewportChanged subtitle_viewport_changed,
+                       RenderError render_error)
         : impl_(std::make_unique<Impl>(frames, caption_events, superimpose_events,
                                       std::move(clock_position),
                                       std::move(anchor_video_clock),
-                                      std::move(subtitle_viewport_changed))) {}
+                                      std::move(subtitle_viewport_changed),
+                                      std::move(render_error))) {}
 GlRenderer::~GlRenderer() = default;
 bool GlRenderer::Start() { return impl_->Start(); }
 bool GlRenderer::Stop(int64_t timeout_ms) { return impl_->Stop(timeout_ms); }

@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <string>
 
 namespace aribplayer {
 
@@ -20,13 +21,15 @@ public:
     using ClockPosition = std::function<bool(double*)>;
     using VideoClockAnchor = std::function<void(double)>;
     using SubtitleViewportChanged = std::function<void(int, int)>;
+    using RenderError = std::function<void(const std::string&)>;
 
     GlRenderer(FrameQueue* frames,
                SubtitleQueue* caption_events,
                SubtitleQueue* superimpose_events,
                ClockPosition clock_position,
                VideoClockAnchor anchor_video_clock,
-               SubtitleViewportChanged subtitle_viewport_changed);
+               SubtitleViewportChanged subtitle_viewport_changed,
+               RenderError render_error = nullptr);
     ~GlRenderer();
 
     GlRenderer(const GlRenderer&) = delete;

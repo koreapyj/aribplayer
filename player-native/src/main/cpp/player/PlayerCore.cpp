@@ -1923,6 +1923,9 @@ private:
                         [this](double pts) { AnchorVideoClock(pts); },
                         [this](int width, int height) {
                             RequestSubtitleViewport(width, height);
+                        },
+                        [this](const std::string& message) {
+                            callbacks_->onError(7, message);
                         });
                 renderer_->SetSerial(serial_.load());
                 renderer_->SetSubtitlesEnabled(
