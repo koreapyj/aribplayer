@@ -23,24 +23,32 @@ import kr.dcmys.android.aribplayer.ui.theme.PlayerDims
 fun Modifier.tvFocusRing(
     shape: Shape = RoundedCornerShape(4.dp),
     touchModeRing: Boolean = true,
+    focusScale: Float = PlayerDims.FocusScale,
+    fill: Boolean = true,
 ): Modifier = composed {
     var isFocused by remember { mutableStateOf(false) }
     val isTouchMode = LocalInputModeManager.current.inputMode == InputMode.Touch
-    val focusScale by animateFloatAsState(
-        targetValue = if (isFocused && !isTouchMode) PlayerDims.FocusScale else 1f,
+    val animatedFocusScale by animateFloatAsState(
+        targetValue = if (isFocused && !isTouchMode) focusScale else 1f,
         animationSpec = tween(PlayerDims.FocusAnimMs),
         label = "tvFocusScale",
     )
     val focusDecoration = when {
         !isFocused -> Modifier
         !isTouchMode -> Modifier
-            .background(PlayerColors.FocusFill, shape)
+            .then(if (fill) Modifier.background(PlayerColors.FocusFill, shape) else Modifier)
             .border(PlayerDims.FocusRing, PlayerColors.FocusRing, shape)
         touchModeRing -> Modifier.border(PlayerDims.FocusRing, PlayerColors.FocusRing, shape)
         else -> Modifier
     }
 
     onFocusChanged { isFocused = it.isFocused }
-        .scale(if (isTouchMode) 1f else focusScale)
+        .then(
+            if (!isTouchMode && focusScale != 1f) {
+                Modifier.scale(animatedFocusScale)
+            } else {
+                Modifier
+            },
+        )
         .then(focusDecoration)
 }

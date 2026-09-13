@@ -6,6 +6,7 @@ import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
@@ -100,7 +101,12 @@ internal fun PlayerTimeBar(
                 down = downFocusRequester
                 canFocus = enabled
             }
-            .tvFocusRing(touchModeRing = false)
+            .tvFocusRing(
+                shape = RoundedCornerShape(PlayerDims.TimeBarTouchHeight / 2),
+                touchModeRing = false,
+                focusScale = 1f,
+                fill = false,
+            )
             .onFocusChanged { focusState ->
                 val lostFocus = focused && !focusState.isFocused
                 focused = focusState.isFocused

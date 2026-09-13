@@ -550,7 +550,7 @@ private fun MainSettingsRow(
         modifier = modifier
             .fillMaxWidth()
             .height(PlayerDims.PopupRowHeight)
-            .tvFocusRing()
+            .tvFocusRing(shape = RoundedCornerShape(6.dp), focusScale = 1f)
             .clickable(enabled = enabled, onClick = onClick)
             .padding(horizontal = 12.dp),
         verticalAlignment = Alignment.CenterVertically,
@@ -583,7 +583,7 @@ private fun PopupHeaderRow(title: String, onClick: () -> Unit, modifier: Modifie
         modifier = modifier
             .fillMaxWidth()
             .height(PlayerDims.PopupRowHeight)
-            .tvFocusRing()
+            .tvFocusRing(shape = RoundedCornerShape(6.dp), focusScale = 1f)
             .clickable(onClick = onClick)
             .padding(horizontal = 12.dp),
         verticalAlignment = Alignment.CenterVertically,
@@ -610,7 +610,7 @@ private fun PopupOptionRow(
         modifier = modifier
             .fillMaxWidth()
             .height(PlayerDims.PopupRowHeight)
-            .tvFocusRing()
+            .tvFocusRing(shape = RoundedCornerShape(6.dp), focusScale = 1f)
             .clickable(onClick = onClick)
             .padding(horizontal = 12.dp),
         verticalAlignment = Alignment.CenterVertically,
