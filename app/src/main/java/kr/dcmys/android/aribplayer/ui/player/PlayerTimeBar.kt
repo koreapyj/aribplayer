@@ -33,6 +33,7 @@ import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.progressBarRangeInfo
 import androidx.compose.ui.semantics.semantics
 import kr.dcmys.android.aribplayer.R
+import kr.dcmys.android.aribplayer.ui.components.tvFocusRing
 import kr.dcmys.android.aribplayer.ui.theme.PlayerColors
 import kr.dcmys.android.aribplayer.ui.theme.PlayerDims
 import kotlinx.coroutines.Job
@@ -49,6 +50,7 @@ internal fun PlayerTimeBar(
     seekStepMs: Long,
     chromeState: PlayerChromeState,
     focusRequester: FocusRequester,
+    onFocusChanged: (PlayerControl, Boolean) -> Unit,
     upFocusRequester: FocusRequester,
     downFocusRequester: FocusRequester,
     onSeek: (Long) -> Unit,
@@ -98,9 +100,11 @@ internal fun PlayerTimeBar(
                 down = downFocusRequester
                 canFocus = enabled
             }
+            .tvFocusRing(touchModeRing = false)
             .onFocusChanged { focusState ->
                 val lostFocus = focused && !focusState.isFocused
                 focused = focusState.isFocused
+                onFocusChanged(PlayerControl.TimeBar, focusState.isFocused)
                 if (lostFocus && !chromeState.scrubbing) commitPreview()
                 if (focusState.isFocused) onInteraction()
             }

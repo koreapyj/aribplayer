@@ -49,10 +49,10 @@ film-mode playback, and dual-audio support.
    | Key | Action |
    |---|---|
    | ◀ ▶ (controls hidden) | seek −/+ step (hold to accelerate); shows a time overlay |
-   | ◀ ▶ (controls shown) | move between buttons; on the time bar: preview seek, OK to jump |
-   | ▲ ▼ | reveal controls (they do not toggle playback) |
+   | ◀ ▶ (controls shown) | move focus between controls; on the time bar, preview seek immediately and commit 1 s after the last key, with OK or focus loss |
+   | ▲ ▼ (controls hidden) | reveal controls with play–pause focused |
    | OK (controls visible) | activate the focused control; play–pause only when the play button is focused |
-   | OK (controls hidden) | toggle play–pause and reveal controls |
+   | OK (controls hidden) | reveal controls with play–pause focused; does not toggle playback |
    | ⏯ | toggle play–pause |
    | ▶ | play |
    | ⏸ | pause |
@@ -63,9 +63,12 @@ film-mode playback, and dual-audio support.
    | INFO / red | diagnostics |
    | CC / green | captions on/off |
    | ⏹ | stop and close |
-   | BACK | close popup / stop |
+   | BACK | on a popup sub-page, return to its parent; on the main popup page, close it; otherwise stop playback |
 
    The step is configured by the **Seek step** setting (10 or 30 s).
+   Visible controls use Android focus navigation, matching stock ExoPlayer. A gamepad needs no
+   app-specific bindings: Android's standard key map turns **A** and **START** into OK,
+   **B** into Back, and **SELECT** into MENU; other gamepad buttons remain unbound.
 
 ### Caption appearance
 

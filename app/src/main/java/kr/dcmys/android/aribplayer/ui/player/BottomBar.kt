@@ -9,7 +9,6 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.width
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Settings
@@ -19,15 +18,12 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.remember
-import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusProperties
 import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.res.stringResource
@@ -39,7 +35,6 @@ import kr.dcmys.android.aribplayer.ui.components.tvFocusRing
 import kr.dcmys.android.aribplayer.ui.theme.PlayerColors
 import kr.dcmys.android.aribplayer.ui.theme.PlayerDims
 import kr.dcmys.android.aribplayer.ui.theme.PlayerTextStyles
-import kotlinx.coroutines.android.awaitFrame
 
 @Composable
 internal fun BottomBar(
@@ -54,6 +49,8 @@ internal fun BottomBar(
     preferences: PlayerPreferences,
     chromeState: PlayerChromeState,
     focusRequesters: PlayerFocusRequesters,
+    upFocusRequester: FocusRequester,
+    onFocusChanged: (PlayerControl, Boolean) -> Unit,
     onToggleDiagnostics: () -> Unit,
     onToggleSubtitles: () -> Unit,
     onSetVideoMode: (Int) -> Unit,
@@ -66,18 +63,6 @@ internal fun BottomBar(
     onRemoteKeyEvent: ((KeyEvent) -> Boolean)? = null,
 ) {
     val captionsOrSettings = if (hasSubtitles) focusRequesters.captions else focusRequesters.settings
-    var popupWasOpen by remember { mutableStateOf(false) }
-
-    LaunchedEffect(chromeState.popupOpen) {
-        if (chromeState.popupOpen) {
-            popupWasOpen = true
-        } else if (popupWasOpen) {
-            popupWasOpen = false
-            awaitFrame()
-            focusRequesters.settings.requestFocus()
-            onInteraction()
-        }
-    }
 
     Row(
         modifier = modifier
@@ -106,13 +91,16 @@ internal fun BottomBar(
         )
         Spacer(Modifier.weight(1f))
         BottomActionButton(
+            control = PlayerControl.Info,
             icon = Icons.Filled.Info,
             contentDescription = stringResource(R.string.player_info_description),
             selected = diagnosticsVisible,
+            onFocusChanged = onFocusChanged,
             modifier = Modifier
                 .focusRequester(focusRequesters.info)
                 .focusProperties {
-                    up = focusRequesters.timeBar
+                    left = FocusRequester.Cancel
+                    up = upFocusRequester
                     right = captionsOrSettings
                 },
             onClick = {
@@ -122,6 +110,7 @@ internal fun BottomBar(
         )
         if (hasSubtitles) {
             BottomActionButton(
+                control = PlayerControl.Captions,
                 icon = if (subtitlesEnabled) Icons.Filled.Subtitles else Icons.Filled.SubtitlesOff,
                 contentDescription = stringResource(
                     if (subtitlesEnabled) {
@@ -131,12 +120,13 @@ internal fun BottomBar(
                     },
                 ),
                 selected = subtitlesEnabled,
+                onFocusChanged = onFocusChanged,
                 modifier = Modifier
                     .focusRequester(focusRequesters.captions)
                     .focusProperties {
                         left = focusRequesters.info
                         right = focusRequesters.settings
-                        up = focusRequesters.timeBar
+                        up = upFocusRequester
                     },
                 onClick = {
                     onInteraction()
@@ -146,14 +136,17 @@ internal fun BottomBar(
         }
         Box {
             BottomActionButton(
+                control = PlayerControl.Settings,
                 icon = Icons.Filled.Settings,
                 contentDescription = stringResource(R.string.player_settings_description),
                 selected = chromeState.popupOpen,
+                onFocusChanged = onFocusChanged,
                 modifier = Modifier
                     .focusRequester(focusRequesters.settings)
                     .focusProperties {
                         left = if (hasSubtitles) focusRequesters.captions else focusRequesters.info
-                        up = focusRequesters.timeBar
+                        right = FocusRequester.Cancel
+                        up = upFocusRequester
                     },
                 onClick = {
                     onInteraction()
@@ -189,9 +182,11 @@ internal fun BottomBar(
 
 @Composable
 private fun BottomActionButton(
+    control: PlayerControl,
     icon: ImageVector,
     contentDescription: String,
     selected: Boolean,
+    onFocusChanged: (PlayerControl, Boolean) -> Unit,
     onClick: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -199,6 +194,9 @@ private fun BottomActionButton(
         onClick = onClick,
         modifier = modifier
             .size(PlayerDims.ActionButton)
+            .onFocusChanged { focusState ->
+                onFocusChanged(control, focusState.isFocused)
+            }
             .tvFocusRing(),
     ) {
         Box(

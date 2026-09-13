@@ -16,15 +16,12 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusProperties
 import androidx.compose.ui.focus.focusRequester
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.input.key.KeyEventType
 import androidx.compose.ui.input.key.key
@@ -32,9 +29,8 @@ import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.key.type
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalView
+import androidx.compose.ui.platform.LocalWindowInfo
 import androidx.compose.ui.unit.dp
-import kr.dcmys.android.aribplayer.AudioTrackUi
-import kr.dcmys.android.aribplayer.PlaybackState
 import kr.dcmys.android.aribplayer.PlayerUiState
 import kr.dcmys.android.aribplayer.data.PlayerPreferences
 import kr.dcmys.android.aribplayer.ui.theme.PlayerColors
@@ -63,48 +59,57 @@ fun PlayerChrome(
     modifier: Modifier = Modifier,
     onRemoteKeyEvent: ((KeyEvent) -> Boolean)? = null,
 ) {
-    val focusRequesters = rememberPlayerFocusRequesters()
+    val focusCoordinator = remember(chromeState) { PlayerFocusCoordinator(chromeState) }
+    val focusRequesters = focusCoordinator.requesters
     val view = LocalView.current
+    val windowFocused = LocalWindowInfo.current.isWindowFocused
+    val touchMode = view.isInTouchMode
     val density = LocalDensity.current
     val hideTranslationPx = with(density) { PlayerDims.HideTranslation.roundToPx() }
-    val playbackEnabled = state.playbackState != PlaybackState.PREPARING &&
-        state.playbackState != PlaybackState.ERROR
-    val seekEnabled = state.isSeekable && state.durationMs > 0L
+    val focusCaps = FocusCaps(
+        playbackState = state.playbackState,
+        isSeekable = state.isSeekable,
+        durationMs = state.durationMs,
+        hasSubtitles = state.hasSubtitles,
+    )
+    val availableControls = available(focusCaps)
+    val playbackEnabled = PlayerControl.PlayPause in availableControls
+    val seekEnabled = PlayerControl.TimeBar in availableControls
     val previewPosition = chromeState.previewPositionMs ?: state.positionMs
-    var requestPlayFocus by remember { mutableStateOf(!view.isInTouchMode) }
 
-    fun requestControlFocus() {
-        if (playbackEnabled) {
-            val requested = runCatching { focusRequesters.playPause.requestFocus() }
-            if (requested.isSuccess) return
+    LaunchedEffect(
+        chromeState.controlsVisible,
+        chromeState.popupOpen,
+        chromeState.focusedControl,
+        chromeState.interactionRevision,
+        focusCoordinator.pendingRevision,
+        focusCaps,
+        windowFocused,
+        touchMode,
+    ) {
+        focusCoordinator.observe(
+            controlsVisible = chromeState.controlsVisible,
+            popupOpen = chromeState.popupOpen,
+            touchMode = touchMode,
+            caps = focusCaps,
+        )
+        if (!chromeState.controlsVisible) {
+            awaitFrame()
+            focusCoordinator.requestRootFocus()
+            return@LaunchedEffect
         }
-        runCatching { focusRequesters.settings.requestFocus() }
+        if (chromeState.popupOpen || !windowFocused) return@LaunchedEffect
+        focusCoordinator.runPending(
+            caps = focusCaps,
+            windowFocused = windowFocused,
+            touchMode = touchMode,
+            awaitNextFrame = { awaitFrame() },
+        )
     }
 
     LaunchedEffect(interactionEvents) {
         interactionEvents.collect {
-            requestPlayFocus = true
             chromeState.showControls()
-        }
-    }
-
-    LaunchedEffect(chromeState.controlsVisible, playbackEnabled, requestPlayFocus) {
-        if (!chromeState.controlsVisible) {
-            awaitFrame()
-            runCatching { focusRequesters.root.requestFocus() }
-        } else {
-            awaitFrame()
-            if (requestPlayFocus || view.findFocus() == null) {
-                requestControlFocus()
-                requestPlayFocus = false
-            }
-        }
-    }
-
-    LaunchedEffect(chromeState.focusPlayPauseRequest) {
-        if (chromeState.focusPlayPauseRequest > 0 && chromeState.controlsVisible) {
-            awaitFrame()
-            requestControlFocus()
         }
     }
 
@@ -114,6 +119,7 @@ fun PlayerChrome(
         chromeState.controlsVisible,
         chromeState.popupOpen,
         chromeState.scrubbing,
+        chromeState.previewPositionMs,
         controlsTimeoutMs,
         chromeState.interactionRevision,
     ) {
@@ -122,6 +128,7 @@ fun PlayerChrome(
             chromeState.controlsVisible &&
             !chromeState.popupOpen &&
             !chromeState.scrubbing &&
+            chromeState.previewPositionMs == null &&
             controlsTimeoutMs > 0L
         ) {
             delay(controlsTimeoutMs)
@@ -141,9 +148,8 @@ fun PlayerChrome(
                     return@onPreviewKeyEvent false
                 }
                 if (event.key in hiddenRevealKeys ||
-                    (view.isInTouchMode && event.key in touchModeRevealKeys)
+                    (touchMode && event.key in touchModeRevealKeys)
                 ) {
-                    requestPlayFocus = true
                     chromeState.showControls()
                     true
                 } else {
@@ -151,7 +157,8 @@ fun PlayerChrome(
                     false
                 }
             }
-            .focusable(enabled = !chromeState.controlsVisible),
+            // Keep the target installed so canFocus is contained here when controls are visible.
+            .focusable(),
     ) {
         AnimatedVisibility(
             visible = chromeState.controlsVisible,
@@ -173,6 +180,7 @@ fun PlayerChrome(
                 seekEnabled = seekEnabled,
                 seekStepMs = seekStepMs,
                 focusRequesters = focusRequesters,
+                onFocusChanged = focusCoordinator::onFocusChanged,
                 onReplay = {
                     onSeekTo((state.positionMs - seekStepMs).coerceIn(0L, state.durationMs))
                 },
@@ -220,6 +228,12 @@ fun PlayerChrome(
                         preferences = preferences,
                         chromeState = chromeState,
                         focusRequesters = focusRequesters,
+                        upFocusRequester = when {
+                            seekEnabled -> focusRequesters.timeBar
+                            playbackEnabled -> focusRequesters.playPause
+                            else -> FocusRequester.Cancel
+                        },
+                        onFocusChanged = focusCoordinator::onFocusChanged,
                         onToggleDiagnostics = onToggleDiagnostics,
                         onToggleSubtitles = onToggleSubtitles,
                         onSetVideoMode = onSetVideoMode,
@@ -239,6 +253,7 @@ fun PlayerChrome(
                     seekStepMs = seekStepMs,
                     chromeState = chromeState,
                     focusRequester = focusRequesters.timeBar,
+                    onFocusChanged = focusCoordinator::onFocusChanged,
                     upFocusRequester = focusRequesters.playPause,
                     downFocusRequester = focusRequesters.info,
                     onSeek = onSeekTo,

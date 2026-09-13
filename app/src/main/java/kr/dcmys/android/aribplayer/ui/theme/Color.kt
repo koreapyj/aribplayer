@@ -28,5 +28,6 @@ object PlayerColors {
     val SecondaryText = Color.White.copy(alpha = 0.7f)
     val ErrorPill = Color(0x80808080)
     val FocusRing = Color.White
+    val FocusFill = Color.White.copy(alpha = 0.20f)
     val Disabled = Color.White.copy(alpha = 0.33f)
 }

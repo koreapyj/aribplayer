@@ -197,7 +197,6 @@ class MainActivity : ComponentActivity() {
         val state = playerViewModel.uiState.value
         return playerChromeState != null &&
             state.screen == PlayerScreenDestination.PLAYER &&
-            state.playbackState != PlaybackState.ERROR &&
             remoteKeys.onKeyEvent(event, window.decorView.isInTouchMode)
     }
 

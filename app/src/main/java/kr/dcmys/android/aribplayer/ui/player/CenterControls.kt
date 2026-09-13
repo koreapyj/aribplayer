@@ -16,8 +16,10 @@ import androidx.compose.material3.IconButton
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusProperties
 import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.res.pluralStringResource
@@ -35,6 +37,7 @@ internal fun CenterControls(
     seekEnabled: Boolean,
     seekStepMs: Long,
     focusRequesters: PlayerFocusRequesters,
+    onFocusChanged: (PlayerControl, Boolean) -> Unit,
     onReplay: () -> Unit,
     onTogglePlayback: () -> Unit,
     onForward: () -> Unit,
@@ -42,6 +45,7 @@ internal fun CenterControls(
     modifier: Modifier = Modifier,
 ) {
     val seekSeconds = (seekStepMs / 1_000L).coerceAtLeast(1L).toInt()
+    val downFocusRequester = if (seekEnabled) focusRequesters.timeBar else focusRequesters.info
     val replayDescription = pluralStringResource(
         R.plurals.player_rewind_by_amount_description,
         seekSeconds,
@@ -59,15 +63,18 @@ internal fun CenterControls(
         verticalAlignment = Alignment.CenterVertically,
     ) {
         CenterIconButton(
+            control = PlayerControl.Replay,
             icon = if (seekStepMs == 10_000L) Icons.Filled.Replay10 else Icons.Filled.Replay30,
             contentDescription = replayDescription,
             enabled = seekEnabled,
             modifier = Modifier
                 .focusRequester(focusRequesters.replay)
                 .focusProperties {
+                    left = FocusRequester.Cancel
                     right = focusRequesters.playPause
-                    down = focusRequesters.timeBar
+                    down = downFocusRequester
                 },
+            onFocusChanged = onFocusChanged,
             onClick = {
                 onInteraction()
                 onReplay()
@@ -82,10 +89,13 @@ internal fun CenterControls(
             modifier = Modifier
                 .size(PlayerDims.PlayPauseButton)
                 .focusRequester(focusRequesters.playPause)
+                .onFocusChanged { focusState ->
+                    onFocusChanged(PlayerControl.PlayPause, focusState.isFocused)
+                }
                 .focusProperties {
-                    left = focusRequesters.replay
-                    right = focusRequesters.forward
-                    down = focusRequesters.timeBar
+                    left = if (seekEnabled) focusRequesters.replay else FocusRequester.Cancel
+                    right = if (seekEnabled) focusRequesters.forward else FocusRequester.Cancel
+                    down = downFocusRequester
                     canFocus = playbackEnabled
                 }
                 .tvFocusRing(CircleShape),
@@ -100,6 +110,7 @@ internal fun CenterControls(
             )
         }
         CenterIconButton(
+            control = PlayerControl.Forward,
             icon = if (seekStepMs == 10_000L) Icons.Filled.Forward10 else Icons.Filled.Forward30,
             contentDescription = forwardDescription,
             enabled = seekEnabled,
@@ -107,8 +118,10 @@ internal fun CenterControls(
                 .focusRequester(focusRequesters.forward)
                 .focusProperties {
                     left = focusRequesters.playPause
-                    down = focusRequesters.timeBar
+                    right = FocusRequester.Cancel
+                    down = downFocusRequester
                 },
+            onFocusChanged = onFocusChanged,
             onClick = {
                 onInteraction()
                 onForward()
@@ -119,9 +132,11 @@ internal fun CenterControls(
 
 @Composable
 private fun CenterIconButton(
+    control: PlayerControl,
     icon: ImageVector,
     contentDescription: String,
     enabled: Boolean,
+    onFocusChanged: (PlayerControl, Boolean) -> Unit,
     onClick: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -130,6 +145,9 @@ private fun CenterIconButton(
         enabled = enabled,
         modifier = modifier
             .size(PlayerDims.ActionButton)
+            .onFocusChanged { focusState ->
+                onFocusChanged(control, focusState.isFocused)
+            }
             .focusProperties { canFocus = enabled }
             .tvFocusRing(CircleShape),
     ) {

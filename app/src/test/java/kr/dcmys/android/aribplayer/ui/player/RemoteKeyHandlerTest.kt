@@ -232,6 +232,116 @@ class RemoteKeyHandlerTest {
     }
 
     @Test
+    fun hiddenCenterRevealsControlsWithoutTogglingPlayback() = runTest {
+        val chrome = hiddenChrome()
+        val controller = FakeController(baseState())
+        val handler = handler(this, controller, chrome)
+
+        assertTrue(handler.handle(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_DPAD_CENTER, 0, false))
+
+        assertTrue(chrome.controlsVisible)
+        assertEquals(0, controller.togglePlaybackCalls)
+        assertEquals(PlaybackState.PLAYING, controller.state.playbackState)
+        handler.release()
+    }
+
+    @Test
+    fun hiddenDirectionalAndEnterKeysRevealWithoutTogglingPlayback() = runTest {
+        for (keyCode in listOf(
+            KeyEvent.KEYCODE_DPAD_UP,
+            KeyEvent.KEYCODE_DPAD_DOWN,
+            KeyEvent.KEYCODE_DPAD_CENTER,
+            KeyEvent.KEYCODE_ENTER,
+        )) {
+            val chrome = hiddenChrome()
+            val controller = FakeController(baseState())
+            val handler = handler(this, controller, chrome)
+
+            assertTrue(handler.handle(KeyEvent.ACTION_DOWN, keyCode, 0, false))
+            assertTrue(chrome.controlsVisible)
+            assertEquals(0, controller.togglePlaybackCalls)
+            handler.release()
+        }
+    }
+
+    @Test
+    fun visibleNavigationRearmsInteractionWithoutBeingConsumed() = runTest {
+        val chrome = PlayerChromeState()
+        val controller = FakeController(baseState())
+        val handler = handler(this, controller, chrome)
+        val before = chrome.interactionRevision
+
+        assertFalse(handler.handle(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_DPAD_LEFT, 0, false))
+        assertEquals(before + 1L, chrome.interactionRevision)
+        assertTrue(controller.seeks.isEmpty())
+
+        val beforeBack = chrome.interactionRevision
+        assertFalse(handler.handle(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_BACK, 0, false))
+        assertEquals(beforeBack + 1L, chrome.interactionRevision)
+        handler.release()
+    }
+
+    @Test
+    fun fallbackDpadCenterHasTheSameRevealOnlyBehaviorAsTheRealKey() = runTest {
+        val realChrome = hiddenChrome()
+        val fallbackChrome = hiddenChrome()
+        val realController = FakeController(baseState())
+        val fallbackController = FakeController(baseState())
+        val realHandler = handler(this, realController, realChrome)
+        val fallbackHandler = handler(this, fallbackController, fallbackChrome)
+
+        val realConsumed = realHandler.onKeyInput(
+            RemoteKeyInput(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_DPAD_CENTER, 0),
+            touchMode = false,
+        )
+        val fallbackConsumed = fallbackHandler.onKeyInput(
+            RemoteKeyInput(
+                action = KeyEvent.ACTION_DOWN,
+                keyCode = KeyEvent.KEYCODE_DPAD_CENTER,
+                repeatCount = 0,
+                flags = KeyEvent.FLAG_FALLBACK,
+            ),
+            touchMode = false,
+        )
+
+        assertEquals(realConsumed, fallbackConsumed)
+        assertTrue(realChrome.controlsVisible)
+        assertTrue(fallbackChrome.controlsVisible)
+        assertEquals(0, realController.togglePlaybackCalls)
+        assertEquals(0, fallbackController.togglePlaybackCalls)
+        realHandler.release()
+        fallbackHandler.release()
+    }
+
+    @Test
+    fun fallbackMenuHasTheSameSettingsBehaviorAsTheRealKey() = runTest {
+        val realChrome = PlayerChromeState()
+        val fallbackChrome = PlayerChromeState()
+        val realHandler = handler(this, FakeController(baseState()), realChrome)
+        val fallbackHandler = handler(this, FakeController(baseState()), fallbackChrome)
+
+        val realConsumed = realHandler.onKeyInput(
+            RemoteKeyInput(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_MENU, 0),
+            touchMode = false,
+        )
+        val fallbackConsumed = fallbackHandler.onKeyInput(
+            RemoteKeyInput(
+                action = KeyEvent.ACTION_DOWN,
+                keyCode = KeyEvent.KEYCODE_MENU,
+                repeatCount = 0,
+                flags = KeyEvent.FLAG_FALLBACK,
+            ),
+            touchMode = false,
+        )
+
+        assertEquals(realConsumed, fallbackConsumed)
+        assertTrue(realChrome.popupOpen)
+        assertTrue(fallbackChrome.popupOpen)
+        realHandler.release()
+        fallbackHandler.release()
+    }
+
+    @Test
     fun menuOpensAndDismissesSettings() = runTest {
         val chrome = PlayerChromeState()
         val controller = FakeController(baseState())
@@ -241,6 +351,111 @@ class RemoteKeyHandlerTest {
         assertTrue(chrome.popupOpen)
         assertTrue(handler.handle(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_MENU, 0, false))
         assertFalse(chrome.popupOpen)
+        handler.release()
+    }
+
+    @Test
+    fun errorStateAllowsRevealAndSettingsButRefusesTransportActions() = runTest {
+        val controller = FakeController(
+            baseState().copy(playbackState = PlaybackState.ERROR),
+        )
+        val chrome = hiddenChrome()
+        val handler = handler(this, controller, chrome)
+
+        assertTrue(handler.handle(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_DPAD_CENTER, 0, false))
+        assertTrue(chrome.controlsVisible)
+        assertEquals(0, controller.togglePlaybackCalls)
+        assertTrue(handler.handle(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_MENU, 0, false))
+        assertTrue(chrome.popupOpen)
+        assertFalse(
+            handler.handle(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE, 0, false),
+        )
+        assertFalse(
+            handler.handle(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_MEDIA_REWIND, 0, false),
+        )
+        assertFalse(
+            handler.handle(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_MEDIA_STOP, 0, false),
+        )
+        handler.release()
+    }
+
+    @Test
+    fun rawGamepadButtonsAlwaysPassThrough() = runTest {
+        val buttonCodes = listOf(
+            KeyEvent.KEYCODE_BUTTON_A,
+            KeyEvent.KEYCODE_BUTTON_B,
+            KeyEvent.KEYCODE_BUTTON_C,
+            KeyEvent.KEYCODE_BUTTON_X,
+            KeyEvent.KEYCODE_BUTTON_Y,
+            KeyEvent.KEYCODE_BUTTON_Z,
+            KeyEvent.KEYCODE_BUTTON_L1,
+            KeyEvent.KEYCODE_BUTTON_R1,
+            KeyEvent.KEYCODE_BUTTON_L2,
+            KeyEvent.KEYCODE_BUTTON_R2,
+            KeyEvent.KEYCODE_BUTTON_START,
+            KeyEvent.KEYCODE_BUTTON_SELECT,
+            KeyEvent.KEYCODE_BUTTON_MODE,
+            KeyEvent.KEYCODE_BUTTON_THUMBL,
+            KeyEvent.KEYCODE_BUTTON_THUMBR,
+            KeyEvent.KEYCODE_BUTTON_1,
+            KeyEvent.KEYCODE_BUTTON_2,
+            KeyEvent.KEYCODE_BUTTON_3,
+            KeyEvent.KEYCODE_BUTTON_4,
+            KeyEvent.KEYCODE_BUTTON_5,
+            KeyEvent.KEYCODE_BUTTON_6,
+            KeyEvent.KEYCODE_BUTTON_7,
+            KeyEvent.KEYCODE_BUTTON_8,
+            KeyEvent.KEYCODE_BUTTON_9,
+            KeyEvent.KEYCODE_BUTTON_10,
+            KeyEvent.KEYCODE_BUTTON_11,
+            KeyEvent.KEYCODE_BUTTON_12,
+            KeyEvent.KEYCODE_BUTTON_13,
+            KeyEvent.KEYCODE_BUTTON_14,
+            KeyEvent.KEYCODE_BUTTON_15,
+            KeyEvent.KEYCODE_BUTTON_16,
+        )
+        val states = listOf(
+            PlaybackState.IDLE,
+            PlaybackState.PREPARING,
+            PlaybackState.READY,
+            PlaybackState.PLAYING,
+            PlaybackState.PAUSED,
+            PlaybackState.ENDED,
+            PlaybackState.ERROR,
+        )
+
+        for (playbackState in states) {
+            for (touchMode in listOf(false, true)) {
+                val chrome = PlayerChromeState()
+                val controller = FakeController(baseState().copy(playbackState = playbackState))
+                val handler = handler(this, controller, chrome)
+                for (keyCode in buttonCodes) {
+                    assertFalse(
+                        "button $keyCode consumed in $playbackState touch=$touchMode",
+                        handler.handle(KeyEvent.ACTION_DOWN, keyCode, 0, touchMode),
+                    )
+                }
+                handler.release()
+            }
+        }
+    }
+
+    @Test
+    fun repeatedMediaPlayPauseRearmsControlsWithoutTogglingAgain() = runTest {
+        val chrome = PlayerChromeState()
+        val controller = FakeController(baseState())
+        val handler = handler(this, controller, chrome)
+
+        assertTrue(
+            handler.handle(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE, 0, false),
+        )
+        val afterFirst = chrome.interactionRevision
+        assertTrue(
+            handler.handle(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE, 1, false),
+        )
+
+        assertEquals(afterFirst + 1L, chrome.interactionRevision)
+        assertEquals(1, controller.togglePlaybackCalls)
         handler.release()
     }
 

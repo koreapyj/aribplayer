@@ -1,6 +1,7 @@
 package kr.dcmys.android.aribplayer.ui.player
 
 import android.view.KeyEvent
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -8,11 +9,16 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.relocation.BringIntoViewRequester
+import androidx.compose.foundation.relocation.bringIntoViewRequester
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Audiotrack
 import androidx.compose.material.icons.filled.Check
@@ -26,12 +32,16 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusProperties
 import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.input.key.Key
@@ -39,10 +49,12 @@ import androidx.compose.ui.input.key.KeyEventType
 import androidx.compose.ui.input.key.key
 import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.key.type
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.res.pluralStringResource
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntRect
 import androidx.compose.ui.unit.IntSize
@@ -95,6 +107,7 @@ internal fun PlayerSettingsPopup(
         ),
     ) {
         val view = LocalView.current
+        val forwardedKeys = remember { popupForwardKeys() }
         Surface(
             color = PlayerColors.Popup,
             contentColor = Color.White,
@@ -106,8 +119,7 @@ internal fun PlayerSettingsPopup(
                     val nativeEvent = event.nativeKeyEvent
                     if (
                         !view.isInTouchMode &&
-                        (nativeEvent.keyCode in popupRemoteKeys ||
-                            nativeEvent.keyCode in KeyEvent.KEYCODE_0..KeyEvent.KEYCODE_9) &&
+                        nativeEvent.keyCode in forwardedKeys &&
                         onRemoteKeyEvent?.invoke(nativeEvent) == true
                     ) {
                         return@onPreviewKeyEvent true
@@ -202,16 +214,20 @@ private fun SettingsMainPage(
     onInteraction: () -> Unit,
 ) {
     val requesters = remember { List(3) { FocusRequester() } }
+    var focusedIndex by remember { mutableStateOf<Int?>(null) }
     val audioEnabled = tracks.isNotEmpty()
     val selectedTrack = tracks.firstOrNull { it.key == selectedTrackKey } ?: tracks.firstOrNull()
     LaunchedEffect(focusTarget, audioEnabled) {
-        awaitFrame()
         val index = when (focusTarget) {
             PlayerSettingsMainRow.VideoFilter -> 0
             PlayerSettingsMainRow.Audio -> if (audioEnabled) 1 else 0
             PlayerSettingsMainRow.AppSettings -> 2
         }
-        requesters[index].requestFocus()
+        awaitFocusAcknowledgement(
+            requestFocus = { requesters[index].requestFocus() },
+            isFocused = { focusedIndex == index },
+            awaitNextFrame = { awaitFrame() },
+        )
     }
     Column {
         MainSettingsRow(
@@ -222,6 +238,10 @@ private fun SettingsMainPage(
             showChevron = true,
             modifier = Modifier
                 .focusRequester(requesters[0])
+                .onFocusChanged { focusState ->
+                    if (focusState.isFocused) focusedIndex = 0
+                    else if (focusedIndex == 0) focusedIndex = null
+                }
                 .focusProperties { down = if (audioEnabled) requesters[1] else requesters[2] },
             onClick = {
                 onInteraction()
@@ -236,6 +256,10 @@ private fun SettingsMainPage(
             showChevron = true,
             modifier = Modifier
                 .focusRequester(requesters[1])
+                .onFocusChanged { focusState ->
+                    if (focusState.isFocused) focusedIndex = 1
+                    else if (focusedIndex == 1) focusedIndex = null
+                }
                 .focusProperties {
                     up = requesters[0]
                     down = requesters[2]
@@ -254,6 +278,10 @@ private fun SettingsMainPage(
             showChevron = true,
             modifier = Modifier
                 .focusRequester(requesters[2])
+                .onFocusChanged { focusState ->
+                    if (focusState.isFocused) focusedIndex = 2
+                    else if (focusedIndex == 2) focusedIndex = null
+                }
                 .focusProperties { up = if (audioEnabled) requesters[1] else requesters[0] },
             onClick = {
                 onInteraction()
@@ -273,15 +301,24 @@ private fun AppSettingsPage(
     onInteraction: () -> Unit,
 ) {
     val requesters = remember { List(4) { FocusRequester() } }
+    var focusedIndex by remember { mutableStateOf<Int?>(null) }
     LaunchedEffect(focusTarget) {
-        awaitFrame()
-        requesters[focusTarget.ordinal + 1].requestFocus()
+        val index = focusTarget.ordinal + 1
+        awaitFocusAcknowledgement(
+            requestFocus = { requesters[index].requestFocus() },
+            isFocused = { focusedIndex == index },
+            awaitNextFrame = { awaitFrame() },
+        )
     }
     Column {
         PopupHeaderRow(
             title = stringResource(R.string.player_settings_description),
             modifier = Modifier
                 .focusRequester(requesters[0])
+                .onFocusChanged { focusState ->
+                    if (focusState.isFocused) focusedIndex = 0
+                    else if (focusedIndex == 0) focusedIndex = null
+                }
                 .focusProperties { down = requesters[1] },
             onClick = {
                 onInteraction()
@@ -296,6 +333,10 @@ private fun AppSettingsPage(
             showChevron = true,
             modifier = Modifier
                 .focusRequester(requesters[1])
+                .onFocusChanged { focusState ->
+                    if (focusState.isFocused) focusedIndex = 1
+                    else if (focusedIndex == 1) focusedIndex = null
+                }
                 .focusProperties { up = requesters[0]; down = requesters[2] },
             onClick = {
                 onInteraction()
@@ -310,6 +351,10 @@ private fun AppSettingsPage(
             showChevron = true,
             modifier = Modifier
                 .focusRequester(requesters[2])
+                .onFocusChanged { focusState ->
+                    if (focusState.isFocused) focusedIndex = 2
+                    else if (focusedIndex == 2) focusedIndex = null
+                }
                 .focusProperties { up = requesters[1]; down = requesters[3] },
             onClick = {
                 onInteraction()
@@ -326,6 +371,10 @@ private fun AppSettingsPage(
             showChevron = false,
             modifier = Modifier
                 .focusRequester(requesters[3])
+                .onFocusChanged { focusState ->
+                    if (focusState.isFocused) focusedIndex = 3
+                    else if (focusedIndex == 3) focusedIndex = null
+                }
                 .focusProperties { up = requesters[2] },
             onClick = {
                 onInteraction()
@@ -396,6 +445,7 @@ private fun AudioPage(
     )
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun OptionPage(
     title: String,
@@ -406,15 +456,36 @@ private fun OptionPage(
     onInteraction: () -> Unit,
 ) {
     val requesters = remember(labels) { List(labels.size + 1) { FocusRequester() } }
-    LaunchedEffect(labels) {
-        awaitFrame()
-        requesters.first().requestFocus()
+    val bringIntoViewRequesters = remember(labels) {
+        List(labels.size + 1) { BringIntoViewRequester() }
     }
-    Column {
+    var focusedIndex by remember(labels) { mutableStateOf<Int?>(null) }
+    val scrollState = rememberScrollState()
+    val maxHeight = popupMaxHeight()
+    LaunchedEffect(labels) {
+        awaitFocusAcknowledgement(
+            requestFocus = { requesters.first().requestFocus() },
+            isFocused = { focusedIndex == 0 },
+            awaitNextFrame = { awaitFrame() },
+        )
+    }
+    LaunchedEffect(focusedIndex) {
+        focusedIndex?.let { bringIntoViewRequesters[it].bringIntoView() }
+    }
+    Column(
+        modifier = Modifier
+            .then(maxHeight?.let { Modifier.heightIn(max = it) } ?: Modifier)
+            .verticalScroll(scrollState),
+    ) {
         PopupHeaderRow(
             title = title,
             modifier = Modifier
                 .focusRequester(requesters[0])
+                .bringIntoViewRequester(bringIntoViewRequesters[0])
+                .onFocusChanged { focusState ->
+                    if (focusState.isFocused) focusedIndex = 0
+                    else if (focusedIndex == 0) focusedIndex = null
+                }
                 .focusProperties { if (labels.isNotEmpty()) down = requesters[1] },
             onClick = {
                 onInteraction()
@@ -428,6 +499,11 @@ private fun OptionPage(
                 checked = selectedIndex == index,
                 modifier = Modifier
                     .focusRequester(requesters[requesterIndex])
+                    .bringIntoViewRequester(bringIntoViewRequesters[requesterIndex])
+                    .onFocusChanged { focusState ->
+                        if (focusState.isFocused) focusedIndex = requesterIndex
+                        else if (focusedIndex == requesterIndex) focusedIndex = null
+                    }
                     .focusProperties {
                         up = requesters[requesterIndex - 1]
                         if (requesterIndex < requesters.lastIndex) {
@@ -440,6 +516,22 @@ private fun OptionPage(
                 },
             )
         }
+    }
+}
+
+@Composable
+private fun popupMaxHeight(): Dp? {
+    val density = LocalDensity.current
+    val configurationHeightPx = with(density) {
+        LocalConfiguration.current.screenHeightDp.dp.roundToPx()
+    }
+    val availableHeightPx = configurationHeightPx.takeIf { it > 0 }
+        ?: LocalView.current.resources.displayMetrics.heightPixels
+    if (availableHeightPx <= 0) return null
+    return with(density) {
+        (availableHeightPx - 16.dp.roundToPx())
+            .coerceAtLeast(PlayerDims.PopupRowHeight.roundToPx())
+            .toDp()
     }
 }
 
@@ -554,26 +646,6 @@ private fun seekStepLabel(valueMs: Long): String {
     val seconds = (valueMs / 1_000L).toInt()
     return pluralStringResource(R.plurals.player_seconds, seconds, seconds)
 }
-
-// BACK stays with the popup; D-pad and ENTER stay with Compose focus/activation.
-private val popupRemoteKeys = setOf(
-    KeyEvent.KEYCODE_MENU,
-    KeyEvent.KEYCODE_SETTINGS,
-    KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE,
-    KeyEvent.KEYCODE_MEDIA_PLAY,
-    KeyEvent.KEYCODE_MEDIA_PAUSE,
-    KeyEvent.KEYCODE_MEDIA_STOP,
-    KeyEvent.KEYCODE_MEDIA_REWIND,
-    KeyEvent.KEYCODE_MEDIA_FAST_FORWARD,
-    KeyEvent.KEYCODE_MEDIA_PREVIOUS,
-    KeyEvent.KEYCODE_MEDIA_NEXT,
-    KeyEvent.KEYCODE_MEDIA_SKIP_BACKWARD,
-    KeyEvent.KEYCODE_MEDIA_SKIP_FORWARD,
-    KeyEvent.KEYCODE_INFO,
-    KeyEvent.KEYCODE_PROG_RED,
-    KeyEvent.KEYCODE_CAPTIONS,
-    KeyEvent.KEYCODE_PROG_GREEN,
-)
 
 private class AboveEndPopupPositionProvider(private val gapPx: Int) : PopupPositionProvider {
     override fun calculatePosition(

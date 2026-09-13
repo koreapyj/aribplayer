@@ -8,7 +8,6 @@ import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
-import androidx.compose.ui.focus.FocusRequester
 
 data class SeekFeedback(
     val deltaMs: Long,
@@ -62,7 +61,7 @@ class PlayerChromeState internal constructor() {
 
     var seekFeedback by mutableStateOf<SeekFeedback?>(null)
 
-    var focusPlayPauseRequest by mutableStateOf(0)
+    internal var focusedControl by mutableStateOf<PlayerControl?>(null)
 
     val popupOpen: Boolean
         get() = settingsPage != null
@@ -78,10 +77,6 @@ class PlayerChromeState internal constructor() {
 
     fun clearSeekFeedback() {
         seekFeedback = null
-    }
-
-    fun requestPlayPauseFocus() {
-        focusPlayPauseRequest++
     }
 
     fun recordInteraction(showControls: Boolean = true) {
@@ -180,19 +175,3 @@ class PlayerChromeState internal constructor() {
 
 @Composable
 fun rememberPlayerChromeState(): PlayerChromeState = remember { PlayerChromeState() }
-
-@Stable
-internal class PlayerFocusRequesters {
-    val root = FocusRequester()
-    val replay = FocusRequester()
-    val playPause = FocusRequester()
-    val forward = FocusRequester()
-    val timeBar = FocusRequester()
-    val info = FocusRequester()
-    val captions = FocusRequester()
-    val settings = FocusRequester()
-}
-
-@Composable
-internal fun rememberPlayerFocusRequesters(): PlayerFocusRequesters =
-    remember { PlayerFocusRequesters() }

@@ -29,8 +29,8 @@ android {
         applicationId = "kr.dcmys.android.aribplayer"
         minSdk = 26
         targetSdk = 35
-        versionCode = 5
-        versionName = "0.0.5"
+        versionCode = 6
+        versionName = "0.0.6"
 
         // Package precisely the native ABI selected by -PtargetAbi.
         ndk {
@@ -91,6 +91,8 @@ android.applicationVariants.all {
 kotlin {
     compilerOptions {
         jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17)
+        // FocusRequester.Cancel (focus graph boundaries) is still experimental in Compose 1.7.
+        optIn.add("androidx.compose.ui.ExperimentalComposeUiApi")
     }
 }
 

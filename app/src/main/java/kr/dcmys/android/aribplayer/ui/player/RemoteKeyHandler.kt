@@ -23,6 +23,13 @@ interface RemotePlaybackController {
     fun notifyControlsInteraction()
 }
 
+internal data class RemoteKeyInput(
+    val action: Int,
+    val keyCode: Int,
+    val repeatCount: Int,
+    val flags: Int = 0,
+)
+
 class RemoteKeyHandler(
     private val viewModel: RemotePlaybackController,
     private val chromeState: () -> PlayerChromeState?,
@@ -44,8 +51,18 @@ class RemoteKeyHandler(
     private var activeChrome: PlayerChromeState? = null
 
     /** Returns true when the key was consumed. Call from Activity.dispatchKeyEvent BEFORE super. */
-    fun onKeyEvent(event: KeyEvent, touchMode: Boolean): Boolean =
-        handle(event.action, event.keyCode, event.repeatCount, touchMode)
+    fun onKeyEvent(event: KeyEvent, touchMode: Boolean): Boolean = onKeyInput(
+        RemoteKeyInput(
+            action = event.action,
+            keyCode = event.keyCode,
+            repeatCount = event.repeatCount,
+            flags = event.flags,
+        ),
+        touchMode,
+    )
+
+    internal fun onKeyInput(input: RemoteKeyInput, touchMode: Boolean): Boolean =
+        handle(input.action, input.keyCode, input.repeatCount, touchMode)
 
     internal fun handle(
         action: Int,
@@ -54,24 +71,25 @@ class RemoteKeyHandler(
         touchMode: Boolean,
     ): Boolean {
         if (touchMode && action != KeyEvent.ACTION_DOWN) return false
-        if (touchMode && keyCode !in touchMediaKeys) return false
+        if (touchMode && !isTouchAllowedKey(keyCode)) return false
 
         val state = viewModel.state
         val chrome = chromeState() ?: return false
         resetForChromeIfNeeded(chrome)
 
         val now = clock()
+        val seekKey = isSeekKey(keyCode)
         if (action == KeyEvent.ACTION_UP) {
             val heldForMs = heldSinceAt[keyCode]?.let { now - it } ?: 0L
-            if (isSeekKey(keyCode)) {
+            if (seekKey) {
                 heldFlushJob?.cancel()
                 heldFlushJob = null
             }
             heldSinceAt.remove(keyCode)
-            if (isSeekKey(keyCode) && heldForMs > HELD_SEEK_THRESHOLD_MS) {
+            if (seekKey && heldForMs > HELD_SEEK_THRESHOLD_MS) {
                 flush(chrome)
             }
-            if (isSeekKey(keyCode) && pendingTargetMs == null) {
+            if (seekKey && pendingTargetMs == null) {
                 lastIssuedTargetMs = null
             }
             return false
@@ -82,118 +100,114 @@ class RemoteKeyHandler(
         val held = repeatCount > 0 ||
             (previousDownAt != null && now - previousDownAt < REPEAT_WINDOW_MS)
         lastDownAt[keyCode] = now
-        if (isSeekKey(keyCode)) heldSinceAt.putIfAbsent(keyCode, now)
+        if (seekKey) heldSinceAt.putIfAbsent(keyCode, now)
 
-        when (keyCode) {
-            KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE -> {
-                if (repeatCount == 0) {
-                    viewModel.togglePlayback()
-                    viewModel.notifyControlsInteraction()
-                }
-                return true
+        val context = PlayerKeyContext(
+            touchMode = touchMode,
+            controlsVisible = chrome.controlsVisible,
+            popupOpen = chrome.popupOpen,
+            playbackState = state.playbackState,
+            isSeekable = state.isSeekable,
+            durationMs = state.durationMs,
+            hasSubtitles = state.hasSubtitles,
+            focusedControl = chrome.focusedControl,
+        )
+        val binding = playerKeyBindingFor(keyCode, context, seekStepMs)
+        if (binding == null) {
+            // Compose normally re-arms the chrome timeout in its key preview handler. Keep that
+            // timer alive even when no Compose node currently owns focus, while leaving navigation
+            // and activation to Compose/framework focus handling.
+            if (!touchMode && chrome.controlsVisible && !chrome.popupOpen &&
+                keyCode in visibleNavigationKeys
+            ) {
+                chrome.recordInteraction(showControls = false)
             }
-            KeyEvent.KEYCODE_MEDIA_PLAY -> {
-                if (repeatCount == 0) {
-                    if (!state.isPlaying) viewModel.play()
-                    viewModel.notifyControlsInteraction()
+            return false
+        }
+        if (state.playbackState == PlaybackState.ERROR && binding.action.isTransportAction()) {
+            return false
+        }
+        if (binding.repeat == RepeatPolicy.FirstDownOnly && repeatCount > 0) {
+            if (!touchMode) {
+                when (binding.action) {
+                    PlayerKeyAction.PlayPause,
+                    PlayerKeyAction.Play,
+                    PlayerKeyAction.Pause,
+                    -> chrome.recordInteraction(showControls = false)
+                    else -> Unit
                 }
-                return true
             }
-            KeyEvent.KEYCODE_MEDIA_PAUSE -> {
-                if (repeatCount == 0) {
-                    if (state.isPlaying) viewModel.pause()
-                    viewModel.notifyControlsInteraction()
-                }
-                return true
+            return true
+        }
+
+        return when (val keyAction = binding.action) {
+            PlayerKeyAction.RevealControls -> {
+                chrome.showControls()
+                true
             }
-            KeyEvent.KEYCODE_DPAD_CENTER,
-            KeyEvent.KEYCODE_ENTER,
-            -> {
-                if (repeatCount > 0) return true
-                if (chrome.controlsVisible || chrome.popupOpen) return false
+            PlayerKeyAction.ToggleSettings -> {
+                if (chrome.popupOpen) chrome.dismissSettings() else chrome.openSettings()
+                true
+            }
+            PlayerKeyAction.ToggleDiagnostics -> {
+                viewModel.toggleDiagnostics()
+                chrome.recordInteraction(showControls = true)
+                true
+            }
+            PlayerKeyAction.ToggleCaptions -> {
+                viewModel.toggleSubtitles()
+                chrome.recordInteraction(showControls = true)
+                true
+            }
+            PlayerKeyAction.PlayPause -> {
                 viewModel.togglePlayback()
                 viewModel.notifyControlsInteraction()
-                chrome.recordInteraction(showControls = true)
-                chrome.requestPlayPauseFocus()
-                return true
+                true
             }
-            KeyEvent.KEYCODE_DPAD_UP,
-            KeyEvent.KEYCODE_DPAD_DOWN,
-            -> {
-                if (chrome.controlsVisible || chrome.popupOpen) return false
-                chrome.showControls()
-                chrome.requestPlayPauseFocus()
-                return true
+            PlayerKeyAction.Play -> {
+                if (!state.isPlaying) viewModel.play()
+                viewModel.notifyControlsInteraction()
+                true
             }
-            KeyEvent.KEYCODE_MENU,
-            KeyEvent.KEYCODE_SETTINGS,
-            -> {
-                if (repeatCount == 0) {
-                    if (chrome.popupOpen) chrome.dismissSettings() else chrome.openSettings()
+            PlayerKeyAction.Pause -> {
+                if (state.isPlaying) viewModel.pause()
+                viewModel.notifyControlsInteraction()
+                true
+            }
+            PlayerKeyAction.Stop -> {
+                val positionMs = state.positionMs
+                val durationMs = state.durationMs
+                release()
+                onStop(positionMs, durationMs)
+                true
+            }
+            is PlayerKeyAction.SeekRelative -> {
+                val directionalDpad = keyCode == KeyEvent.KEYCODE_DPAD_LEFT ||
+                    keyCode == KeyEvent.KEYCODE_DPAD_RIGHT
+                if (directionalDpad && (chrome.controlsVisible || chrome.popupOpen)) return false
+                if (!state.isSeekable || state.durationMs <= 0L) return false
+                val heldLong = held &&
+                    heldSinceAt[keyCode]?.let { now - it > HELD_SEEK_THRESHOLD_MS } == true
+                val holdConfirmed = repeatCount > 0 || heldLong
+                val adjustedDelta = if (heldLong) {
+                    doubleDelta(keyAction.ms)
+                } else {
+                    keyAction.ms
                 }
-                return true
+                val base = pendingTargetMs ?: state.positionMs
+                val target = safeAdd(base, adjustedDelta)
+                    .coerceIn(0L, state.durationMs)
+                updatePendingTarget(chrome, state, target, now, holdConfirmed)
+                true
             }
-            KeyEvent.KEYCODE_INFO,
-            KeyEvent.KEYCODE_PROG_RED,
-            -> {
-                if (repeatCount == 0) {
-                    viewModel.toggleDiagnostics()
-                    chrome.recordInteraction(showControls = true)
-                }
-                return true
+            is PlayerKeyAction.SeekPercent -> {
+                if (!state.isSeekable || state.durationMs <= 0L) return false
+                val target = percentTarget(state.durationMs, keyAction.n)
+                updatePendingTarget(chrome, state, target, now)
+                true
             }
-            KeyEvent.KEYCODE_CAPTIONS,
-            KeyEvent.KEYCODE_PROG_GREEN,
-            -> {
-                if (repeatCount == 0) {
-                    viewModel.toggleSubtitles()
-                    chrome.recordInteraction(showControls = true)
-                }
-                return true
-            }
-            KeyEvent.KEYCODE_MEDIA_STOP -> {
-                if (repeatCount == 0) {
-                    val positionMs = state.positionMs
-                    val durationMs = state.durationMs
-                    release()
-                    onStop(positionMs, durationMs)
-                }
-                return true
-            }
-            KeyEvent.KEYCODE_BACK -> return false
+            PlayerKeyAction.PassThrough -> false
         }
-
-        val seekDelta = seekDeltaFor(keyCode)
-        if (seekDelta != null) {
-            val directionalDpad = keyCode == KeyEvent.KEYCODE_DPAD_LEFT ||
-                keyCode == KeyEvent.KEYCODE_DPAD_RIGHT
-            if (directionalDpad && (chrome.controlsVisible || chrome.popupOpen)) return false
-            if (!state.isSeekable || state.durationMs <= 0L) return false
-            val heldLong = held &&
-                heldSinceAt[keyCode]?.let { now - it > HELD_SEEK_THRESHOLD_MS } == true
-            val holdConfirmed = repeatCount > 0 || heldLong
-            val adjustedDelta = if (heldLong) {
-                doubleDelta(seekDelta)
-            } else {
-                seekDelta
-            }
-            val base = pendingTargetMs ?: state.positionMs
-            val target = safeAdd(base, adjustedDelta)
-                .coerceIn(0L, state.durationMs)
-            updatePendingTarget(chrome, state, target, now, holdConfirmed)
-            return true
-        }
-
-        if (keyCode in KeyEvent.KEYCODE_0..KeyEvent.KEYCODE_9) {
-            if (repeatCount > 0) return true
-            if (!state.isSeekable || state.durationMs <= 0L) return false
-            val number = keyCode - KeyEvent.KEYCODE_0
-            val target = percentTarget(state.durationMs, number)
-            updatePendingTarget(chrome, state, target, now)
-            return true
-        }
-
-        return false
     }
 
     fun release() {
@@ -308,23 +322,15 @@ class RemoteKeyHandler(
         lastIssuedTargetMs = null
     }
 
-    private fun seekDeltaFor(keyCode: Int): Long? = when (keyCode) {
-        KeyEvent.KEYCODE_DPAD_LEFT,
-        KeyEvent.KEYCODE_MEDIA_REWIND,
-        -> -seekStepMs.coerceAtLeast(0L)
-        KeyEvent.KEYCODE_DPAD_RIGHT,
-        KeyEvent.KEYCODE_MEDIA_FAST_FORWARD,
-        -> seekStepMs.coerceAtLeast(0L)
-        KeyEvent.KEYCODE_MEDIA_PREVIOUS,
-        KeyEvent.KEYCODE_MEDIA_SKIP_BACKWARD,
-        -> -FIXED_SEEK_MS
-        KeyEvent.KEYCODE_MEDIA_NEXT,
-        KeyEvent.KEYCODE_MEDIA_SKIP_FORWARD,
-        -> FIXED_SEEK_MS
-        else -> null
-    }
+    private fun isTouchAllowedKey(keyCode: Int): Boolean =
+        playerKeyBindings(seekStepMs).any { binding ->
+            keyCode in binding.keys && binding.touch == TouchPolicy.AlsoInTouch
+        }
 
-    private fun isSeekKey(keyCode: Int): Boolean = seekDeltaFor(keyCode) != null
+    private fun isSeekKey(keyCode: Int): Boolean =
+        playerKeyBindings(seekStepMs).any { binding ->
+            keyCode in binding.keys && binding.action is PlayerKeyAction.SeekRelative
+        }
 
     private fun doubleDelta(delta: Long): Long = when {
         delta > 0L && delta > Long.MAX_VALUE / 2L -> Long.MAX_VALUE
@@ -356,12 +362,15 @@ class RemoteKeyHandler(
         const val SEEK_ISSUE_INTERVAL_MS = 250L
         const val SEEK_FLUSH_DELAY_MS = 300L
         const val SEEK_FEEDBACK_DURATION_MS = 800L
-        const val FIXED_SEEK_MS = 60_000L
 
-        val touchMediaKeys = setOf(
-            KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE,
-            KeyEvent.KEYCODE_MEDIA_PLAY,
-            KeyEvent.KEYCODE_MEDIA_PAUSE,
+        val visibleNavigationKeys = setOf(
+            KeyEvent.KEYCODE_DPAD_UP,
+            KeyEvent.KEYCODE_DPAD_DOWN,
+            KeyEvent.KEYCODE_DPAD_LEFT,
+            KeyEvent.KEYCODE_DPAD_RIGHT,
+            KeyEvent.KEYCODE_DPAD_CENTER,
+            KeyEvent.KEYCODE_ENTER,
+            KeyEvent.KEYCODE_BACK,
         )
     }
 }

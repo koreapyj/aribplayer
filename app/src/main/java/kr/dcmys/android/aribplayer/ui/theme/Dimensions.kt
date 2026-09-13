@@ -19,6 +19,8 @@ object PlayerDims {
     val PopupMaxWidth = 320.dp
     val ErrorPillRadius = 16.dp
     val FocusRing = 3.dp
+    val FocusScale = 1.08f
+    const val FocusAnimMs = 120
     const val AnimMs = 250
 }
 
