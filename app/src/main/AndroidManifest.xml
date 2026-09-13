@@ -8,6 +8,10 @@
         android:label="ARIB Player"
         android:supportsRtl="true"
         android:theme="@style/Theme.ARIBPlayer">
+        <provider
+            android:name=".data.ResumeProvider"
+            android:authorities="kr.dcmys.android.aribplayer.resume"
+            android:exported="true" />
         <activity
             android:name=".MainActivity"
             android:exported="true"

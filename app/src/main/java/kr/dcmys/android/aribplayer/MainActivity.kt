@@ -73,10 +73,14 @@ class MainActivity : ComponentActivity() {
     private var finishInFlight by mutableStateOf(false)
     @Volatile private var playerRouteActive = false
     @Volatile private var activePlayerUri: String? = null
+    @Volatile private var activePlayerReturnResult = false
+    private var lastPlaybackPositionMs = 0L
+    private var lastPlaybackDurationMs = 0L
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         val initialRequest = intent.toIncomingOpenRequest()
+        activePlayerReturnResult = initialRequest?.returnResult == true
         incomingOpenRequest = initialRequest
         if (initialRequest == null) finishWithMessage(R.string.player_invalid_open_request)
         enableEdgeToEdge(
@@ -91,9 +95,10 @@ class MainActivity : ComponentActivity() {
                 incomingOpenRequest = incomingOpenRequest,
                 finishInFlight = finishInFlight,
                 onIncomingOpenRequestConsumed = { incomingOpenRequest = null },
-                onPlayerRouteChanged = { active, uri ->
+                onPlayerRouteChanged = { active, uri, returnResult ->
                     playerRouteActive = active
                     activePlayerUri = uri
+                    if (active) activePlayerReturnResult = returnResult
                 },
             )
         }
@@ -103,6 +108,7 @@ class MainActivity : ComponentActivity() {
         super.onNewIntent(intent)
         setIntent(intent)
         val request = intent.toIncomingOpenRequest()
+        activePlayerReturnResult = request?.returnResult == true
         incomingOpenRequest = request
         if (request == null) finishWithMessage(R.string.player_invalid_open_request)
     }
@@ -164,8 +170,31 @@ class MainActivity : ComponentActivity() {
     }
 
     fun finishPlayback() {
+        finishPlaybackWithResult(
+            returnResult = activePlayerReturnResult,
+            lastPositionMs = lastPlaybackPositionMs,
+            lastDurationMs = lastPlaybackDurationMs,
+            endBy = END_BY_USER,
+        )
+    }
+
+    fun finishPlaybackWithResult(
+        returnResult: Boolean,
+        lastPositionMs: Long,
+        lastDurationMs: Long,
+        endBy: String,
+    ) {
         if (finishInFlight) return
         finishInFlight = true
+        if (returnResult) {
+            setResult(
+                RESULT_OK,
+                Intent()
+                    .putExtra("position", lastPositionMs.coerceAtLeast(0L))
+                    .putExtra("duration", lastDurationMs.coerceAtLeast(0L))
+                    .putExtra("end_by", endBy),
+            )
+        }
         finish()
     }
 
@@ -173,11 +202,15 @@ class MainActivity : ComponentActivity() {
         val uri = activePlayerUri ?: return
         val state = playerViewModel.uiState.value
         if (state.screen != PlayerScreenDestination.PLAYER) return
+        val positionMs = state.positionMs.coerceAtLeast(0L)
+        val durationMs = state.durationMs.coerceAtLeast(0L)
+        lastPlaybackPositionMs = positionMs
+        lastPlaybackDurationMs = durationMs
         lifecycleScope.launch {
             repository.updatePosition(
                 uri = uri,
-                positionMs = state.positionMs,
-                durationMs = state.durationMs.takeIf { it > 0L },
+                positionMs = positionMs,
+                durationMs = durationMs.takeIf { it > 0L },
                 lastOpenedEpochMs = System.currentTimeMillis(),
             )
         }
@@ -192,7 +225,7 @@ private fun AribPlayerApp(
     incomingOpenRequest: IncomingOpenRequest?,
     finishInFlight: Boolean,
     onIncomingOpenRequestConsumed: () -> Unit,
-    onPlayerRouteChanged: (Boolean, String?) -> Unit,
+    onPlayerRouteChanged: (Boolean, String?, Boolean) -> Unit,
 ) {
     var preferences by remember { mutableStateOf<PlayerPreferences?>(null) }
     val scope = rememberCoroutineScope()
@@ -206,7 +239,11 @@ private fun AribPlayerApp(
     }
 
     SideEffect {
-        onPlayerRouteChanged(session != null, session?.uriString)
+        onPlayerRouteChanged(
+            session != null,
+            session?.uriString,
+            session?.returnResult == true,
+        )
     }
 
     LaunchedEffect(incomingOpenRequest, preferences) {
@@ -243,13 +280,29 @@ private fun AribPlayerApp(
                     accessible = true,
                 )
                 repository.upsert(entry)
+                if (request.fromStart) {
+                    repository.updatePosition(
+                        uri = entry.uriString,
+                        positionMs = 0L,
+                        durationMs = entry.durationMs,
+                        lastOpenedEpochMs = System.currentTimeMillis(),
+                    )
+                }
                 if (latestRequestGeneration != request.generation) return@launch
-                val needsResumeChoice = entry.resumePositionMs > RESUME_DIALOG_THRESHOLD_MS
+                val hasExplicitStart = request.positionMs != null || request.fromStart
+                val needsResumeChoice = !hasExplicitStart &&
+                    entry.resumePositionMs > RESUME_DIALOG_THRESHOLD_MS
+                val resumePositionMs = when {
+                    request.fromStart -> 0L
+                    request.positionMs != null -> request.positionMs.coerceAtLeast(0L)
+                    needsResumeChoice -> entry.resumePositionMs
+                    else -> 0L
+                }
                 session = PlayerSession(
                     generation = request.generation,
                     uriString = entry.uriString,
                     displayName = entry.displayName,
-                    resumePositionMs = if (needsResumeChoice) entry.resumePositionMs else 0L,
+                    resumePositionMs = resumePositionMs,
                     openAllowed = !needsResumeChoice,
                     selectedVideoMode = when (entry.videoMode) {
                         UNSET_VIDEO_MODE, VideoMode.AUTO -> currentPreferences.defaultVideoMode
@@ -257,6 +310,7 @@ private fun AribPlayerApp(
                     },
                     audioTrackKey = entry.audioTrackKey,
                     subtitlesEnabled = entry.subtitlesEnabled,
+                    returnResult = request.returnResult,
                 )
             } catch (error: CancellationException) {
                 throw error
@@ -290,9 +344,14 @@ private fun AribPlayerApp(
                         repository = repository,
                         playerViewModel = playerViewModel,
                         preferences = currentPreferences,
-                        onPlaybackClosed = {
+                        onPlaybackClosed = { lastPositionMs, lastDurationMs, endBy ->
                             session = null
-                            activity.finishPlayback()
+                            activity.finishPlaybackWithResult(
+                                returnResult = currentSession.returnResult,
+                                lastPositionMs = lastPositionMs,
+                                lastDurationMs = lastDurationMs,
+                                endBy = endBy,
+                            )
                         },
                         onSetDefaultVideoMode = { mode ->
                             scope.launch { repository.setDefaultVideoMode(mode) }
@@ -343,7 +402,7 @@ private fun AribPlayerApp(
                                 playerViewModel.toggleDiagnostics()
                             }
                         },
-                        onClosePlayer = activity::finishPlayback,
+                        onClosePlayer = { activity.finishPlayback() },
                     )
                 }
                 finishInFlight || requestPending || currentPreferences == null ||
@@ -399,7 +458,7 @@ private fun PlayerDestination(
     repository: MediaRepository,
     playerViewModel: PlayerViewModel,
     preferences: PlayerPreferences,
-    onPlaybackClosed: () -> Unit,
+    onPlaybackClosed: (Long, Long, String) -> Unit,
     onSetDefaultVideoMode: (Int) -> Unit,
     onSetSeekStepMs: (Long) -> Unit,
     onSetDiagnosticsEnabled: (Boolean) -> Unit,
@@ -516,6 +575,20 @@ private fun PlayerDestination(
         }
     }
 
+    LaunchedEffect(session.generation, openIssued, session.returnResult, state.playbackState) {
+        if (!openIssued || !session.returnResult || state.playbackState != PlaybackState.ENDED) {
+            return@LaunchedEffect
+        }
+        delay(FINISH_MESSAGE_DELAY_MS)
+        if (isActive && playerViewModel.uiState.value.playbackState == PlaybackState.ENDED) {
+            onPlaybackClosed(
+                lastPlayback.positionMs,
+                lastPlayback.durationMs ?: 0L,
+                END_BY_PLAYBACK_COMPLETION,
+            )
+        }
+    }
+
     LaunchedEffect(session.uriString, openIssued, audioPreferenceReady, state.selectedTrackKey) {
         val selectedTrackKey = state.selectedTrackKey
         if (openIssued && audioPreferenceReady && selectedTrackKey != null) {
@@ -579,7 +652,13 @@ private fun PlayerDestination(
         onSetDefaultVideoMode = onSetDefaultVideoMode,
         onSetSeekStepMs = onSetSeekStepMs,
         onSetDiagnosticsEnabled = onSetDiagnosticsEnabled,
-        onClosePlayer = onPlaybackClosed,
+        onClosePlayer = {
+            onPlaybackClosed(
+                lastPlayback.positionMs,
+                lastPlayback.durationMs ?: 0L,
+                END_BY_USER,
+            )
+        },
     )
 }
 
@@ -643,7 +722,18 @@ private fun Intent?.toIncomingOpenRequest(): IncomingOpenRequest? {
     if (this?.action != Intent.ACTION_VIEW) return null
     val incomingUri = data ?: return null
     if (incomingUri.scheme != "content" && incomingUri.scheme != "file") return null
-    return IncomingOpenRequest(incomingUri, flags, requestIds.incrementAndGet())
+    val extras = extras
+    val hasPosition = extras?.containsKey(EXTRA_POSITION) == true
+    val hasFromStart = extras?.containsKey(EXTRA_FROM_START) == true
+    return IncomingOpenRequest(
+        uri = incomingUri,
+        flags = flags,
+        generation = requestIds.incrementAndGet(),
+        positionMs = (extras?.get(EXTRA_POSITION) as? Number)?.toLong(),
+        fromStart = extras?.getBoolean(EXTRA_FROM_START, false) == true,
+        hasExplicitStart = hasPosition || hasFromStart,
+        returnResult = extras?.getBoolean(EXTRA_RETURN_RESULT, false) == true,
+    )
 }
 
 private fun PlaybackState.isActiveOrOpening(): Boolean = when (this) {
@@ -688,7 +778,15 @@ private fun CaptioningManager.CaptionStyle.toAribPresentationPreferences():
     )
 }
 
-private data class IncomingOpenRequest(val uri: Uri, val flags: Int, val generation: Long)
+private data class IncomingOpenRequest(
+    val uri: Uri,
+    val flags: Int,
+    val generation: Long,
+    val positionMs: Long?,
+    val fromStart: Boolean,
+    val hasExplicitStart: Boolean,
+    val returnResult: Boolean,
+)
 private data class MediaMetadata(val displayName: String, val sizeBytes: Long?)
 private data class PlayerSession(
     val generation: Long,
@@ -699,6 +797,7 @@ private data class PlayerSession(
     val selectedVideoMode: Int,
     val audioTrackKey: String?,
     val subtitlesEnabled: Boolean?,
+    val returnResult: Boolean,
 )
 private class PlaybackSnapshot(
     var positionMs: Long = 0L,
@@ -715,3 +814,8 @@ private const val POSITION_SAVE_INTERVAL_MS = 5_000L
 private const val AUDIO_TRACK_RESTORE_TIMEOUT_MS = 5_000L
 private const val FINISH_MESSAGE_DELAY_MS = 1_500L
 private const val UNSET_VIDEO_MODE = -1
+private const val EXTRA_POSITION = "position"
+private const val EXTRA_FROM_START = "from_start"
+private const val EXTRA_RETURN_RESULT = "return_result"
+private const val END_BY_USER = "user"
+private const val END_BY_PLAYBACK_COMPLETION = "playback_completion"

@@ -68,6 +68,40 @@ Text color, size, and font always follow the broadcast, as on a TV.
 - Seeking within a recording is fast but not instant — broadcast streams
   have no index, so the player decodes forward from the nearest keyframe.
 
+## Integration for other apps
+
+ARIB Player accepts `ACTION_VIEW` intents for `content://` and `file://` MPEG-TS
+URIs. Without any extras it behaves as a normal player (resume prompt, its own
+position bookkeeping). Three optional extras let a calling app drive it:
+
+| Extra | Type | Effect |
+|---|---|---|
+| `position` | long (ms) | Start at this position and skip the resume prompt. |
+| `from_start` | boolean | Start at 0, skip the resume prompt, and reset the stored position. |
+| `return_result` | boolean | Deliver a result on finish and auto-close when playback reaches the end. |
+
+Result (only when `return_result` is set): `RESULT_OK` with extras
+`position` (long ms), `duration` (long ms) and `end_by` (`"user"` or
+`"playback_completion"`).
+
+```kotlin
+val intent = Intent(Intent.ACTION_VIEW)
+    .setDataAndType(uri, "video/mp2t")
+    .setPackage("kr.dcmys.android.aribplayer")
+    .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+    .putExtra("return_result", true)
+    .putExtra("from_start", true)
+startActivityForResult(intent, REQUEST_PLAY)
+```
+
+### Resume positions (read-only provider)
+
+`content://kr.dcmys.android.aribplayer.resume/entries` returns the stored
+resume data, optionally filtered with `?uri=<url-encoded exact uri>`. Columns:
+`uri` (TEXT), `resume_position_ms`, `duration_ms`, `last_opened_ms` (INTEGER).
+Only `content://` entries whose authority belongs to the *calling* package are
+returned, so each app sees resume data for its own content only.
+
 ## Building
 
 Requires Linux or WSL for the native build, and Android Studio / the
