@@ -70,23 +70,28 @@ jobs:
           path: app/build/outputs/apk/debug/aribplayer-${{ matrix.abi }}-debug.apk
           if-no-files-found: error
 
-      # No signing credentials are present in CI by default, so app/build.gradle.kts
-      # deliberately signs release APKs with the debug key. Add a secret-backed
-      # keystore reconstruction step before distributing production-signed releases.
-      # Production signing scaffold. Create ARIB_KEYSTORE_BASE64 and
-      # ARIB_KEYSTORE_PROPERTIES repository secrets, then uncomment this step.
-      # - name: Restore release signing material
-      #   if: github.ref_type == 'tag' && startsWith(github.ref_name, 'v')
-      #   env:
-      #     ARIB_KEYSTORE_BASE64: ${{ secrets.ARIB_KEYSTORE_BASE64 }}
-      #     ARIB_KEYSTORE_PROPERTIES: ${{ secrets.ARIB_KEYSTORE_PROPERTIES }}
-      #   run: |
-      #     mkdir -p signing
-      #     printf '%s' "$ARIB_KEYSTORE_BASE64" | base64 --decode > signing/release.jks
-      #     printf '%s' "$ARIB_KEYSTORE_PROPERTIES" > signing/keystore.properties
+      # Release signing material is restored only for version tags. On other
+      # refs, app/build.gradle.kts continues to use its debug-signing fallback.
+      - name: Restore release signing material
+        if: github.ref_type == 'tag' && startsWith(github.ref_name, 'v')
+        env:
+          ARIB_KEYSTORE_BASE64: ${{ secrets.ARIB_KEYSTORE_BASE64 }}
+          ARIB_KEYSTORE_PROPERTIES: ${{ secrets.ARIB_KEYSTORE_PROPERTIES }}
+        run: |
+          mkdir -p signing
+          printf '%s' "$ARIB_KEYSTORE_BASE64" | base64 --decode > signing/dcmys-tv.jks
+          printf '%s\n' "$ARIB_KEYSTORE_PROPERTIES" > signing/keystore.properties
+          printf '%s\n' 'storeFile=signing/dcmys-tv.jks' >> signing/keystore.properties
+
       - name: Assemble release APK
         if: github.ref_type == 'tag' && startsWith(github.ref_name, 'v')
         run: ./gradlew :app:assembleRelease -PtargetAbi=${{ matrix.abi }}
+
+      - name: Print release APK certificate SHA256
+        if: github.ref_type == 'tag' && startsWith(github.ref_name, 'v')
+        run: |
+          "$ANDROID_HOME"/build-tools/*/apksigner verify --print-certs \
+            "app/build/outputs/apk/release/aribplayer-${{ matrix.abi }}-release.apk"
 
       - name: Upload release APK for GitHub Release
         if: github.ref_type == 'tag' && startsWith(github.ref_name, 'v')
