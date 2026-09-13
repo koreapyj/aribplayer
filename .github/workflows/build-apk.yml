@@ -90,7 +90,10 @@ jobs:
       - name: Print release APK certificate SHA256
         if: github.ref_type == 'tag' && startsWith(github.ref_name, 'v')
         run: |
-          "$ANDROID_HOME"/build-tools/*/apksigner verify --print-certs \
+          # The runner image ships several build-tools versions; a bare glob would
+          # expand to more than one apksigner path, so pick the newest explicitly.
+          apksigner="$(ls -d "$ANDROID_HOME"/build-tools/*/apksigner | sort -V | tail -n 1)"
+          "$apksigner" verify --print-certs \
             "app/build/outputs/apk/release/aribplayer-${{ matrix.abi }}-release.apk"
 
       - name: Upload release APK for GitHub Release
