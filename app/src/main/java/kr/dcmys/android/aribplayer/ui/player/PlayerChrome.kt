@@ -1,5 +1,6 @@
 package kr.dcmys.android.aribplayer.ui.player
 
+import android.view.KeyEvent
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
@@ -60,6 +61,7 @@ fun PlayerChrome(
     onSetSeekStepMs: (Long) -> Unit,
     onSetDiagnosticsEnabled: (Boolean) -> Unit,
     modifier: Modifier = Modifier,
+    onRemoteKeyEvent: ((KeyEvent) -> Boolean)? = null,
 ) {
     val focusRequesters = rememberPlayerFocusRequesters()
     val view = LocalView.current
@@ -71,6 +73,14 @@ fun PlayerChrome(
     val previewPosition = chromeState.previewPositionMs ?: state.positionMs
     var requestPlayFocus by remember { mutableStateOf(!view.isInTouchMode) }
 
+    fun requestControlFocus() {
+        if (playbackEnabled) {
+            val requested = runCatching { focusRequesters.playPause.requestFocus() }
+            if (requested.isSuccess) return
+        }
+        runCatching { focusRequesters.settings.requestFocus() }
+    }
+
     LaunchedEffect(interactionEvents) {
         interactionEvents.collect {
             requestPlayFocus = true
@@ -81,11 +91,20 @@ fun PlayerChrome(
     LaunchedEffect(chromeState.controlsVisible, playbackEnabled, requestPlayFocus) {
         if (!chromeState.controlsVisible) {
             awaitFrame()
-            focusRequesters.root.requestFocus()
-        } else if (requestPlayFocus && playbackEnabled) {
+            runCatching { focusRequesters.root.requestFocus() }
+        } else {
             awaitFrame()
-            focusRequesters.playPause.requestFocus()
-            requestPlayFocus = false
+            if (requestPlayFocus || view.findFocus() == null) {
+                requestControlFocus()
+                requestPlayFocus = false
+            }
+        }
+    }
+
+    LaunchedEffect(chromeState.focusPlayPauseRequest) {
+        if (chromeState.focusPlayPauseRequest > 0 && chromeState.controlsVisible) {
+            awaitFrame()
+            requestControlFocus()
         }
     }
 
@@ -121,11 +140,14 @@ fun PlayerChrome(
                     chromeState.recordInteraction()
                     return@onPreviewKeyEvent false
                 }
-                if (event.key in dpadKeys) {
+                if (event.key in hiddenRevealKeys ||
+                    (view.isInTouchMode && event.key in touchModeRevealKeys)
+                ) {
                     requestPlayFocus = true
                     chromeState.showControls()
                     true
                 } else {
+                    // In non-touch mode LEFT/RIGHT are not consumed: the activity handler seeks.
                     false
                 }
             }
@@ -206,6 +228,7 @@ fun PlayerChrome(
                         onSetSeekStepMs = onSetSeekStepMs,
                         onSetDiagnosticsEnabled = onSetDiagnosticsEnabled,
                         onInteraction = chromeState::recordInteraction,
+                        onRemoteKeyEvent = onRemoteKeyEvent,
                     )
                 }
                 PlayerTimeBar(
@@ -213,6 +236,7 @@ fun PlayerChrome(
                     durationMs = state.durationMs,
                     bufferedPositionMs = null,
                     enabled = seekEnabled,
+                    seekStepMs = seekStepMs,
                     chromeState = chromeState,
                     focusRequester = focusRequesters.timeBar,
                     upFocusRequester = focusRequesters.playPause,
@@ -229,13 +253,22 @@ fun PlayerChrome(
                 )
             }
         }
+
+        SeekFeedbackOverlay(
+            feedback = chromeState.seekFeedback,
+            durationMs = state.durationMs,
+            modifier = Modifier.align(Alignment.Center),
+        )
     }
 }
 
-private val dpadKeys = setOf(
+private val hiddenRevealKeys = setOf(
     Key.DirectionUp,
     Key.DirectionDown,
+    Key.DirectionCenter,
+)
+
+private val touchModeRevealKeys = setOf(
     Key.DirectionLeft,
     Key.DirectionRight,
-    Key.DirectionCenter,
 )

@@ -57,6 +57,9 @@ jobs:
           ARIB_BUILD_DIR: ${{ github.workspace }}/third_party/build
         run: bash third_party/scripts/build-all.sh
 
+      - name: Run debug unit tests
+        run: ./gradlew :app:testDebugUnitTest -PtargetAbi=${{ matrix.abi }}
+
       - name: Assemble debug APK
         run: ./gradlew :app:assembleDebug -PtargetAbi=${{ matrix.abi }}
 

@@ -1,5 +1,6 @@
 package kr.dcmys.android.aribplayer
 
+import android.view.KeyEvent
 import android.view.SurfaceHolder
 import android.view.SurfaceView
 import androidx.activity.compose.BackHandler
@@ -24,11 +25,12 @@ import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import kr.dcmys.android.aribplayer.data.PlayerPreferences
 import kr.dcmys.android.aribplayer.ui.player.PlayerChrome
+import kr.dcmys.android.aribplayer.ui.player.PlayerChromeState
 import kr.dcmys.android.aribplayer.ui.player.PlayerOverlays
-import kr.dcmys.android.aribplayer.ui.player.rememberPlayerChromeState
 
 @Composable
 fun PlayerScreen(
+    chromeState: PlayerChromeState,
     viewModel: PlayerViewModel = viewModel(),
     seekStepMs: Long,
     controlsTimeoutMs: Long,
@@ -37,14 +39,14 @@ fun PlayerScreen(
     onSetSeekStepMs: (Long) -> Unit,
     onSetDiagnosticsEnabled: (Boolean) -> Unit,
     onClosePlayer: () -> Unit,
+    onRemoteKeyEvent: ((KeyEvent) -> Boolean)? = null,
 ) {
     val state by viewModel.uiState.collectAsState()
-    val chrome = rememberPlayerChromeState()
 
-    PlayerSystemBars(controlsVisible = chrome.controlsVisible)
+    PlayerSystemBars(controlsVisible = chromeState.controlsVisible)
 
     BackHandler {
-        if (!chrome.handleBack()) {
+        if (!chromeState.handleBack()) {
             viewModel.closePlayer()
             onClosePlayer()
         }
@@ -86,14 +88,14 @@ fun PlayerScreen(
         Box(
             modifier = Modifier
                 .fillMaxSize()
-                .pointerInput(chrome) {
-                    detectTapGestures { chrome.onVideoTap() }
+                .pointerInput(chromeState) {
+                    detectTapGestures { chromeState.onVideoTap() }
                 }
         )
 
         PlayerChrome(
             state = state,
-            chromeState = chrome,
+            chromeState = chromeState,
             preferences = preferences,
             seekStepMs = seekStepMs,
             controlsTimeoutMs = controlsTimeoutMs,
@@ -107,6 +109,7 @@ fun PlayerScreen(
             onSetDefaultVideoMode = onSetDefaultVideoMode,
             onSetSeekStepMs = onSetSeekStepMs,
             onSetDiagnosticsEnabled = onSetDiagnosticsEnabled,
+            onRemoteKeyEvent = onRemoteKeyEvent,
         )
 
         PlayerOverlays(state = state)

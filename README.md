@@ -44,8 +44,28 @@ film-mode playback, and dual-audio support.
      audio track, and app settings.
    - **Info button**: playback diagnostics (decoder, filter, fps).
    - **Back** or leaving the app ends playback.
-4. TV / D-pad: all controls are reachable with a remote — press any
-   direction key to reveal the controls, navigate with the D-pad.
+4. TV / D-pad:
+
+   | Key | Action |
+   |---|---|
+   | ◀ ▶ (controls hidden) | seek −/+ step (hold to accelerate); shows a time overlay |
+   | ◀ ▶ (controls shown) | move between buttons; on the time bar: preview seek, OK to jump |
+   | ▲ ▼ | reveal controls (they do not toggle playback) |
+   | OK (controls visible) | activate the focused control; play–pause only when the play button is focused |
+   | OK (controls hidden) | toggle play–pause and reveal controls |
+   | ⏯ | toggle play–pause |
+   | ▶ | play |
+   | ⏸ | pause |
+   | ⏪ ⏩ | seek −/+ step |
+   | ⏮ ⏭ | seek −/+ 60 s |
+   | 0–9 | jump to 0 %…90 % |
+   | MENU | settings popup |
+   | INFO / red | diagnostics |
+   | CC / green | captions on/off |
+   | ⏹ | stop and close |
+   | BACK | close popup / stop |
+
+   The step is configured by the **Seek step** setting (10 or 30 s).
 
 ### Caption appearance
 

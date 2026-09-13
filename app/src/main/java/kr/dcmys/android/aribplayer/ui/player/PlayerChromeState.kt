@@ -1,5 +1,6 @@
 package kr.dcmys.android.aribplayer.ui.player
 
+import android.os.SystemClock
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.Stable
 import androidx.compose.runtime.getValue
@@ -8,6 +9,12 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.focus.FocusRequester
+
+data class SeekFeedback(
+    val deltaMs: Long,
+    val targetMs: Long,
+    val shownAtMs: Long,
+)
 
 internal enum class PlayerSettingsPage {
     Main,
@@ -53,8 +60,29 @@ class PlayerChromeState internal constructor() {
     var interactionRevision by mutableLongStateOf(0L)
         private set
 
+    var seekFeedback by mutableStateOf<SeekFeedback?>(null)
+
+    var focusPlayPauseRequest by mutableStateOf(0)
+
     val popupOpen: Boolean
         get() = settingsPage != null
+
+    fun showSeekFeedback(deltaMs: Long, targetMs: Long) {
+        seekFeedback = SeekFeedback(
+            deltaMs = deltaMs,
+            targetMs = targetMs,
+            shownAtMs = SystemClock.uptimeMillis(),
+        )
+        interactionRevision++
+    }
+
+    fun clearSeekFeedback() {
+        seekFeedback = null
+    }
+
+    fun requestPlayPauseFocus() {
+        focusPlayPauseRequest++
+    }
 
     fun recordInteraction(showControls: Boolean = true) {
         if (showControls) controlsVisible = true

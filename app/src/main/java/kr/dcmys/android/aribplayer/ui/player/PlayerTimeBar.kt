@@ -46,6 +46,7 @@ internal fun PlayerTimeBar(
     durationMs: Long,
     bufferedPositionMs: Long?,
     enabled: Boolean,
+    seekStepMs: Long,
     chromeState: PlayerChromeState,
     focusRequester: FocusRequester,
     upFocusRequester: FocusRequester,
@@ -72,6 +73,7 @@ internal fun PlayerTimeBar(
         chromeState.scrubbing = false
         onInteraction()
         onSeek(preview.coerceIn(0L, safeDuration))
+        chromeState.clearSeekFeedback()
     }
 
     fun scheduleDelayedCommit() {
@@ -107,10 +109,12 @@ internal fun PlayerTimeBar(
                 when (event.key) {
                     Key.DirectionLeft, Key.DirectionRight -> {
                         val direction = if (event.key == Key.DirectionLeft) -1L else 1L
-                        val step = (safeDuration / 20L).coerceAtLeast(1L)
+                        val step = seekStepMs.coerceAtLeast(1L)
                         val base = chromeState.previewPositionMs ?: positionMs
-                        chromeState.previewPositionMs = (base + direction * step)
+                        val newPreview = (base + direction * step)
                             .coerceIn(0L, safeDuration)
+                        chromeState.previewPositionMs = newPreview
+                        chromeState.showSeekFeedback(newPreview - positionMs, newPreview)
                         onInteraction()
                         scheduleDelayedCommit()
                         true

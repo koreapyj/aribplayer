@@ -47,6 +47,10 @@ import kr.dcmys.android.aribplayer.data.PlayerPreferences
 import kr.dcmys.android.aribplayer.data.PlayerPreferencesStore
 import kr.dcmys.android.aribplayer.nativeplayer.VideoMode
 import kr.dcmys.android.aribplayer.ui.theme.AppTheme
+import kr.dcmys.android.aribplayer.ui.player.PlayerChromeState
+import kr.dcmys.android.aribplayer.ui.player.RemoteKeyHandler
+import kr.dcmys.android.aribplayer.ui.player.RemotePlaybackController
+import kr.dcmys.android.aribplayer.ui.player.rememberPlayerChromeState
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
@@ -61,6 +65,53 @@ import java.util.concurrent.atomic.AtomicLong
 
 class MainActivity : ComponentActivity() {
     private val playerViewModel by viewModels<PlayerViewModel>()
+    private val remotePlaybackController by lazy {
+        object : RemotePlaybackController {
+            override val state: PlayerUiState
+                get() = playerViewModel.uiState.value
+
+            override fun togglePlayback() = playerViewModel.togglePlayback()
+
+            override fun play() {
+                if (!state.isPlaying) playerViewModel.togglePlayback()
+            }
+
+            override fun pause() {
+                if (state.isPlaying) playerViewModel.togglePlayback()
+            }
+
+            override fun seekTo(ms: Long) = playerViewModel.seekTo(ms)
+
+            override fun toggleSubtitles() = playerViewModel.toggleSubtitles()
+
+            override fun toggleDiagnostics() = playerViewModel.toggleDiagnostics()
+
+            override fun closePlayer() = playerViewModel.closePlayer()
+
+            override fun notifyControlsInteraction() = playerViewModel.notifyControlsInteraction()
+        }
+    }
+    private val remoteKeys by lazy {
+        RemoteKeyHandler(
+            viewModel = remotePlaybackController,
+            chromeState = { playerChromeState },
+            onStop = { positionMs, durationMs ->
+                lastPlaybackPositionMs = positionMs.coerceAtLeast(0L)
+                lastPlaybackDurationMs = durationMs.coerceAtLeast(0L)
+                remoteStopSnapshot = activePlayerUri?.let { uri ->
+                    RemoteStopSnapshot(uri, lastPlaybackPositionMs, lastPlaybackDurationMs)
+                }
+                playerViewModel.closePlayer()
+                finishPlaybackWithResult(
+                    returnResult = activePlayerReturnResult,
+                    lastPositionMs = lastPlaybackPositionMs,
+                    lastDurationMs = lastPlaybackDurationMs,
+                    endBy = END_BY_USER,
+                )
+            },
+            scope = lifecycleScope,
+        )
+    }
     private val repository by lazy {
         MediaRepository(
             context = applicationContext,
@@ -72,8 +123,10 @@ class MainActivity : ComponentActivity() {
     private var incomingOpenRequest by mutableStateOf<IncomingOpenRequest?>(null)
     private var finishInFlight by mutableStateOf(false)
     @Volatile private var playerRouteActive = false
+    @Volatile private var playerChromeState: PlayerChromeState? = null
     @Volatile private var activePlayerUri: String? = null
     @Volatile private var activePlayerReturnResult = false
+    @Volatile private var remoteStopSnapshot: RemoteStopSnapshot? = null
     private var lastPlaybackPositionMs = 0L
     private var lastPlaybackDurationMs = 0L
 
@@ -100,6 +153,7 @@ class MainActivity : ComponentActivity() {
                     activePlayerUri = uri
                     if (active) activePlayerReturnResult = returnResult
                 },
+                onChromeStateChanged = { playerChromeState = it },
             )
         }
     }
@@ -108,6 +162,7 @@ class MainActivity : ComponentActivity() {
         super.onNewIntent(intent)
         setIntent(intent)
         val request = intent.toIncomingOpenRequest()
+        remoteStopSnapshot = null
         activePlayerReturnResult = request?.returnResult == true
         incomingOpenRequest = request
         if (request == null) finishWithMessage(R.string.player_invalid_open_request)
@@ -135,28 +190,15 @@ class MainActivity : ComponentActivity() {
             state.playbackState.isActiveOrOpening()
     }
 
-    override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean {
-        if (playerRouteActive && event.repeatCount == 0) {
-            val state = playerViewModel.uiState.value
-            when (keyCode) {
-                KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE -> {
-                    playerViewModel.notifyControlsInteraction()
-                    playerViewModel.togglePlayback()
-                    return true
-                }
-                KeyEvent.KEYCODE_MEDIA_PLAY -> {
-                    playerViewModel.notifyControlsInteraction()
-                    if (!state.isPlaying) playerViewModel.togglePlayback()
-                    return true
-                }
-                KeyEvent.KEYCODE_MEDIA_PAUSE -> {
-                    playerViewModel.notifyControlsInteraction()
-                    if (state.isPlaying) playerViewModel.togglePlayback()
-                    return true
-                }
-            }
-        }
-        return super.onKeyDown(keyCode, event)
+    override fun dispatchKeyEvent(event: KeyEvent): Boolean =
+        handleRemoteKeyEvent(event) || super.dispatchKeyEvent(event)
+
+    internal fun handleRemoteKeyEvent(event: KeyEvent): Boolean {
+        val state = playerViewModel.uiState.value
+        return playerChromeState != null &&
+            state.screen == PlayerScreenDestination.PLAYER &&
+            state.playbackState != PlaybackState.ERROR &&
+            remoteKeys.onKeyEvent(event, window.decorView.isInTouchMode)
     }
 
     fun finishWithMessage(messageRes: Int) {
@@ -198,19 +240,35 @@ class MainActivity : ComponentActivity() {
         finish()
     }
 
+    internal fun syncRemoteSeekStepMs(seekStepMs: Long) {
+        remoteKeys.seekStepMs = seekStepMs
+    }
+
+    internal fun remoteStopSnapshotFor(uri: String): RemoteStopSnapshot? =
+        remoteStopSnapshot?.takeIf { it.uriString == uri }
+
+    override fun onDestroy() {
+        remoteKeys.release()
+        super.onDestroy()
+    }
+
     private fun persistActivePosition() {
-        val uri = activePlayerUri ?: return
         val state = playerViewModel.uiState.value
         if (state.screen != PlayerScreenDestination.PLAYER) return
-        val positionMs = state.positionMs.coerceAtLeast(0L)
-        val durationMs = state.durationMs.coerceAtLeast(0L)
-        lastPlaybackPositionMs = positionMs
-        lastPlaybackDurationMs = durationMs
+        persistActivePosition(state.positionMs, state.durationMs)
+    }
+
+    private fun persistActivePosition(positionMs: Long, durationMs: Long) {
+        val safePositionMs = positionMs.coerceAtLeast(0L)
+        val safeDurationMs = durationMs.coerceAtLeast(0L)
+        lastPlaybackPositionMs = safePositionMs
+        lastPlaybackDurationMs = safeDurationMs
+        val uri = activePlayerUri ?: return
         lifecycleScope.launch {
             repository.updatePosition(
                 uri = uri,
-                positionMs = positionMs,
-                durationMs = durationMs.takeIf { it > 0L },
+                positionMs = safePositionMs,
+                durationMs = safeDurationMs.takeIf { it > 0L },
                 lastOpenedEpochMs = System.currentTimeMillis(),
             )
         }
@@ -226,6 +284,7 @@ private fun AribPlayerApp(
     finishInFlight: Boolean,
     onIncomingOpenRequestConsumed: () -> Unit,
     onPlayerRouteChanged: (Boolean, String?, Boolean) -> Unit,
+    onChromeStateChanged: (PlayerChromeState?) -> Unit,
 ) {
     var preferences by remember { mutableStateOf<PlayerPreferences?>(null) }
     val scope = rememberCoroutineScope()
@@ -353,6 +412,7 @@ private fun AribPlayerApp(
                                 endBy = endBy,
                             )
                         },
+                        onChromeStateChanged = onChromeStateChanged,
                         onSetDefaultVideoMode = { mode ->
                             scope.launch { repository.setDefaultVideoMode(mode) }
                         },
@@ -385,8 +445,17 @@ private fun AribPlayerApp(
                 }
                 playerSessionActiveOrOpening && currentPreferences != null -> {
                     // Defensive continuity: an active/opening native session must never reveal fallback UI.
+                    val fallbackChromeState = rememberPlayerChromeState()
+                    SideEffect {
+                        onChromeStateChanged(fallbackChromeState)
+                        activity.syncRemoteSeekStepMs(currentPreferences.seekStepMs)
+                    }
+                    DisposableEffect(fallbackChromeState) {
+                        onDispose { onChromeStateChanged(null) }
+                    }
                     PlayerScreen(
                         viewModel = playerViewModel,
+                        chromeState = fallbackChromeState,
                         seekStepMs = currentPreferences.seekStepMs,
                         controlsTimeoutMs = currentPreferences.controlsTimeoutMs,
                         preferences = currentPreferences,
@@ -403,6 +472,7 @@ private fun AribPlayerApp(
                             }
                         },
                         onClosePlayer = { activity.finishPlayback() },
+                        onRemoteKeyEvent = activity::handleRemoteKeyEvent,
                     )
                 }
                 finishInFlight || requestPending || currentPreferences == null ||
@@ -459,11 +529,20 @@ private fun PlayerDestination(
     playerViewModel: PlayerViewModel,
     preferences: PlayerPreferences,
     onPlaybackClosed: (Long, Long, String) -> Unit,
+    onChromeStateChanged: (PlayerChromeState?) -> Unit,
     onSetDefaultVideoMode: (Int) -> Unit,
     onSetSeekStepMs: (Long) -> Unit,
     onSetDiagnosticsEnabled: (Boolean) -> Unit,
 ) {
     val state by playerViewModel.uiState.collectAsState()
+    val chromeState = rememberPlayerChromeState()
+    SideEffect {
+        onChromeStateChanged(chromeState)
+        activity.syncRemoteSeekStepMs(preferences.seekStepMs)
+    }
+    DisposableEffect(chromeState) {
+        onDispose { onChromeStateChanged(null) }
+    }
     var openIssued by remember(session.generation) { mutableStateOf(false) }
     var playbackStarted by remember(session.generation) { mutableStateOf(false) }
     var audioPreferenceReady by remember(session.generation) { mutableStateOf(false) }
@@ -622,10 +701,16 @@ private fun PlayerDestination(
             }
         } finally {
             withContext(NonCancellable) {
+                // STOP snapshots before closePlayer resets uiState; persist it even on teardown.
+                val stopSnapshot = activity.remoteStopSnapshotFor(session.uriString)
                 repository.updatePosition(
                     uri = session.uriString,
-                    positionMs = lastPlayback.positionMs,
-                    durationMs = lastPlayback.durationMs,
+                    positionMs = stopSnapshot?.positionMs ?: lastPlayback.positionMs,
+                    durationMs = if (stopSnapshot != null) {
+                        stopSnapshot.durationMs.takeIf { it > 0L }
+                    } else {
+                        lastPlayback.durationMs
+                    },
                     lastOpenedEpochMs = System.currentTimeMillis(),
                 )
                 lastPlayback.selectedTrackKey?.let { selectedTrackKey ->
@@ -646,6 +731,7 @@ private fun PlayerDestination(
 
     PlayerScreen(
         viewModel = playerViewModel,
+        chromeState = chromeState,
         seekStepMs = preferences.seekStepMs,
         controlsTimeoutMs = preferences.controlsTimeoutMs,
         preferences = preferences,
@@ -659,6 +745,7 @@ private fun PlayerDestination(
                 END_BY_USER,
             )
         },
+        onRemoteKeyEvent = activity::handleRemoteKeyEvent,
     )
 }
 
@@ -723,15 +810,12 @@ private fun Intent?.toIncomingOpenRequest(): IncomingOpenRequest? {
     val incomingUri = data ?: return null
     if (incomingUri.scheme != "content" && incomingUri.scheme != "file") return null
     val extras = extras
-    val hasPosition = extras?.containsKey(EXTRA_POSITION) == true
-    val hasFromStart = extras?.containsKey(EXTRA_FROM_START) == true
     return IncomingOpenRequest(
         uri = incomingUri,
         flags = flags,
         generation = requestIds.incrementAndGet(),
         positionMs = (extras?.get(EXTRA_POSITION) as? Number)?.toLong(),
         fromStart = extras?.getBoolean(EXTRA_FROM_START, false) == true,
-        hasExplicitStart = hasPosition || hasFromStart,
         returnResult = extras?.getBoolean(EXTRA_RETURN_RESULT, false) == true,
     )
 }
@@ -784,7 +868,6 @@ private data class IncomingOpenRequest(
     val generation: Long,
     val positionMs: Long?,
     val fromStart: Boolean,
-    val hasExplicitStart: Boolean,
     val returnResult: Boolean,
 )
 private data class MediaMetadata(val displayName: String, val sizeBytes: Long?)
@@ -799,6 +882,12 @@ private data class PlayerSession(
     val subtitlesEnabled: Boolean?,
     val returnResult: Boolean,
 )
+internal data class RemoteStopSnapshot(
+    val uriString: String,
+    val positionMs: Long,
+    val durationMs: Long,
+)
+
 private class PlaybackSnapshot(
     var positionMs: Long = 0L,
     var durationMs: Long? = null,

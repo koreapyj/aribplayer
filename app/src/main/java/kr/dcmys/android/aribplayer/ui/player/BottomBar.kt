@@ -1,5 +1,6 @@
 package kr.dcmys.android.aribplayer.ui.player
 
+import android.view.KeyEvent
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -62,6 +63,7 @@ internal fun BottomBar(
     onSetDiagnosticsEnabled: (Boolean) -> Unit,
     onInteraction: () -> Unit,
     modifier: Modifier = Modifier,
+    onRemoteKeyEvent: ((KeyEvent) -> Boolean)? = null,
 ) {
     val captionsOrSettings = if (hasSubtitles) focusRequesters.captions else focusRequesters.settings
     var popupWasOpen by remember { mutableStateOf(false) }
@@ -178,6 +180,7 @@ internal fun BottomBar(
                     onSetDiagnosticsEnabled = onSetDiagnosticsEnabled,
                     onDismiss = chromeState::dismissSettings,
                     onInteraction = onInteraction,
+                    onRemoteKeyEvent = onRemoteKeyEvent,
                 )
             }
         }

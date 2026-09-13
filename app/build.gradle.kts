@@ -29,8 +29,8 @@ android {
         applicationId = "kr.dcmys.android.aribplayer"
         minSdk = 26
         targetSdk = 35
-        versionCode = 3
-        versionName = "0.0.3"
+        versionCode = 5
+        versionName = "0.0.5"
 
         // Package precisely the native ABI selected by -PtargetAbi.
         ndk {
@@ -68,6 +68,10 @@ android {
                 "proguard-rules.pro"
             )
         }
+    }
+
+    testOptions {
+        unitTests.isReturnDefaultValues = true
     }
 
     compileOptions {
@@ -109,4 +113,7 @@ dependencies {
     implementation(libs.androidx.documentfile)
 
     debugImplementation(libs.androidx.compose.ui.tooling)
+
+    testImplementation("junit:junit:4.13.2")
+    testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.10.1")
 }

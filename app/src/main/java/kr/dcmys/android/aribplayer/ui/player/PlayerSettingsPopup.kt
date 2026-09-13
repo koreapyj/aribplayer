@@ -1,5 +1,6 @@
 package kr.dcmys.android.aribplayer.ui.player
 
+import android.view.KeyEvent
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -39,6 +40,7 @@ import androidx.compose.ui.input.key.key
 import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.key.type
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.res.pluralStringResource
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.IntOffset
@@ -79,6 +81,7 @@ internal fun PlayerSettingsPopup(
     onSetDiagnosticsEnabled: (Boolean) -> Unit,
     onDismiss: () -> Unit,
     onInteraction: () -> Unit,
+    onRemoteKeyEvent: ((KeyEvent) -> Boolean)? = null,
 ) {
     val gapPx = with(LocalDensity.current) { 8.dp.roundToPx() }
     Popup(
@@ -91,6 +94,7 @@ internal fun PlayerSettingsPopup(
             clippingEnabled = true,
         ),
     ) {
+        val view = LocalView.current
         Surface(
             color = PlayerColors.Popup,
             contentColor = Color.White,
@@ -98,6 +102,16 @@ internal fun PlayerSettingsPopup(
             modifier = Modifier
                 .widthIn(min = PlayerDims.PopupMinWidth, max = PlayerDims.PopupMaxWidth)
                 .onPreviewKeyEvent { event ->
+                    // A focusable Popup owns a separate window, bypassing Activity.dispatchKeyEvent.
+                    val nativeEvent = event.nativeKeyEvent
+                    if (
+                        !view.isInTouchMode &&
+                        (nativeEvent.keyCode in popupRemoteKeys ||
+                            nativeEvent.keyCode in KeyEvent.KEYCODE_0..KeyEvent.KEYCODE_9) &&
+                        onRemoteKeyEvent?.invoke(nativeEvent) == true
+                    ) {
+                        return@onPreviewKeyEvent true
+                    }
                     if (event.type != KeyEventType.KeyDown || event.key != Key.Back) {
                         return@onPreviewKeyEvent false
                     }
@@ -540,6 +554,26 @@ private fun seekStepLabel(valueMs: Long): String {
     val seconds = (valueMs / 1_000L).toInt()
     return pluralStringResource(R.plurals.player_seconds, seconds, seconds)
 }
+
+// BACK stays with the popup; D-pad and ENTER stay with Compose focus/activation.
+private val popupRemoteKeys = setOf(
+    KeyEvent.KEYCODE_MENU,
+    KeyEvent.KEYCODE_SETTINGS,
+    KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE,
+    KeyEvent.KEYCODE_MEDIA_PLAY,
+    KeyEvent.KEYCODE_MEDIA_PAUSE,
+    KeyEvent.KEYCODE_MEDIA_STOP,
+    KeyEvent.KEYCODE_MEDIA_REWIND,
+    KeyEvent.KEYCODE_MEDIA_FAST_FORWARD,
+    KeyEvent.KEYCODE_MEDIA_PREVIOUS,
+    KeyEvent.KEYCODE_MEDIA_NEXT,
+    KeyEvent.KEYCODE_MEDIA_SKIP_BACKWARD,
+    KeyEvent.KEYCODE_MEDIA_SKIP_FORWARD,
+    KeyEvent.KEYCODE_INFO,
+    KeyEvent.KEYCODE_PROG_RED,
+    KeyEvent.KEYCODE_CAPTIONS,
+    KeyEvent.KEYCODE_PROG_GREEN,
+)
 
 private class AboveEndPopupPositionProvider(private val gapPx: Int) : PopupPositionProvider {
     override fun calculatePosition(
