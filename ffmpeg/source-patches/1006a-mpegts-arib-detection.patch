@@ -1,0 +1,223 @@
+--- a/libavformat/mpegts.c
++++ b/libavformat/mpegts.c
+@@ -22,6 +22,7 @@
+ #include "config_components.h"
+ 
+ #include "libavutil/attributes_internal.h"
++#include "libavutil/avstring.h"
+ #include "libavutil/buffer.h"
+ #include "libavutil/crc.h"
+ #include "libavutil/internal.h"
+@@ -128,6 +129,8 @@ struct Program {
+ 
+     /** have we found pmt for this program */
+     int pmt_found;
++    /** result of the ARIB detection on the last complete PMT, kept across PMT versions */
++    int arib;
+ };
+ 
+ struct MpegTSContext {
+@@ -294,6 +297,94 @@ static struct Program * get_program(Mpeg
+     return NULL;
+ }
+ 
++/*
++ * ARIB detection. A program is ARIB when its PMT carries two or more distinct
++ * markers of ARIB STD-B10/B24 (program descriptors 0xC1 digital copy control,
++ * 0xDE content availability, 0xF6 access control; ES descriptors 0xC8 video
++ * decode control, 0xC1; stream_type 0x0D data carousel), or when it has an
++ * ARIB caption/superimpose stream, which is specific enough alone. Neither
++ * the network id nor the CA_system_id is used (SKY Perfect JSAT carries 0x0001).
++ */
++enum {
++    ARIB_PRG_C1  = 1 << 0,
++    ARIB_PRG_DE  = 1 << 1,
++    ARIB_PRG_F6  = 1 << 2,
++    ARIB_ES_C8   = 1 << 3,
++    ARIB_ES_C1   = 1 << 4,
++    ARIB_ST_0D   = 1 << 5,
++    ARIB_MARKERS = (1 << 6) - 1,
++    ARIB_CAPTION = 1 << 6,
++};
++
++static const char *const arib_marker_names[] = {
++    "prg_c1", "prg_de", "prg_f6", "es_c8", "es_c1", "st_0d", "caption",
++};
++
++static int arib_scan_es_descriptors(const uint8_t *p, const uint8_t *end,
++                                    int stream_type)
++{
++    int marks = 0, tag = -1, data_component_id = -1;
++
++    if (stream_type == 0x0d)
++        marks |= ARIB_ST_0D;
++    while (end - p >= 2) {
++        int desc_tag = p[0], desc_len = p[1];
++        if (desc_len > end - p - 2)
++            break;
++        switch (desc_tag) {
++        case 0xc8: marks |= ARIB_ES_C8; break;
++        case 0xc1: marks |= ARIB_ES_C1; break;
++        case STREAM_IDENTIFIER_DESCRIPTOR:
++            if (desc_len >= 1)
++                tag = p[2];
++            break;
++        case DATA_COMPONENT_DESCRIPTOR:
++            if (desc_len >= 2)
++                data_component_id = AV_RB16(p + 2);
++            break;
++        }
++        p += 2 + desc_len;
++    }
++    if (stream_type == STREAM_TYPE_PRIVATE_DATA && tag >= 0 &&
++        ((data_component_id == 0x0008 && tag >= 0x30 && tag <= 0x3f) ||
++         (data_component_id == 0x0012 && (tag == 0x87 || tag == 0x88))))
++        marks |= ARIB_CAPTION;
++    return marks;
++}
++
++/*
++ * Publishes the verdict of one complete PMT: AVProgram metadata "arib" ("1" or
++ * "0"; absent until a PMT was evaluated) and "arib_markers" (what matched),
++ * and the format metadata "arib" ("1" if any program is ARIB). Re-run for
++ * every new PMT version, so a later version can change the verdict.
++ */
++static void arib_update_program(MpegTSContext *ts, struct Program *prg,
++                                unsigned int programid, int marks)
++{
++    AVFormatContext *s = ts->stream;
++    int arib = (marks & ARIB_CAPTION) || av_popcount(marks & ARIB_MARKERS) >= 2;
++    const AVDictionaryEntry *e;
++    char list[64] = "";
++    int any = 0;
++
++    if (prg)
++        prg->arib = arib;
++    for (int i = 0; i < FF_ARRAY_ELEMS(arib_marker_names); i++)
++        if (marks & (1 << i))
++            av_strlcatf(list, sizeof(list), "%s%s", *list ? "," : "", arib_marker_names[i]);
++    for (int i = 0; i < s->nb_programs; i++) {
++        AVProgram *program = s->programs[i];
++        if (program->id == programid) {
++            av_dict_set(&program->metadata, "arib", arib ? "1" : "0", 0);
++            av_dict_set(&program->metadata, "arib_markers", list, 0);
++        }
++        e = av_dict_get(program->metadata, "arib", NULL, 0);
++        if (e && e->value[0] == '1')
++            any = 1;
++    }
++    av_dict_set(&s->metadata, "arib", any ? "1" : "0", 0);
++}
++
+ static void clear_avprogram(MpegTSContext *ts, unsigned int programid)
+ {
+     AVProgram *prg = NULL;
+@@ -344,6 +435,7 @@ static struct Program * add_program(Mpeg
+     ts->prg = tmp;
+     p = &ts->prg[ts->nb_prg];
+     p->id = programid;
++    p->arib = 0;
+     clear_program(p);
+     ts->nb_prg++;
+     return p;
+@@ -2242,6 +2334,8 @@ int ff_parse_mpeg2_descriptor(AVFormatCo
+         break;
+     case STREAM_IDENTIFIER_DESCRIPTOR:
+         sti->stream_identifier = 1 + get8(pp, desc_end);
++        av_dict_set_int(&st->metadata, "component_tag",
++                        sti->stream_identifier - 1, 0);
+         break;
+     case METADATA_DESCRIPTOR:
+         if (get16(pp, desc_end) == 0xFFFF)
+@@ -2498,6 +2592,7 @@ static AVStream *find_matching_stream(Mp
+                "reusing existing %s stream %d (pid=0x%x) for new pid=0x%x\n",
+                av_get_media_type_string(found->codecpar->codec_type),
+                found->index, found->id, pid);
++        found->id = pid;
+     }
+ 
+     return found;
+@@ -2569,6 +2664,8 @@ static void pmt_cb(MpegTSFilter *filter,
+     uint32_t prog_reg_desc = 0; /* registration descriptor */
+     int stream_identifier = -1;
+     struct Program *prg;
++    int arib_marks = 0;
++    int merge;
+ 
+     int mp4_descr_count = 0;
+     Mp4Descr mp4_descr[MAX_MP4_DESCR_COUNT] = { { 0 } };
+@@ -2597,8 +2694,16 @@ static void pmt_cb(MpegTSFilter *filter,
+     prg = get_program(ts, h->id);
+     if (prg)
+         old_program = *prg;
+-    else
++    else {
+         clear_program(&old_program);
++        old_program.arib = 0;
++    }
++    /* merge_pmt_versions is always on for a program already seen as ARIB: the main
++     * audio can move to another PID with the same component_tag. It maps by
++     * stream_identifier, else by position in the PMT; it does not compare stream
++     * types and never removes a stream that left the PMT (it only drops out of
++     * AVProgram.stream_index). A merged stream takes the new PID as its id. */
++    merge = ts->merge_pmt_versions || old_program.arib;
+ 
+     if (ts->skip_unknown_pmt && !prg)
+         return;
+@@ -2635,6 +2740,12 @@ static void pmt_cb(MpegTSFilter *filter,
+             // something else is broken, exit the program_descriptors_loop
+             break;
+         program_info_length -= len;
++        if (tag == 0xc1)
++            arib_marks |= ARIB_PRG_C1;
++        else if (tag == 0xde)
++            arib_marks |= ARIB_PRG_DE;
++        else if (tag == 0xf6)
++            arib_marks |= ARIB_PRG_F6;
+         if (tag == IOD_DESCRIPTOR && len >= 2) {
+             get8(&p, p_end); // scope
+             get8(&p, p_end); // label
+@@ -2676,7 +2787,7 @@ static void pmt_cb(MpegTSFilter *filter,
+         /* now create stream */
+         if (ts->pids[pid] && ts->pids[pid]->type == MPEGTS_PES) {
+             pes = ts->pids[pid]->u.pes_filter.opaque;
+-            if (ts->merge_pmt_versions && !pes->st) {
++            if (merge && !pes->st) {
+                 st = find_matching_stream(ts, pid, h->id, stream_identifier, i, &old_program);
+                 if (st) {
+                     pes->st = st;
+@@ -2695,7 +2806,7 @@ static void pmt_cb(MpegTSFilter *filter,
+             if (ts->pids[pid])
+                 mpegts_close_filter(ts, ts->pids[pid]); // wrongly added sdt filter probably
+             pes = add_pes_stream(ts, pid, pcr_pid);
+-            if (ts->merge_pmt_versions && pes && !pes->st) {
++            if (merge && pes && !pes->st) {
+                 st = find_matching_stream(ts, pid, h->id, stream_identifier, i, &old_program);
+                 if (st) {
+                     pes->st = st;
+@@ -2714,7 +2825,7 @@ static void pmt_cb(MpegTSFilter *filter,
+             if (idx >= 0) {
+                 st = ts->stream->streams[idx];
+             }
+-            if (ts->merge_pmt_versions && !st) {
++            if (merge && !st) {
+                 st = find_matching_stream(ts, pid, h->id, stream_identifier, i, &old_program);
+             }
+             if (!st) {
+@@ -2752,6 +2863,7 @@ static void pmt_cb(MpegTSFilter *filter,
+         desc_list_end  = p + desc_list_len;
+         if (desc_list_end > p_end)
+             goto out;
++        arib_marks |= arib_scan_es_descriptors(p, desc_list_end, stream_type);
+         for (;;) {
+             if (ff_parse_mpeg2_descriptor(ts->stream, st, stream_type, h->id, &p,
+                                           desc_list_end, mp4_descr,
+@@ -2768,6 +2880,8 @@ static void pmt_cb(MpegTSFilter *filter,
+         p = desc_list_end;
+     }
+ 
++    arib_update_program(ts, prg, h->id, arib_marks);
++
+     if (!ts->pids[pcr_pid])
+         mpegts_open_pcr_filter(ts, pcr_pid);
+ 

@@ -1,0 +1,392 @@
+diff --git a/docker-build-win64.sh b/docker-build-win64.sh
+--- a/docker-build-win64.sh
++++ b/docker-build-win64.sh
+@@ -173,16 +173,19 @@
+ ninja -j$(nproc) -C fontconfig_build install
+ 
+ # LIBARIBCAPTION
+-git clone -b v1.1.2 --depth=1 https://github.com/xqq/libaribcaption.git
++git clone -b v1.1.1 --depth=1 https://github.com/xqq/libaribcaption.git
+ pushd libaribcaption
++patch -p1 < "${SOURCE_DIR}/builder/patches/libaribcaption-directwrite-file-font.patch"
+ mkdir build
+ pushd build
+ cmake \
+     -DCMAKE_TOOLCHAIN_FILE=${FF_CMAKE_TOOLCHAIN} \
+     -DCMAKE_INSTALL_PREFIX=${FF_DEPS_PREFIX} \
+     -DCMAKE_BUILD_TYPE=Release \
++    -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+     -DBUILD_SHARED_LIBS=OFF \
+     -DARIBCC_SHARED_LIBRARY=OFF \
++    -DARIBCC_USE_FREETYPE=ON \
+     ..
+ make -j$(nproc)
+ make install
+
+diff --git a/builder/patches/libaribcaption-directwrite-file-font.patch b/builder/patches/libaribcaption-directwrite-file-font.patch
+new file mode 100644
+--- /dev/null
++++ b/builder/patches/libaribcaption-directwrite-file-font.patch
+@@ -0,0 +1,362 @@
++diff --git a/src/renderer/font_provider_directwrite.hpp b/src/renderer/font_provider_directwrite.hpp
++--- a/src/renderer/font_provider_directwrite.hpp
+++++ b/src/renderer/font_provider_directwrite.hpp
++@@ -24,2 +24,3 @@
++ #include <memory>
+++#include <mutex>
++ #include "aribcaption/context.hpp"
++@@ -33,1 +34,3 @@
+++struct DirectWriteFileFontCollectionState;
+++
++ struct FontfaceInfoPrivateDirectWrite : public FontfaceInfoPrivate {
++@@ -39,2 +42,3 @@
++     ComPtr<IDWriteFontFace> fontface;
+++    ComPtr<IDWriteFontCollection> font_collection;
++ };
++@@ -44,3 +48,3 @@
++     explicit FontProviderDirectWrite(Context& context);
++-    ~FontProviderDirectWrite() override = default;
+++    ~FontProviderDirectWrite() override;
++ public:
++@@ -60,0 +65,2 @@
+++    std::mutex file_font_collection_state_mutex_;
+++    std::unique_ptr<DirectWriteFileFontCollectionState> file_font_collection_state_;
++
++diff --git a/src/renderer/font_provider_directwrite.cpp b/src/renderer/font_provider_directwrite.cpp
++--- a/src/renderer/font_provider_directwrite.cpp
+++++ b/src/renderer/font_provider_directwrite.cpp
++@@ -19,4 +19,11 @@
++ #include <windows.h>
++ #include <initguid.h>
+++#include <cassert>
+++#include <limits>
+++#include <map>
+++#include <mutex>
+++#include <new>
+++#include <string>
+++#include <utility>
++ #include "base/wchar_helper.hpp"
++ #include "renderer/font_provider_directwrite.hpp"
++@@ -135,2 +142,309 @@
+++namespace {
+++
+++class FontFileEnumerator final : public IDWriteFontFileEnumerator {
+++public:
+++    FontFileEnumerator(IDWriteFactory *factory, std::wstring path)
+++        : factory_(factory), path_(std::move(path)) {}
+++
+++    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void **object) override
+++    {
+++        if (!object)
+++            return E_POINTER;
+++        *object = nullptr;
+++        if (IsEqualIID(iid, __uuidof(IUnknown)) ||
+++            IsEqualIID(iid, __uuidof(IDWriteFontFileEnumerator))) {
+++            *object = static_cast<IDWriteFontFileEnumerator *>(this);
+++            AddRef();
+++            return S_OK;
+++        }
+++        return E_NOINTERFACE;
+++    }
+++
+++    ULONG STDMETHODCALLTYPE AddRef() override
+++    {
+++        return InterlockedIncrement(&ref_count_);
+++    }
+++
+++    ULONG STDMETHODCALLTYPE Release() override
+++    {
+++        ULONG ref = InterlockedDecrement(&ref_count_);
+++        if (!ref)
+++            delete this;
+++        return ref;
+++    }
+++
+++    HRESULT STDMETHODCALLTYPE MoveNext(BOOL *has_current_file) override
+++    {
+++        if (!has_current_file)
+++            return E_POINTER;
+++        if (enumerated_) {
+++            *has_current_file = FALSE;
+++            return S_OK;
+++        }
+++        enumerated_ = true;
+++        HRESULT hr = factory_->CreateFontFileReference(path_.c_str(), nullptr,
+++                                                        &font_file_);
+++        if (FAILED(hr)) {
+++            *has_current_file = FALSE;
+++            return hr;
+++        }
+++        *has_current_file = TRUE;
+++        return S_OK;
+++    }
+++
+++    HRESULT STDMETHODCALLTYPE GetCurrentFontFile(IDWriteFontFile **font_file) override
+++    {
+++        if (!font_file)
+++            return E_POINTER;
+++        *font_file = nullptr;
+++        return font_file_.CopyTo(font_file);
+++    }
+++
+++private:
+++    volatile LONG ref_count_ = 1;
+++    ComPtr<IDWriteFactory> factory_;
+++    std::wstring path_;
+++    ComPtr<IDWriteFontFile> font_file_;
+++    bool enumerated_ = false;
+++};
+++
+++class FontFileCollectionLoader final : public IDWriteFontCollectionLoader {
+++public:
+++    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void **object) override
+++    {
+++        if (!object)
+++            return E_POINTER;
+++        *object = nullptr;
+++        if (IsEqualIID(iid, __uuidof(IUnknown)) ||
+++            IsEqualIID(iid, __uuidof(IDWriteFontCollectionLoader))) {
+++            *object = static_cast<IDWriteFontCollectionLoader *>(this);
+++            AddRef();
+++            return S_OK;
+++        }
+++        return E_NOINTERFACE;
+++    }
+++
+++    ULONG STDMETHODCALLTYPE AddRef() override
+++    {
+++        return InterlockedIncrement(&ref_count_);
+++    }
+++
+++    ULONG STDMETHODCALLTYPE Release() override
+++    {
+++        ULONG ref = InterlockedDecrement(&ref_count_);
+++        if (!ref)
+++            delete this;
+++        return ref;
+++    }
+++
+++    HRESULT STDMETHODCALLTYPE CreateEnumeratorFromKey(
+++        IDWriteFactory *factory, const void *collection_key,
+++        UINT32 collection_key_size,
+++        IDWriteFontFileEnumerator **font_file_enumerator) override
+++    {
+++        if (!factory || !collection_key || !font_file_enumerator ||
+++            collection_key_size < sizeof(wchar_t) ||
+++            collection_key_size % sizeof(wchar_t))
+++            return E_INVALIDARG;
+++        *font_file_enumerator = nullptr;
+++        const auto *key = static_cast<const wchar_t *>(collection_key);
+++        size_t key_length = collection_key_size / sizeof(wchar_t);
+++        if (key[key_length - 1] != L'\0')
+++            return E_INVALIDARG;
+++        auto *enumerator = new (std::nothrow)
+++            FontFileEnumerator(factory, std::wstring(key, key_length - 1));
+++        if (!enumerator)
+++            return E_OUTOFMEMORY;
+++        *font_file_enumerator = enumerator;
+++        return S_OK;
+++    }
+++
+++private:
+++    volatile LONG ref_count_ = 1;
+++};
+++
+++}
+++
+++struct DirectWriteFileFontCollectionState {
+++    explicit DirectWriteFileFontCollectionState(IDWriteFactory *factory)
+++        : factory_(factory) {}
+++
+++    ~DirectWriteFileFontCollectionState()
+++    {
+++        for (auto &entry : collections_)
+++            entry.second.Reset();
+++
+++        if (loader_registered_) {
+++            HRESULT hr = factory_->UnregisterFontCollectionLoader(loader_.Get());
+++            assert(SUCCEEDED(hr));
+++            loader_registered_ = false;
+++        }
+++
+++        // DirectWrite's registration reference is gone before our owning reference.
+++        loader_.Reset();
+++        collections_.clear();
+++    }
+++
+++    HRESULT GetCollection(const std::wstring &path,
+++                          ComPtr<IDWriteFontCollection> &collection)
+++    {
+++        std::lock_guard<std::mutex> lock(mutex_);
+++
+++        auto it = collections_.find(path);
+++        if (it != collections_.end() && it->second) {
+++            collection = it->second;
+++            return S_OK;
+++        }
+++
+++        const size_t max_chars =
+++            std::numeric_limits<UINT32>::max() / sizeof(wchar_t);
+++        if (path.size() >= max_chars)
+++            return E_INVALIDARG;
+++
+++        if (!loader_) {
+++            auto *loader = new (std::nothrow) FontFileCollectionLoader();
+++            if (!loader)
+++                return E_OUTOFMEMORY;
+++            loader_.Attach(loader);
+++        }
+++
+++        if (!loader_registered_) {
+++            HRESULT hr = factory_->RegisterFontCollectionLoader(loader_.Get());
+++            if (FAILED(hr))
+++                return hr;
+++            loader_registered_ = true;
+++        }
+++
+++        if (it == collections_.end())
+++            it = collections_.emplace(path, ComPtr<IDWriteFontCollection>()).first;
+++
+++        const UINT32 key_size =
+++            static_cast<UINT32>((it->first.size() + 1) * sizeof(wchar_t));
+++        ComPtr<IDWriteFontCollection> created_collection;
+++        HRESULT hr = factory_->CreateCustomFontCollection(
+++            loader_.Get(), it->first.c_str(), key_size, &created_collection);
+++        if (FAILED(hr) || !created_collection)
+++            return FAILED(hr) ? hr : E_FAIL;
+++
+++        it->second = created_collection;
+++        collection = std::move(created_collection);
+++        return S_OK;
+++    }
+++
+++private:
+++    // Borrowed from FontProviderDirectWrite; that provider destroys this state first.
+++    IDWriteFactory *factory_ = nullptr;
+++    ComPtr<IDWriteFontCollectionLoader> loader_;
+++    bool loader_registered_ = false;
+++    std::mutex mutex_;
+++    // Map nodes are stable, and their key buffers live until after unregistration.
+++    std::map<std::wstring, ComPtr<IDWriteFontCollection>> collections_;
+++};
+++
+++namespace {
+++
+++static auto GetFontFaceFromFile(DirectWriteFileFontCollectionState &state,
+++                                IDWriteFactory *factory,
+++                                const std::string &filename,
+++                                std::optional<uint32_t> ucs4)
+++    -> Result<FontfaceInfo, FontProviderError>
+++{
+++    std::wstring path = wchar::UTF8ToWideString(filename);
+++    if (path.empty())
+++        return Err(FontProviderError::kFontNotFound);
+++
+++    HRESULT hr;
+++    ComPtr<IDWriteFontFile> font_file;
+++    hr = factory->CreateFontFileReference(path.c_str(), nullptr, &font_file);
+++    if (FAILED(hr))
+++        return Err(FontProviderError::kFontNotFound);
+++
+++    BOOL is_supported = FALSE;
+++    DWRITE_FONT_FILE_TYPE file_type;
+++    DWRITE_FONT_FACE_TYPE face_type;
+++    UINT32 face_count = 0;
+++    hr = font_file->Analyze(&is_supported, &file_type, &face_type, &face_count);
+++    if (FAILED(hr) || !is_supported || !face_count)
+++        return Err(FontProviderError::kFontNotFound);
+++
+++    IDWriteFontFile *files[] = { font_file.Get() };
+++    ComPtr<IDWriteFontFace> fontface;
+++    hr = factory->CreateFontFace(face_type, 1, files, 0,
+++                                 DWRITE_FONT_SIMULATIONS_NONE, &fontface);
+++    if (FAILED(hr))
+++        return Err(FontProviderError::kFontNotFound);
+++
+++    ComPtr<IDWriteFontCollection> font_collection;
+++    hr = state.GetCollection(path, font_collection);
+++    if (FAILED(hr) || !font_collection || !font_collection->GetFontFamilyCount())
+++        return Err(FontProviderError::kFontNotFound);
+++
+++    ComPtr<IDWriteFontFamily> font_family;
+++    hr = font_collection->GetFontFamily(0, &font_family);
+++    if (FAILED(hr) || !font_family || !font_family->GetFontCount())
+++        return Err(FontProviderError::kFontNotFound);
+++
+++    ComPtr<IDWriteFont> font;
+++    hr = font_family->GetFont(0, &font);
+++    if (FAILED(hr) || !font)
+++        return Err(FontProviderError::kFontNotFound);
+++
+++    if (ucs4) {
+++        BOOL exists = FALSE;
+++        hr = font->HasCharacter(ucs4.value(), &exists);
+++        if (FAILED(hr) || !exists)
+++            return Err(FontProviderError::kCodePointNotFound);
+++    }
+++
+++    ComPtr<IDWriteLocalizedStrings> family_names;
+++    hr = font_family->GetFamilyNames(&family_names);
+++    if (FAILED(hr) || !family_names || !family_names->GetCount())
+++        return Err(FontProviderError::kOtherError);
+++
+++    BOOL has_postscript_name = FALSE;
+++    ComPtr<IDWriteLocalizedStrings> postscript_names;
+++    hr = font->GetInformationalStrings(DWRITE_INFORMATIONAL_STRING_POSTSCRIPT_NAME,
+++                                       &postscript_names, &has_postscript_name);
+++    if (FAILED(hr) || !has_postscript_name || !postscript_names)
+++        return Err(FontProviderError::kOtherError);
+++
+++    FontfaceInfo info;
+++    info.family_name = DWriteLocalizedStringsToUTF8(family_names.Get());
+++    info.postscript_name = DWriteLocalizedStringsToUTF8(postscript_names.Get(), 0);
+++    info.filename = filename;
+++    info.face_index = static_cast<int>(fontface->GetIndex());
+++    info.provider_type = FontProviderType::kDirectWrite;
+++
+++    auto private_info = std::make_unique<FontfaceInfoPrivateDirectWrite>();
+++    private_info->font = std::move(font);
+++    private_info->fontface = std::move(fontface);
+++    private_info->font_collection = std::move(font_collection);
+++    info.provider_priv = std::move(private_info);
+++    return Ok(std::move(info));
+++}
+++
+++}
+++
+++FontProviderDirectWrite::~FontProviderDirectWrite() = default;
+++
++ auto FontProviderDirectWrite::GetFontFace(const std::string& font_name,
++                                           std::optional<uint32_t> ucs4) -> Result<FontfaceInfo, FontProviderError> {
+++    if (font_name.rfind("file:", 0) == 0) {
+++        if (!dwrite_factory_)
+++            return Err(FontProviderError::kOtherError);
+++        DirectWriteFileFontCollectionState *state = nullptr;
+++        {
+++            std::lock_guard<std::mutex> lock(file_font_collection_state_mutex_);
+++            if (!file_font_collection_state_) {
+++                auto *new_state = new (std::nothrow)
+++                    DirectWriteFileFontCollectionState(dwrite_factory_.Get());
+++                if (!new_state)
+++                    return Err(FontProviderError::kOtherError);
+++                file_font_collection_state_.reset(new_state);
+++            }
+++            state = file_font_collection_state_.get();
+++        }
+++        return GetFontFaceFromFile(*state, dwrite_factory_.Get(),
+++                                   font_name.substr(5), ucs4);
+++    }
+++
++diff --git a/src/renderer/text_renderer_directwrite.cpp b/src/renderer/text_renderer_directwrite.cpp
++--- a/src/renderer/text_renderer_directwrite.cpp
+++++ b/src/renderer/text_renderer_directwrite.cpp
++@@ -601,0 +602,6 @@
+++    IDWriteFontCollection *font_collection = nullptr;
+++    if (face_info.provider_priv) {
+++        auto *private_info = static_cast<FontfaceInfoPrivateDirectWrite *>(
+++            face_info.provider_priv.get());
+++        font_collection = private_info->font_collection.Get();
+++    }
++@@ -606,1 +612,1 @@
++-                                                   nullptr,
+++                                                   font_collection,

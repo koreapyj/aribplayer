@@ -1,0 +1,112 @@
+--- a/libavcodec/libaribcaption.c
++++ b/libavcodec/libaribcaption.c
+@@ -184,6 +184,29 @@ static void logcat_callback(aribcc_logle
+     }
+ }
+ 
++#if defined(_WIN32) && defined(ARIBCC_USE_DIRECTWRITE)
++static int aribcaption_has_file_font(const char *font)
++{
++    const char *fonts = font;
++
++    while (fonts && *fonts) {
++        char *font_family = av_get_token(&fonts, ",");
++        int has_file_font;
++
++        if (!font_family)
++            return AVERROR(ENOMEM);
++        has_file_font = av_strstart(font_family, "file:", NULL);
++        av_free(font_family);
++        if (has_file_font)
++            return 1;
++        if (*fonts)
++            fonts++;
++    }
++
++    return 0;
++}
++#endif
++
+ static void estimate_video_frame_size(ARIBCaptionContext *ctx)
+ {
+     if (ctx->avctx->width > 0 && ctx->avctx->height > 0) {
+@@ -1554,6 +1577,11 @@ static av_cold int aribcaption_init(AVCo
+ {
+     ARIBCaptionContext *ctx = avctx->priv_data;
+     aribcc_profile_t profile;
++    aribcc_fontprovider_type_t font_provider_type = ARIBCC_FONTPROVIDER_TYPE_AUTO;
++    aribcc_textrenderer_type_t text_renderer_type = ARIBCC_TEXTRENDERER_TYPE_AUTO;
++#if defined(_WIN32) && defined(ARIBCC_USE_DIRECTWRITE)
++    int has_file_font = 0;
++#endif
+     int ret = 0;
+ 
+     ctx->avctx = avctx;
+@@ -1622,14 +1650,32 @@ static av_cold int aribcaption_init(AVCo
+         break;
+ 
+     case SUBTITLE_BITMAP:
++#if defined(_WIN32) && defined(ARIBCC_USE_DIRECTWRITE)
++        if (ctx->font) {
++            has_file_font = aribcaption_has_file_font(ctx->font);
++            if (has_file_font < 0)
++                return has_file_font;
++            if (has_file_font) {
++                /* The DirectWrite provider resolves file: fonts to a path and face index. Render them
++                 * with FreeType, as the reference Android player does, so the glyph and outline
++                 * rasterization match it; without FreeType keep the DirectWrite renderer. */
++                font_provider_type = ARIBCC_FONTPROVIDER_TYPE_DIRECTWRITE;
++#if defined(ARIBCC_USE_FREETYPE)
++                text_renderer_type = ARIBCC_TEXTRENDERER_TYPE_FREETYPE;
++#else
++                text_renderer_type = ARIBCC_TEXTRENDERER_TYPE_DIRECTWRITE;
++#endif
++            }
++        }
++#endif
+         if(!(ctx->renderer = aribcc_renderer_alloc(ctx->context))) {
+             av_log(avctx, AV_LOG_ERROR, "Failed to alloc libaribcaption renderer.\n");
+             return AVERROR_EXTERNAL;
+         }
+         if(!aribcc_renderer_initialize(ctx->renderer,
+                                        (enum aribcc_captiontype_t)ctx->caption_type,
+-                                       ARIBCC_FONTPROVIDER_TYPE_AUTO,
+-                                       ARIBCC_TEXTRENDERER_TYPE_AUTO)) {
++                                       font_provider_type,
++                                       text_renderer_type)) {
+             av_log(avctx, AV_LOG_ERROR, "Failed to initialize libaribcaption renderer.\n");
+             return AVERROR_EXTERNAL;
+         }
+@@ -1673,6 +1719,32 @@ static av_cold int aribcaption_init(AVCo
+                         fonts++;
+                 }
+             }
++#if defined(_WIN32) && defined(ARIBCC_USE_DIRECTWRITE)
++            if (!is_nomem && has_file_font) {
++                static const char *windows_default_font_families[] = {
++                    "Windows TV MaruGothic",
++                    "MS Gothic",
++                    "sans-serif",
++                };
++
++                for (size_t i = 0;
++                     i < FF_ARRAY_ELEMS(windows_default_font_families); i++) {
++                    const char **ff = av_realloc_array(font_families, count + 1,
++                                                       sizeof(*font_families));
++                    if (!ff) {
++                        is_nomem = 1;
++                        break;
++                    }
++                    font_families = ff;
++                    ff[count] = av_strdup(windows_default_font_families[i]);
++                    if (!ff[count]) {
++                        is_nomem = 1;
++                        break;
++                    }
++                    count++;
++                }
++            }
++#endif
+             if (!is_nomem && count)
+                 aribcc_renderer_set_default_font_family(ctx->renderer, font_families, count, true);
+             while (count)

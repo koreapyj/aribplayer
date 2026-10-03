@@ -1,0 +1,100 @@
+--- a/libavcodec/dxva2.c
++++ b/libavcodec/dxva2.c
+@@ -765,7 +765,9 @@ int ff_dxva2_common_frame_params(AVCodec
+         D3D11_VIDEO_DECODER_DESC desc = { 0 };
+         D3D11_VIDEO_DECODER_CONFIG config;
+ 
+-        frames_hwctx->BindFlags |= D3D11_BIND_DECODER;
++        frames_hwctx->BindFlags |= D3D11_BIND_DECODER |
++            (frames_ctx->sw_format == AV_PIX_FMT_P010 || frames_ctx->sw_format == AV_PIX_FMT_P012 ?
++             device_hwctx->decoder_bind_flags_p010 : device_hwctx->decoder_bind_flags);
+         frames_hwctx->require_sync = device_hwctx->device_desc.VendorId == 0x8086;
+ 
+         if (!d3d11va_get_decoder_desc_and_config(avctx, frames_ctx, 0, &decoder_guid, &desc, &config)) {
+--- a/libavutil/hwcontext_d3d11va.h
++++ b/libavutil/hwcontext_d3d11va.h
+@@ -118,6 +118,16 @@ typedef struct AVD3D11VADeviceContext {
+      * Whether the device is an UMA device.
+      */
+     int is_uma;
++    /* Extra bind flags for internally allocated decoder frames; zero retains upstream defaults. */
++    UINT decoder_bind_flags;
++    /* Same as decoder_bind_flags for decoder frames of P010 / P012 pools (decoder_bind_flags applies to every other
++     * format): a driver may take the extra bits for NV12 but not for P010, or the other way round. */
++    UINT decoder_bind_flags_p010;
++    /* Output: number of decoder pools that had to be created without their decoder_bind_flags[_p010] bits because the
++     * driver rejected the combination (the pool is then created again with the plain flags). Updated atomically. */
++    int decoder_bind_fallbacks;
++    /* TEST ONLY: the creation of the next N decoder pools that use extra bind bits fails, as if the driver rejected them. */
++    int decoder_bind_test_fail;
+ } AVD3D11VADeviceContext;
+ 
+ /**
+--- a/libavutil/hwcontext_d3d11va.c
++++ b/libavutil/hwcontext_d3d11va.c
+@@ -266,6 +266,45 @@ static AVBufferRef *d3d11va_pool_alloc(v
+     return wrap_texture_buf(ctx, hwctx->texture, s->nb_surfaces_used);
+ }
+ 
++/* the bind bits of a decoder pool that exist only because of AVD3D11VADeviceContext.decoder_bind_flags[_p010] */
++static UINT d3d11va_decoder_extra_flags(const AVD3D11VADeviceContext *device_hwctx, enum AVPixelFormat sw_format)
++{
++    UINT flags = sw_format == AV_PIX_FMT_P010 || sw_format == AV_PIX_FMT_P012 ?
++                 device_hwctx->decoder_bind_flags_p010 : device_hwctx->decoder_bind_flags;
++    return flags & ~device_hwctx->BindFlags;
++}
++
++/* CreateTexture2D for a decoder pool. A driver may reject the extra decoder bind bits at the real frame size: the
++ * texture is then created again without them and the pool keeps the plain flags (counted in decoder_bind_fallbacks). */
++static HRESULT d3d11va_create_decoder_texture(AVHWFramesContext *ctx, D3D11_TEXTURE2D_DESC *texDesc,
++                                              ID3D11Texture2D **tex)
++{
++    AVD3D11VADeviceContext *device_hwctx = ctx->device_ctx->hwctx;
++    D3D11VAFramesContext              *s = ctx->hwctx;
++    AVD3D11VAFramesContext        *hwctx = &s->p;
++    UINT drop = (texDesc->BindFlags & D3D11_BIND_DECODER) ?
++                d3d11va_decoder_extra_flags(device_hwctx, ctx->sw_format) & texDesc->BindFlags : 0;
++    HRESULT hr;
++
++    if (drop && device_hwctx->decoder_bind_test_fail > 0) {
++        device_hwctx->decoder_bind_test_fail--;
++        hr = E_FAIL;
++    } else {
++        hr = ID3D11Device_CreateTexture2D(device_hwctx->device, texDesc, NULL, tex);
++    }
++    if (FAILED(hr) && drop) {
++        av_log(ctx, AV_LOG_WARNING, "Could not create the decoder texture with bind flags 0x%x (%lx), "
++               "retrying without 0x%x\n", (unsigned)texDesc->BindFlags, (long)hr, (unsigned)drop);
++        texDesc->BindFlags &= ~drop;
++        hr = ID3D11Device_CreateTexture2D(device_hwctx->device, texDesc, NULL, tex);
++        if (SUCCEEDED(hr)) {
++            hwctx->BindFlags &= ~drop;
++            InterlockedIncrement((volatile LONG *)&device_hwctx->decoder_bind_fallbacks);
++        }
++    }
++    return hr;
++}
++
+ static int d3d11va_frames_init(AVHWFramesContext *ctx)
+ {
+     AVD3D11VADeviceContext *device_hwctx = ctx->device_ctx->hwctx;
+@@ -319,11 +358,18 @@ static int d3d11va_frames_init(AVHWFrame
+         hwctx->MiscFlags = texDesc2.MiscFlags;
+     } else if ((!(texDesc.BindFlags & D3D11_BIND_RENDER_TARGET) &&
+                 !((texDesc.BindFlags & D3D11_BIND_DECODER) && hwctx->array_of_tex)) && texDesc.ArraySize > 0) {
+-        hr = ID3D11Device_CreateTexture2D(device_hwctx->device, &texDesc, NULL, &hwctx->texture);
++        hr = d3d11va_create_decoder_texture(ctx, &texDesc, &hwctx->texture);
+         if (FAILED(hr)) {
+             av_log(ctx, AV_LOG_ERROR, "Could not create the texture (%lx)\n", (long)hr);
+             return AVERROR_UNKNOWN;
+         }
++    } else if (texDesc.BindFlags & D3D11_BIND_DECODER) {
++        /* the textures are created one by one on demand: find out now whether the bind flags are accepted */
++        ID3D11Texture2D *probe = NULL;
++
++        texDesc.ArraySize = 1;
++        if (SUCCEEDED(d3d11va_create_decoder_texture(ctx, &texDesc, &probe)))
++            ID3D11Texture2D_Release(probe);
+     }
+ 
+     hwctx->texture_infos = av_realloc_f(NULL, ctx->initial_pool_size, sizeof(*hwctx->texture_infos));

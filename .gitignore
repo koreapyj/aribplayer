@@ -1,0 +1,39 @@
+# Local tooling / reference clones
+.claude
+.ref
+.tmp
+
+# ffmpeg pipeline: sources, Docker work dirs and build output (rebuilt by ffmpeg/build-ffplay.ps1)
+ffmpeg/.work/
+ffmpeg/dist/
+ffmpeg/fakebin
+
+# Generated test media (scripts/make-testmedia.ps1)
+testmedia/
+
+# Build output, test results, measurements, screenshots, worker reports, WMP static dumps
+artifacts/
+
+# Screenshots / captures must never be committed (they may contain third-party UI such as WMP)
+*.png
+!src/**/Assets/**/*.png
+docs/img/
+
+# CMake: the build tree is artifacts/cmake/<preset>/ (ignored above); ad-hoc build trees and personal presets
+/build/
+/out/
+CMakeUserPresets.json
+
+# MSVC
+*.ilk
+*.pdb
+*.iobj
+*.ipdb
+
+# Debugging and logs
+*.dmp
+*.etl
+*.log
+
+# Clipboard backups written by GUI test scripts (contain the user's clipboard text)
+clipboard-backup-*.txt

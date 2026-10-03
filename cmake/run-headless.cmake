@@ -1,0 +1,17 @@
+# Usage: cmake -DEXE=<exe> -DMEDIA=<file> -DRESULT=<json> -P run-headless.cmake
+# A missing fixture prints "WVP_SKIP:" (the test's SKIP_REGULAR_EXPRESSION) instead of failing.
+foreach(var EXE MEDIA RESULT)
+    if(NOT DEFINED ${var})
+        message(FATAL_ERROR "run-headless.cmake: -D${var}=... is required")
+    endif()
+endforeach()
+if(NOT EXISTS "${MEDIA}")
+    message("WVP_SKIP: fixture ${MEDIA} not found (testmedia/ is local, see docs/debugging.md)")
+    return()
+endif()
+get_filename_component(result_dir "${RESULT}" DIRECTORY)
+file(MAKE_DIRECTORY "${result_dir}")
+execute_process(COMMAND "${EXE}" --headless-check "${MEDIA}" "--result=${RESULT}" RESULT_VARIABLE rc)
+if(NOT rc STREQUAL "0")
+    message(FATAL_ERROR "--headless-check ${MEDIA} failed (exit ${rc}); see ${RESULT}")
+endif()

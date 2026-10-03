@@ -1,0 +1,5 @@
+# Digest inputs must have identical bytes in Linux CI and Windows/WSL checkouts.
+*.ps1 text eol=lf
+*.sh text eol=lf
+*.patch text eol=lf
+builder.lock text eol=lf

@@ -1,0 +1,878 @@
+--- a/libavcodec/avcodec.h
++++ b/libavcodec/avcodec.h
+@@ -2069,7 +2069,14 @@ enum AVSubtitleType {
+     SUBTITLE_ASS,
+ };
+ 
+-#define AV_SUBTITLE_FLAG_FORCED 0x00000001
++#define AV_SUBTITLE_FLAG_FORCED   0x00000001
++#define AV_SUBTITLE_FLAG_RERENDER 0x00000002 ///< Bitmap was re-rendered without a new subtitle packet
++
++/**
++ * AVPacket.flags bit of an empty packet sent to the libaribcaption decoder: re-render the caption
++ * active at the packet's pts, if the decoder's caption history covers that time.
++ */
++#define AV_PKT_FLAG_ARIB_ACTIVE_AT 0x4000
+ 
+ typedef struct AVSubtitleRect {
+     int x;         ///< top left corner  of pict, undefined when pict is not set
+--- a/libavcodec/libaribcaption.c
++++ b/libavcodec/libaribcaption.c
+@@ -57,6 +57,36 @@
+                                         (ARIBCC_COLOR_G(c) <<  8) | \
+                                         (ARIBCC_COLOR_B(c)))
+ 
++#define ARIBC_HISTORY_WINDOW_DEFAULT    600                 /* seconds of media time kept around the decode position */
++#define ARIBC_HISTORY_MAX_BYTES_DEFAULT (5 * 1024 * 1024)
++#define ARIBC_SPANS_MAX                 16
++#define ARIBC_PARKED_MAX                4
++
++/* A bitmap caption event (a caption, or an empty clear event), owned by the history. Kept so the
++ * caption active at any covered time can be rendered again without its packet. */
++typedef struct ARIBCaptionHistory {
++    aribcc_caption_t caption;
++    int64_t render_pts;
++    int64_t subtitle_pts;
++    uint32_t start_display_time;
++    uint32_t end_display_time;
++    size_t bytes;
++    int clear;
++} ARIBCaptionHistory;
++
++/* A media time range [lo, hi] (us) over which every caption event has been decoded in order. */
++typedef struct ARIBCaptionSpan {
++    int64_t lo, hi;
++} ARIBCaptionSpan;
++
++typedef struct ARIBCaptionStore {
++    ARIBCaptionHistory *events;         /* sorted by subtitle_pts */
++    int count, alloc;
++    size_t bytes;
++    ARIBCaptionSpan spans[ARIBC_SPANS_MAX];  /* closed ranges, sorted and disjoint */
++    int nb_spans;
++} ARIBCaptionStore;
++
+ typedef struct ARIBCaptionContext {
+     AVClass *class;
+     AVCodecContext *avctx;
+@@ -85,6 +115,22 @@ typedef struct ARIBCaptionContext {
+     AVRational time_base;
+     int canvas_width;
+     int canvas_height;
++    int input_width;
++    int input_height;
++    int applied_canvas_width;
++    int applied_canvas_height;
++    ARIBCaptionStore store;
++    ARIBCaptionSpan span;               /* the range being decoded now, if span_open */
++    int span_open;
++    int64_t anchor_pts;
++    uint32_t history_sig;
++    char *history_key;
++    int history_window;
++    int64_t history_max_bytes;
++    int64_t history_bytes;
++    int64_t history_count;
++    int64_t history_appended_bytes;
++    int64_t rendered_subtitle_pts;
+     int plane_width;
+     int plane_height;
+     int frame_width;
+@@ -163,6 +209,49 @@ static void estimate_video_frame_size(AR
+     }
+ }
+ 
++static int aribcaption_update_frame_size(ARIBCaptionContext *ctx, int force,
++                                         int *changed)
++{
++    int old_width = ctx->frame_width;
++    int old_height = ctx->frame_height;
++    int frame_changed;
++
++    if (ctx->canvas_width > 0 && ctx->canvas_height > 0) {
++        ctx->avctx->width = ctx->canvas_width;
++        ctx->avctx->height = ctx->canvas_height;
++    } else {
++        ctx->avctx->width = ctx->input_width;
++        ctx->avctx->height = ctx->input_height;
++    }
++    estimate_video_frame_size(ctx);
++
++    frame_changed = force || ctx->frame_width != old_width ||
++                    ctx->frame_height != old_height;
++
++    if (changed)
++        *changed = frame_changed;
++    if (frame_changed) {
++        ff_dlog(ctx, "canvas: %dx%d  plane: %dx%d  bitmap: %dx%d  frame: %dx%d\n",
++                ctx->avctx->width, ctx->avctx->height,
++                ctx->plane_width, ctx->plane_height,
++                ctx->bitmap_plane_width, ctx->bitmap_plane_height,
++                ctx->frame_width, ctx->frame_height);
++        if (!aribcc_renderer_set_frame_size(ctx->renderer,
++                                            ctx->frame_width,
++                                            ctx->frame_height)) {
++            av_log(ctx, AV_LOG_ERROR,
++                   "aribcc_renderer_set_frame_size() returned with error.\n");
++            ctx->frame_width = old_width;
++            ctx->frame_height = old_height;
++            return AVERROR_EXTERNAL;
++        }
++    }
++
++    ctx->applied_canvas_width = ctx->canvas_width;
++    ctx->applied_canvas_height = ctx->canvas_height;
++    return 0;
++}
++
+ static void clut_set_alpha(ARIBCaptionContext *ctx, uint8_t a)
+ {
+     int i;
+@@ -315,36 +404,29 @@ static void clut_init(ARIBCaptionContext
+  *         = 0 no subtitle
+  *         < 0 error code
+  */
+-static int aribcaption_trans_bitmap_subtitle(ARIBCaptionContext *ctx)
++static int aribcaption_trans_bitmap_subtitle(ARIBCaptionContext *ctx,
++                                             const aribcc_caption_t *caption,
++                                             int append_caption)
+ {
+     int ret = 0;
+     AVSubtitle *sub = ctx->sub;
+-    int status, rect_idx;
++    int status, rect_idx, frame_changed;
+     int image_count, rect_count;
+-    int old_width = ctx->frame_width;
+-    int old_height = ctx->frame_height;
++    int canvas_changed = ctx->canvas_width != ctx->applied_canvas_width ||
++                         ctx->canvas_height != ctx->applied_canvas_height;
+ 
+-    if (ctx->caption.plane_width > 0 && ctx->caption.plane_height > 0) {
+-        ctx->plane_width = ctx->caption.plane_width;
+-        ctx->plane_height = ctx->caption.plane_height;
+-    }
+-    estimate_video_frame_size(ctx);
+-    if (ctx->frame_width != old_width || ctx->frame_height != old_height) {
+-        ff_dlog(ctx, "canvas: %dx%d  plane: %dx%d  bitmap: %dx%d  frame: %dx%d\n",
+-                ctx->avctx->width, ctx->avctx->height,
+-                ctx->plane_width, ctx->plane_height,
+-                ctx->bitmap_plane_width, ctx->bitmap_plane_height,
+-                ctx->frame_width, ctx->frame_height);
+-        if (!aribcc_renderer_set_frame_size(ctx->renderer,
+-                                 ctx->frame_width, ctx->frame_height)) {
+-            av_log(ctx, AV_LOG_ERROR,
+-                   "aribcc_renderer_set_frame_size() returned with error.\n");
+-            return AVERROR_EXTERNAL;
+-        }
+-    }
++    if (caption->plane_width > 0 && caption->plane_height > 0) {
++        ctx->plane_width = caption->plane_width;
++        ctx->plane_height = caption->plane_height;
++    }
++    ret = aribcaption_update_frame_size(ctx, canvas_changed, &frame_changed);
++    if (ret < 0)
++        return ret;
++    if (frame_changed)
++        ff_dlog(ctx, "updating renderer frame size for caption bitmap\n");
+ 
+-    status = aribcc_renderer_append_caption(ctx->renderer, &ctx->caption);
+-    if (!status) {
++    if (append_caption &&
++        !aribcc_renderer_append_caption(ctx->renderer, caption)) {
+         av_log(ctx, AV_LOG_ERROR,
+                "aribcc_renderer_append_caption() returned with error.\n");
+         return AVERROR_EXTERNAL;
+@@ -363,7 +445,9 @@ static int aribcaption_trans_bitmap_subt
+ 
+     case ARIBCC_RENDER_STATUS_NO_IMAGE:
+         aribcc_render_result_cleanup(&ctx->render_result);
+-        ff_dlog(ctx, "no image (clear)\n");
++        ff_dlog(ctx, "no image%s\n", append_caption ? " (clear)" : " (rerender unchanged)");
++        if (!append_caption)
++            return 0;
+         sub->format = 0;
+         sub->num_rects = 0;
+         return 1;
+@@ -382,19 +466,22 @@ static int aribcaption_trans_bitmap_subt
+ 
+     image_count = ctx->render_result.image_count;
+     if (!image_count || ctx->render_result.images == NULL ||
+-        !ctx->caption.region_count) {
++        !caption->region_count) {
+         aribcc_render_result_cleanup(&ctx->render_result);
+-        ff_dlog(ctx, "no image (%d) (clear)\n", image_count);
++        ff_dlog(ctx, "no image (%d)%s\n", image_count,
++                append_caption ? " (clear)" : " (rerender unchanged)");
++        if (!append_caption)
++            return 0;
+         sub->format = 0;
+         sub->num_rects = 0;
+         return 1;
+     }
+ 
+-    rect_count = FFMIN(image_count, ctx->caption.region_count);
+-    if (rect_count != image_count || rect_count != ctx->caption.region_count)
++    rect_count = FFMIN(image_count, caption->region_count);
++    if (rect_count != image_count || rect_count != caption->region_count)
+         av_log(ctx, AV_LOG_WARNING,
+                "Rendered image count (%d) differs from caption region count (%u).\n",
+-               image_count, ctx->caption.region_count);
++               image_count, caption->region_count);
+     sub->format = 0; /* graphic */
+     sub->rects = av_calloc(rect_count, sizeof(*sub->rects));
+     if (!sub->rects) {
+@@ -414,7 +501,7 @@ static int aribcaption_trans_bitmap_subt
+         aribcc_image_t *image = &ctx->render_result.images[rect_idx];
+         int w, h, shrink_height, dst_idx;
+ 
+-        clut_init(ctx, &ctx->caption.regions[rect_idx]);
++        clut_init(ctx, &caption->regions[rect_idx]);
+ 
+         rect->w = image->width * ctx->bitmap_plane_width / ctx->frame_width;
+         rect->h = image->height * ctx->bitmap_plane_height / ctx->frame_height;
+@@ -484,7 +571,7 @@ static int aribcaption_trans_bitmap_subt
+         rect->nb_colors = 256;
+ 
+         ff_dlog(ctx, "BITMAP subtitle%s (%d,%d) %dx%d -> (%d,%d) %dx%d [%d]: %d colors\n",
+-                (ctx->caption.regions[rect_idx].is_ruby) ? " (ruby)" : "",
++                (caption->regions[rect_idx].is_ruby) ? " (ruby)" : "",
+                 image->dst_x, image->dst_y, image->width, image->height,
+                 rect->x, rect->y, rect->w, rect->h,
+                 rect_idx, ctx->clut_idx);
+@@ -856,6 +943,468 @@ fail:
+     return ret;
+ }
+ 
++/* DRCS bitmaps are included. */
++static size_t aribcaption_caption_bytes(const aribcc_caption_t *c)
++{
++    size_t bytes = sizeof(*c);
++    uint32_t seen[8];
++    int nb_seen = 0;
++
++    if (c->text)
++        bytes += strlen(c->text) + 1;
++    bytes += (size_t)c->region_count * sizeof(*c->regions);
++    for (uint32_t i = 0; i < c->region_count; i++) {
++        const aribcc_caption_region_t *region = &c->regions[i];
++
++        bytes += (size_t)region->char_count * sizeof(*region->chars);
++        for (uint32_t j = 0; c->drcs_map && j < region->char_count; j++) {
++            const aribcc_caption_char_t *ch = &region->chars[j];
++            aribcc_drcs_t *drcs;
++            uint8_t *pixels = NULL;
++            size_t size = 0;
++            int dup = 0;
++
++            if (ch->type == ARIBCC_CHARTYPE_TEXT)
++                continue;
++            for (int k = 0; k < nb_seen; k++)
++                dup |= seen[k] == ch->drcs_code;
++            if (dup)
++                continue;
++            if (nb_seen < FF_ARRAY_ELEMS(seen))
++                seen[nb_seen++] = ch->drcs_code;
++            drcs = aribcc_drcsmap_get(c->drcs_map, ch->drcs_code);
++            if (!drcs)
++                continue;
++            aribcc_drcs_get_pixels(drcs, &pixels, &size);
++            bytes += size + 64;
++        }
++    }
++    return bytes;
++}
++
++static void aribcaption_store_free(ARIBCaptionStore *s)
++{
++    for (int i = 0; i < s->count; i++)
++        aribcc_caption_cleanup(&s->events[i].caption);
++    av_freep(&s->events);
++    *s = (ARIBCaptionStore){ 0 };
++}
++
++static void aribcaption_publish_stats(ARIBCaptionContext *ctx)
++{
++    ctx->history_bytes = ctx->store.bytes;
++    ctx->history_count = ctx->store.count;
++}
++
++/* Number of events with subtitle_pts <= pts. */
++static int aribcaption_store_upper(const ARIBCaptionStore *s, int64_t pts)
++{
++    int lo = 0, hi = s->count;
++
++    while (lo < hi) {
++        int mid = lo + (hi - lo) / 2;
++
++        if (s->events[mid].subtitle_pts <= pts)
++            lo = mid + 1;
++        else
++            hi = mid;
++    }
++    return lo;
++}
++
++static void aribcaption_spans_merge(ARIBCaptionStore *s)
++{
++    int n = 0;
++
++    for (int i = 0; i < s->nb_spans; i++) {
++        if (n && s->spans[i].lo <= s->spans[n - 1].hi) {
++            s->spans[n - 1].hi = FFMAX(s->spans[n - 1].hi, s->spans[i].hi);
++        } else {
++            s->spans[n++] = s->spans[i];
++        }
++    }
++    s->nb_spans = n;
++}
++
++static void aribcaption_span_close(ARIBCaptionContext *ctx)
++{
++    ARIBCaptionStore *s = &ctx->store;
++    int i;
++
++    if (!ctx->span_open)
++        return;
++    ctx->span_open = 0;
++    if (s->nb_spans == ARIBC_SPANS_MAX) {
++        memmove(&s->spans[0], &s->spans[1], (ARIBC_SPANS_MAX - 1) * sizeof(s->spans[0]));
++        s->nb_spans--;
++    }
++    for (i = s->nb_spans; i > 0 && s->spans[i - 1].lo > ctx->span.lo; i--)
++        s->spans[i] = s->spans[i - 1];
++    s->spans[i] = ctx->span;
++    s->nb_spans++;
++    aribcaption_spans_merge(s);
++}
++
++/* A packet (event or not) was decoded at pts. Everything between the first event after a discontinuity
++ * and the newest packet has been seen in order, so the caption state in that range is known. */
++static void aribcaption_span_note(ARIBCaptionContext *ctx, int64_t pts, int is_event)
++{
++    ARIBCaptionStore *s = &ctx->store;
++
++    if (pts == AV_NOPTS_VALUE)
++        return;
++    if (!ctx->span_open) {
++        for (int i = 0; i < s->nb_spans; i++) {
++            if (s->spans[i].lo <= pts && pts <= s->spans[i].hi) {
++                ctx->span = s->spans[i];
++                memmove(&s->spans[i], &s->spans[i + 1], (s->nb_spans - i - 1) * sizeof(s->spans[0]));
++                s->nb_spans--;
++                ctx->span_open = 1;
++                break;
++            }
++        }
++        if (!ctx->span_open && is_event) {
++            ctx->span.lo = ctx->span.hi = pts;
++            ctx->span_open = 1;
++        }
++        if (!ctx->span_open)
++            return;
++    } else if (pts > ctx->span.hi) {
++        ctx->span.hi = pts;
++    }
++    for (int i = 0; i < s->nb_spans;) {
++        if (s->spans[i].lo <= ctx->span.hi && s->spans[i].hi >= ctx->span.lo) {
++            ctx->span.lo = FFMIN(ctx->span.lo, s->spans[i].lo);
++            ctx->span.hi = FFMAX(ctx->span.hi, s->spans[i].hi);
++            memmove(&s->spans[i], &s->spans[i + 1], (s->nb_spans - i - 1) * sizeof(s->spans[0]));
++            s->nb_spans--;
++        } else {
++            i++;
++        }
++    }
++}
++
++static int aribcaption_span_covers(const ARIBCaptionContext *ctx, int64_t pts)
++{
++    if (ctx->span_open && ctx->span.lo <= pts && pts <= ctx->span.hi)
++        return 1;
++    for (int i = 0; i < ctx->store.nb_spans; i++)
++        if (ctx->store.spans[i].lo <= pts && pts <= ctx->store.spans[i].hi)
++            return 1;
++    return 0;
++}
++
++/* Clip the known ranges to the events that are still kept: [lo, hi] (hi = INT64_MAX: no limit). */
++static void aribcaption_spans_clip(ARIBCaptionContext *ctx, int64_t lo, int64_t hi)
++{
++    ARIBCaptionStore *s = &ctx->store;
++    int n = 0;
++
++    for (int i = 0; i < s->nb_spans; i++) {
++        ARIBCaptionSpan span = s->spans[i];
++
++        span.lo = FFMAX(span.lo, lo);
++        span.hi = FFMIN(span.hi, hi);
++        if (span.lo <= span.hi)
++            s->spans[n++] = span;
++    }
++    s->nb_spans = n;
++    if (ctx->span_open) {
++        ctx->span.lo = FFMAX(ctx->span.lo, lo);
++        ctx->span.hi = FFMIN(ctx->span.hi, hi);
++        if (ctx->span.lo > ctx->span.hi)
++            ctx->span_open = 0;
++    }
++}
++
++/* Keep the events within the window around the newest decoded one and the byte budget; when the budget
++ * is exceeded the event farthest from it (normally the oldest) goes first. */
++static void aribcaption_store_evict(ARIBCaptionContext *ctx)
++{
++    ARIBCaptionStore *s = &ctx->store;
++    int64_t window = (int64_t)ctx->history_window * AV_TIME_BASE;
++    int64_t hi_limit = INT64_MAX;
++    int evicted = 0;
++
++    while (s->count) {
++        const ARIBCaptionHistory *first = &s->events[0];
++        const ARIBCaptionHistory *last = &s->events[s->count - 1];
++        int64_t anchor = ctx->anchor_pts != AV_NOPTS_VALUE ? ctx->anchor_pts : last->subtitle_pts;
++        int drop_first;
++
++        if (first->subtitle_pts < anchor - window)
++            drop_first = 1;
++        else if (last->subtitle_pts > anchor + window)
++            drop_first = 0;
++        else if ((int64_t)s->bytes > ctx->history_max_bytes)
++            drop_first = anchor - first->subtitle_pts >= last->subtitle_pts - anchor;
++        else
++            break;
++
++        if (drop_first) {
++            s->bytes -= first->bytes;
++            aribcc_caption_cleanup(&s->events[0].caption);
++            memmove(&s->events[0], &s->events[1], (s->count - 1) * sizeof(s->events[0]));
++        } else {
++            hi_limit = FFMIN(hi_limit, last->subtitle_pts - 1);
++            s->bytes -= last->bytes;
++            aribcc_caption_cleanup(&s->events[s->count - 1].caption);
++        }
++        s->count--;
++        evicted++;
++    }
++    if (!evicted)
++        return;
++    if (!s->count) {
++        s->nb_spans = 0;
++        ctx->span_open = 0;
++    } else {
++        aribcaption_spans_clip(ctx, s->events[0].subtitle_pts, hi_limit);
++    }
++    av_log(ctx, AV_LOG_VERBOSE, "ARIB caption history: evicted %d events, %d kept (%zu bytes)\n",
++           evicted, s->count, s->bytes);
++}
++
++/* Record a decoded event; with a caption, ctx->caption moves into the history (it takes ownership).
++ * An event at a pts that is already there (a replay after a seek) replaces it. */
++static int aribcaption_save_history(ARIBCaptionContext *ctx, int64_t subtitle_pts,
++                                    uint32_t start, uint32_t end, int clear)
++{
++    ARIBCaptionStore *s = &ctx->store;
++    ARIBCaptionHistory h = { 0 };
++    int pos;
++
++    if (subtitle_pts == AV_NOPTS_VALUE)
++        return 0;
++    if (!clear) {
++        h.caption = ctx->caption;
++        ctx->caption = (aribcc_caption_t){ 0 };
++        h.bytes = aribcaption_caption_bytes(&h.caption);
++    } else {
++        h.bytes = sizeof(h);
++    }
++    h.render_pts = ctx->pts;
++    h.subtitle_pts = subtitle_pts;
++    h.start_display_time = start;
++    h.end_display_time = end;
++    h.clear = clear;
++
++    pos = aribcaption_store_upper(s, subtitle_pts);
++    for (int i = pos - 1; i >= 0 && s->events[i].subtitle_pts == subtitle_pts; i--) {
++        if (s->events[i].clear == clear) {
++            s->bytes += h.bytes - s->events[i].bytes;
++            aribcc_caption_cleanup(&s->events[i].caption);
++            s->events[i] = h;
++            goto stored;
++        }
++    }
++    if (s->count == s->alloc) {
++        int alloc = s->alloc ? s->alloc * 2 : 64;
++        ARIBCaptionHistory *events = av_realloc_array(s->events, alloc, sizeof(*events));
++
++        if (!events) {
++            aribcc_caption_cleanup(&h.caption);
++            return AVERROR(ENOMEM);
++        }
++        s->events = events;
++        s->alloc = alloc;
++    }
++    memmove(&s->events[pos + 1], &s->events[pos], (s->count - pos) * sizeof(*s->events));
++    s->events[pos] = h;
++    s->count++;
++    s->bytes += h.bytes;
++stored:
++    ctx->history_appended_bytes += h.bytes;
++    ctx->anchor_pts = subtitle_pts;
++    aribcaption_span_note(ctx, subtitle_pts, 1);
++    av_log(ctx, AV_LOG_VERBOSE, "ARIB caption history: %s at %"PRId64" us (%zu bytes) end %"PRIu32" ms, %d events, %zu bytes\n",
++           clear ? "clear" : "caption", subtitle_pts, h.bytes, end, s->count, s->bytes);
++    aribcaption_store_evict(ctx);
++    aribcaption_publish_stats(ctx);
++    return 0;
++}
++
++static uint32_t aribcaption_history_signature(const ARIBCaptionContext *ctx)
++{
++    uint32_t sig = 1;
++
++    sig = sig * 31 + ctx->avctx->profile;
++    sig = sig * 31 + ctx->caption_type;
++    sig = sig * 31 + ctx->encoding_scheme;
++    sig = sig * 31 + ctx->replace_msz_ascii;
++    sig = sig * 31 + ctx->replace_msz_japanese;
++    return sig;
++}
++
++/* Histories of closed decoders, keyed by media identity, so a reopen of the same file (the decoder is new)
++ * continues from them. A different key never sees them. */
++static AVMutex parked_mutex = AV_MUTEX_INITIALIZER;
++static struct {
++    char *key;
++    uint32_t sig;
++    int64_t stamp;
++    ARIBCaptionStore store;
++} parked[ARIBC_PARKED_MAX];
++static int64_t parked_stamp;
++
++static void aribcaption_adopt_history(ARIBCaptionContext *ctx)
++{
++    if (!ctx->history_key || !*ctx->history_key)
++        return;
++    ff_mutex_lock(&parked_mutex);
++    for (int i = 0; i < ARIBC_PARKED_MAX; i++) {
++        if (!parked[i].key || strcmp(parked[i].key, ctx->history_key))
++            continue;
++        if (parked[i].sig == ctx->history_sig) {
++            ctx->store = parked[i].store;
++            parked[i].store = (ARIBCaptionStore){ 0 };
++            av_log(ctx, AV_LOG_VERBOSE, "ARIB caption history: adopted %d events (%zu bytes)\n",
++                   ctx->store.count, ctx->store.bytes);
++        } else {
++            aribcaption_store_free(&parked[i].store);
++        }
++        av_freep(&parked[i].key);
++        break;
++    }
++    ff_mutex_unlock(&parked_mutex);
++    if (ctx->store.count)
++        ctx->anchor_pts = ctx->store.events[ctx->store.count - 1].subtitle_pts;
++    aribcaption_publish_stats(ctx);
++}
++
++static void aribcaption_park_history(ARIBCaptionContext *ctx)
++{
++    int slot = -1;
++
++    aribcaption_span_close(ctx);
++    if (!ctx->history_key || !*ctx->history_key || !ctx->store.count) {
++        aribcaption_store_free(&ctx->store);
++        return;
++    }
++    ff_mutex_lock(&parked_mutex);
++    for (int i = 0; i < ARIBC_PARKED_MAX; i++) {
++        if (parked[i].key && !strcmp(parked[i].key, ctx->history_key)) {
++            slot = i;
++            break;
++        }
++    }
++    for (int i = 0; slot < 0 && i < ARIBC_PARKED_MAX; i++)
++        if (!parked[i].key)
++            slot = i;
++    if (slot < 0) {
++        slot = 0;
++        for (int i = 1; i < ARIBC_PARKED_MAX; i++)
++            if (parked[i].stamp < parked[slot].stamp)
++                slot = i;
++    }
++    aribcaption_store_free(&parked[slot].store);
++    av_freep(&parked[slot].key);
++    parked[slot].key = av_strdup(ctx->history_key);
++    if (parked[slot].key) {
++        parked[slot].sig = ctx->history_sig;
++        parked[slot].stamp = ++parked_stamp;
++        parked[slot].store = ctx->store;
++        ctx->store = (ARIBCaptionStore){ 0 };
++    }
++    ff_mutex_unlock(&parked_mutex);
++    aribcaption_store_free(&ctx->store);
++}
++
++static int aribcaption_rerender(ARIBCaptionContext *ctx, AVSubtitle *sub,
++                                int *got_sub_ptr, const AVPacket *avpkt)
++{
++    int ret, frame_changed, idx = -1;
++    int canvas_changed = ctx->canvas_width != ctx->applied_canvas_width ||
++                         ctx->canvas_height != ctx->applied_canvas_height;
++    int at_time = !!(avpkt->flags & AV_PKT_FLAG_ARIB_ACTIVE_AT);
++    const ARIBCaptionStore *s = &ctx->store;
++    int64_t target = AV_NOPTS_VALUE;
++    ARIBCaptionHistory *h;
++
++    if (!ctx->renderer)
++        return 0;
++
++    if (avpkt->pts != AV_NOPTS_VALUE)
++        target = av_rescale_q(avpkt->pts, ctx->time_base, AV_TIME_BASE_Q);
++
++    if (at_time) {
++        /* The caption on screen at target, from the history: the latest event at or before it (1 ms
++         * tolerance, as the cue queue). Only inside a range whose events were all decoded; a clear event,
++         * or a finished duration, leaves nothing. */
++        if (target != AV_NOPTS_VALUE && aribcaption_span_covers(ctx, target)) {
++            int upper = aribcaption_store_upper(s, target + 1000);
++            const ARIBCaptionHistory *e = upper > 0 ? &s->events[upper - 1] : NULL;
++
++            if (e && !e->clear &&
++                (e->end_display_time == UINT32_MAX ||
++                 target < e->subtitle_pts + (int64_t)e->end_display_time * 1000))
++                idx = upper - 1;
++        }
++        if (idx < 0 && !canvas_changed)
++            return 0;
++    } else if (target != AV_NOPTS_VALUE) {
++        for (int i = aribcaption_store_upper(s, target) - 1;
++             i >= 0 && s->events[i].subtitle_pts == target; i--) {
++            if (!s->events[i].clear) {
++                idx = i;
++                break;
++            }
++        }
++    } else {
++        for (int i = s->count - 1; i >= 0; i--) {
++            if (!s->events[i].clear) {
++                idx = i;
++                break;
++            }
++        }
++    }
++
++    if (!canvas_changed && !at_time &&
++        (avpkt->pts == AV_NOPTS_VALUE || idx < 0 ||
++         s->events[idx].subtitle_pts == ctx->rendered_subtitle_pts))
++        return 0;
++
++    ctx->sub = sub;
++    ctx->avpkt = avpkt;
++    if (idx >= 0 && s->events[idx].caption.plane_width > 0 &&
++        s->events[idx].caption.plane_height > 0) {
++        ctx->plane_width = s->events[idx].caption.plane_width;
++        ctx->plane_height = s->events[idx].caption.plane_height;
++    }
++    ret = aribcaption_update_frame_size(ctx, canvas_changed, &frame_changed);
++    if (ret < 0)
++        return ret;
++    if (frame_changed)
++        ff_dlog(ctx, "canvas resized; re-rendering active bitmap caption\n");
++    if (idx < 0)
++        return 0;
++
++    h = &ctx->store.events[idx];
++    /* The renderer copies the caption; the history keeps ownership. Appending
++     * an older pts re-inserts it and invalidates the renderer's image cache. */
++    if (!aribcc_renderer_append_caption(ctx->renderer, &h->caption)) {
++        av_log(ctx, AV_LOG_ERROR,
++               "aribcc_renderer_append_caption() returned with error.\n");
++        return AVERROR_EXTERNAL;
++    }
++    ctx->pts = h->render_pts;
++    ret = aribcaption_trans_bitmap_subtitle(ctx, &h->caption, 0);
++    if (ret < 0)
++        return ret;
++    ctx->rendered_subtitle_pts = h->subtitle_pts;
++    if (ret > 0) {
++        *got_sub_ptr = 1;
++        sub->pts = h->subtitle_pts;
++        sub->start_display_time = h->start_display_time;
++        sub->end_display_time = h->end_display_time;
++        for (int i = 0; i < sub->num_rects; i++)
++            sub->rects[i]->flags |= AV_SUBTITLE_FLAG_RERENDER;
++        ff_dlog(ctx, "rerendered bitmap caption at pts=%"PRId64"\n",
++                h->render_pts);
++    }
++    return 0;
++}
++
+ static int aribcaption_decode(AVCodecContext *avctx, AVSubtitle *sub,
+                               int *got_sub_ptr, const AVPacket *avpkt)
+ {
+@@ -867,6 +1416,11 @@ static int aribcaption_decode(AVCodecCon
+         avpriv_request_sample(ctx, "Different Version of Segment asked Twice");
+         return AVERROR_PATCHWELCOME;
+     }
++    if (!avpkt->size) {
++        if (ctx->subtitle_type != SUBTITLE_BITMAP)
++            return 0;
++        return aribcaption_rerender(ctx, sub, got_sub_ptr, avpkt);
++    }
+     hex_dump_debug(ctx, avpkt->data, avpkt->size);
+ 
+     ctx->sub = sub;
+@@ -880,6 +1434,8 @@ static int aribcaption_decode(AVCodecCon
+         ctx->pts = ARIBCC_PTS_NOPTS;
+     else
+         ctx->pts = av_rescale_q(avpkt->pts, ctx->time_base, (AVRational){1, 1000});
++    if (ctx->subtitle_type == SUBTITLE_BITMAP && avpkt->pts != AV_NOPTS_VALUE)
++        aribcaption_span_note(ctx, av_rescale_q(avpkt->pts, ctx->time_base, AV_TIME_BASE_Q), 0);
+ 
+     status = aribcc_decoder_decode(ctx->decoder, avpkt->data, avpkt->size,
+                                    ctx->pts, &ctx->caption);
+@@ -913,7 +1469,7 @@ static int aribcaption_decode(AVCodecCon
+         break;
+ 
+     case SUBTITLE_BITMAP:
+-        status = aribcaption_trans_bitmap_subtitle(ctx);
++        status = aribcaption_trans_bitmap_subtitle(ctx, &ctx->caption, 1);
+         break;
+ 
+     case SUBTITLE_NONE:
+@@ -941,6 +1497,15 @@ static int aribcaption_decode(AVCodecCon
+             sub->end_display_time = UINT32_MAX;
+         else
+             sub->end_display_time = (uint32_t)ctx->caption.wait_duration;
++
++        if (ctx->subtitle_type == SUBTITLE_BITMAP) {
++            /* Clear events are kept too: they end the captions before them. */
++            int ret = aribcaption_save_history(ctx, sub->pts, sub->start_display_time,
++                                               sub->end_display_time, !sub->num_rects);
++            if (ret < 0)
++                av_log(ctx, AV_LOG_WARNING, "ARIB caption history not updated: %s\n", av_err2str(ret));
++            ctx->rendered_subtitle_pts = sub->num_rects ? sub->pts : AV_NOPTS_VALUE;
++        }
+     }
+ 
+     aribcc_caption_cleanup(&ctx->caption);
+@@ -955,6 +1520,9 @@ static void aribcaption_flush(AVCodecCon
+         aribcc_decoder_flush(ctx->decoder);
+     if (ctx->renderer)
+         aribcc_renderer_flush(ctx->renderer);
++    /* The caption history survives a flush: it is what a seek back is answered from. */
++    aribcaption_span_close(ctx);
++    ctx->rendered_subtitle_pts = AV_NOPTS_VALUE;
+     if (!(avctx->flags2 & AV_CODEC_FLAG2_RO_FLUSH_NOOP))
+         ctx->readorder = 0;
+ }
+@@ -968,6 +1536,7 @@ static av_cold int aribcaption_close(AVC
+         aribcc_renderer_free(ctx->renderer);
+         ctx->renderer = NULL;
+     }
++    aribcaption_park_history(ctx);
+     av_freep(&ctx->clut);
+     if (ctx->decoder) {
+         aribcc_decoder_free(ctx->decoder);
+@@ -988,6 +1557,10 @@ static av_cold int aribcaption_init(AVCo
+     int ret = 0;
+ 
+     ctx->avctx = avctx;
++    ctx->input_width = avctx->width;
++    ctx->input_height = avctx->height;
++    ctx->rendered_subtitle_pts = AV_NOPTS_VALUE;
++    ctx->anchor_pts = AV_NOPTS_VALUE;
+ 
+     switch (avctx->profile) {
+     case AV_PROFILE_ARIB_PROFILE_A:
+@@ -1038,13 +1611,6 @@ static av_cold int aribcaption_init(AVCo
+     aribcc_decoder_set_replace_msz_fullwidth_japanese(ctx->decoder,
+                                                       ctx->replace_msz_japanese);
+ 
+-    /* Similar behavior as ffmpeg tool to set canvas size */
+-    if (ctx->canvas_width > 0 && ctx->canvas_height > 0 &&
+-        (ctx->avctx->width == 0 || ctx->avctx->height == 0)) {
+-        ctx->avctx->width = ctx->canvas_width;
+-        ctx->avctx->height = ctx->canvas_height;
+-    }
+-
+     switch ((enum AVSubtitleType) ctx->subtitle_type) {
+     case SUBTITLE_ASS:
+         ret = set_ass_header(ctx);
+@@ -1067,19 +1633,14 @@ static av_cold int aribcaption_init(AVCo
+             av_log(avctx, AV_LOG_ERROR, "Failed to initialize libaribcaption renderer.\n");
+             return AVERROR_EXTERNAL;
+         }
+-        estimate_video_frame_size(ctx);
++        ret = aribcaption_update_frame_size(ctx, 1, NULL);
++        if (ret < 0)
++            return ret;
+         ff_dlog(ctx, "canvas: %dx%d  plane: %dx%d  bitmap: %dx%d  frame: %dx%d\n",
+                 ctx->avctx->width, ctx->avctx->height,
+                 ctx->plane_width, ctx->plane_height,
+                 ctx->bitmap_plane_width, ctx->bitmap_plane_height,
+                 ctx->frame_width, ctx->frame_height);
+-        if (!aribcc_renderer_set_frame_size(ctx->renderer,
+-                                            ctx->frame_width, ctx->frame_height)) {
+-            av_log(ctx, AV_LOG_ERROR,
+-                   "aribcc_renderer_set_frame_size() returned with error.\n");
+-            return AVERROR_EXTERNAL;
+-        }
+-
+         if (!(ctx->clut = av_mallocz(AVPALETTE_SIZE)))
+             return AVERROR(ENOMEM);
+ 
+@@ -1130,6 +1691,14 @@ static av_cold int aribcaption_init(AVCo
+ 
+     ctx->readorder = 0;
+ 
++    if (ctx->subtitle_type == SUBTITLE_BITMAP) {
++        ctx->time_base = avctx->pkt_timebase;
++        if (ctx->time_base.num <= 0 || ctx->time_base.den <= 0)
++            ctx->time_base = av_make_q(1, 90000);
++        ctx->history_sig = aribcaption_history_signature(ctx);
++        aribcaption_adopt_history(ctx);
++    }
++
+     return 0;
+ }
+ 
+@@ -1183,7 +1752,8 @@ static const AVOption options[] = {
+     { "replace_msz_glyph", "replace MSZ characters with halfwidth glyphs [bitmap]",
+       OFFSET(replace_msz_glyph), AV_OPT_TYPE_BOOL, { .i64 = 1 }, 0, 1, SD },
+     {"canvas_size", "set input video size (WxH or abbreviation) [bitmap]",
+-      OFFSET(canvas_width), AV_OPT_TYPE_IMAGE_SIZE, { .str = NULL }, 0, INT_MAX, SD },
++      OFFSET(canvas_width), AV_OPT_TYPE_IMAGE_SIZE, { .str = NULL }, 0, INT_MAX,
++      SD | AV_OPT_FLAG_RUNTIME_PARAM },
+     { "caption_type", "ARIB caption type",
+       OFFSET(caption_type), AV_OPT_TYPE_INT,
+       { .i64 = ARIBCC_CAPTIONTYPE_CAPTION },
+@@ -1193,6 +1763,22 @@ static const AVOption options[] = {
+       { .i64 = ARIBCC_CAPTIONTYPE_CAPTION }, .flags = SD, .unit = "caption_type" },
+     { "superimpose", "superimpose service", 0, AV_OPT_TYPE_CONST,
+       { .i64 = ARIBCC_CAPTIONTYPE_SUPERIMPOSE }, .flags = SD, .unit = "caption_type" },
++    { "history_key", "media identity: the caption history of a closed decoder with the same key is reused [bitmap]",
++      OFFSET(history_key), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, SD },
++    { "history_window", "seconds of caption history kept around the decode position [bitmap]",
++      OFFSET(history_window), AV_OPT_TYPE_INT, { .i64 = ARIBC_HISTORY_WINDOW_DEFAULT }, 1, 3600, SD },
++    { "history_max_bytes", "memory budget of the caption history [bitmap]",
++      OFFSET(history_max_bytes), AV_OPT_TYPE_INT64, { .i64 = ARIBC_HISTORY_MAX_BYTES_DEFAULT },
++      0, INT64_MAX, SD },
++    { "history_bytes", "bytes held by the caption history",
++      OFFSET(history_bytes), AV_OPT_TYPE_INT64, { .i64 = 0 }, 0, INT64_MAX,
++      SD | AV_OPT_FLAG_EXPORT | AV_OPT_FLAG_READONLY },
++    { "history_events", "caption and clear events held by the caption history",
++      OFFSET(history_count), AV_OPT_TYPE_INT64, { .i64 = 0 }, 0, INT64_MAX,
++      SD | AV_OPT_FLAG_EXPORT | AV_OPT_FLAG_READONLY },
++    { "history_appended_bytes", "bytes of all events recorded into the caption history so far",
++      OFFSET(history_appended_bytes), AV_OPT_TYPE_INT64, { .i64 = 0 }, 0, INT64_MAX,
++      SD | AV_OPT_FLAG_EXPORT | AV_OPT_FLAG_READONLY },
+     { NULL }
+ };
+ 
+@@ -1209,6 +1795,7 @@ const FFCodec ff_libaribcaption_decoder
+     .p.type         = AVMEDIA_TYPE_SUBTITLE,
+     .p.id           = AV_CODEC_ID_ARIB_CAPTION,
+     .priv_data_size = sizeof(ARIBCaptionContext),
++    .p.capabilities = AV_CODEC_CAP_DELAY,
+     .init           = aribcaption_init,
+     .close          = aribcaption_close,
+     FF_CODEC_DECODE_SUB_CB(aribcaption_decode),

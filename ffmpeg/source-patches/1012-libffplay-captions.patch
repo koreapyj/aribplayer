@@ -1,0 +1,4363 @@
+--- a/fftools/ffplay.c
++++ b/fftools/ffplay.c
+@@ -44,6 +44,7 @@
+ #include "libavutil/mathematics.h"
+ #include "libavutil/mem.h"
+ #include "libavutil/pixdesc.h"
++#include "libavutil/pixfmt.h"
+ #include "libavutil/dict.h"
+ #include "libavutil/fifo.h"
+ #include "libavutil/parseutils.h"
+@@ -76,6 +77,7 @@
+ #  endif
+ #  define NOGDI
+ #  include <windows.h>
++#  include <sys/stat.h>
+ #  include <dxgi.h>
+ #endif
+ #if CONFIG_FFNVCODEC
+@@ -156,6 +158,8 @@ typedef struct PacketQueue {
+     int64_t duration;
+     int abort_request;
+     int serial;
++    int stream_index; /* active audio/video stream, protected by mutex */
++    int eof_packet_sent;
+     SDL_mutex *mutex;
+     SDL_cond *cond;
+ } PacketQueue;
+@@ -202,6 +206,9 @@ typedef struct Frame {
+     int uploaded;
+     int flip_v;
+     int snapped;
++    int subtitle_rerender;
++    uint64_t subtitle_rerender_generation;
++    uint64_t subtitle_rerender_decode_generation;
+ } Frame;
+ 
+ typedef struct FrameQueue {
+@@ -223,6 +230,8 @@ enum {
+     AV_SYNC_EXTERNAL_CLOCK, /* synchronize to an external clock */
+ };
+ 
++typedef struct SubtitleLayer SubtitleLayer;
++
+ typedef struct Decoder {
+     AVPacket *pkt;
+     PacketQueue *queue;
+@@ -238,8 +247,107 @@ typedef struct Decoder {
+     SDL_Thread *decoder_tid;
+     int reorder_pts;
+     struct VideoState *vs;          /* video decoder: reports a removed GPU device */
++    SubtitleLayer *subtitle_layer;
++    int subtitle_rerender;
++    uint64_t subtitle_rerender_generation;
++    uint64_t subtitle_rerender_decode_generation;
++    int64_t subtitle_packet_pts;
++    int subtitle_attime;                  /* the packet in hand asks for the cue active at its pts */
++    int subtitle_attime_serial;
++    int subtitle_context_owned_by_thread; /* ARIB: subtitle_thread creates and frees avctx */
+ } Decoder;
+ 
++struct SubtitleLayer {
++    struct VideoState *is;
++    int id;
++    PacketQueue packets;
++    FrameQueue frames;
++    Decoder decoder;
++    AVStream *st;
++    int stream_index;
++    SDL_atomic_t routing_stream_index; /* read_thread route, independent of decoder readiness */
++    int is_arib;
++    int visible;
++    AVSubtitle active;
++    int active_valid;
++    int active_counted_shown;
++    int active_serial;
++    int active_width, active_height;
++    double active_start, active_end;
++    uint64_t generation, active_generation, texture_generation;
++    uint64_t cue_decode_generation;       /* decode-thread generation, protected by dbg_mutex */
++    uint64_t d3d_generation;
++    int texture_width, texture_height;
++    int d3d_canvas_width, d3d_canvas_height, d3d_rect_count, d3d_visible;
++    int resize_requested_width, resize_requested_height;
++    int canvas_width, canvas_height;
++    int resize_candidate_width, resize_candidate_height;
++    int64_t resize_candidate_since;
++    int64_t resize_requested_at;        /* when the last resize request was queued (retry if it was never applied) */
++    int64_t re_renders;
++    /* A re-rendered bitmap for the displayed cue. It bypasses the frame queue, where cues decoded
++     * ahead of playback would hold it back until it is stale. Protected by is->dbg_mutex. */
++    AVSubtitle pending_rerender;
++    int pending_rerender_valid, pending_rerender_serial;
++    int pending_rerender_width, pending_rerender_height;
++    uint64_t pending_rerender_generation;
++    /* The cue active at the landing point of a seek or open, read back from the decoder's history. It
++     * bypasses the frame queue like pending_rerender and only fills an empty screen: any cue the queue
++     * applied for the serial is newer. Protected by is->dbg_mutex. */
++    AVSubtitle pending_attime;
++    int pending_attime_valid, pending_attime_serial;
++    int pending_attime_width, pending_attime_height;
++    int attime_requested_serial;   /* packet serial the history was asked about, -1: none */
++    int event_serial;              /* packet serial of the last cue or clear applied from the queue */
++    SDL_atomic_t attime_applied;   /* cues put on screen from the decoder's history */
++    SDL_atomic_t cues_shown, cues_cleared, cues_uploaded;
++    SDL_Texture *texture;
++    const AVCodec *startup_codec;
++    const AVCodecParameters *startup_codecpar;
++    int startup_stream_index;
++    AVRational startup_pkt_timebase;
++    AVDictionary *startup_opts; /* transferred to subtitle_thread with the ARIB startup request */
++    int startup_lowres;
++    int startup_fast;
++    SDL_sem *startup_sem;
++    SDL_sem *startup_release_sem;
++    int startup_result;
++};
++
++#define FFP_SUBTITLE_RESIZE_MAGIC 0x46535052u
++typedef struct FFPSubtitleResizeRequest {
++    uint32_t magic;
++    int width, height;
++    uint64_t base_generation;
++    uint64_t base_decode_generation;
++} FFPSubtitleResizeRequest;
++
++#define FFP_SUBTITLE_ATTIME_MAGIC 0x46534154u
++typedef struct FFPSubtitleAtTimeRequest {
++    uint32_t magic;
++    int serial;     /* packet serial the request was made for; a stale one is dropped */
++} FFPSubtitleAtTimeRequest;
++
++#define FFP_SUBTITLE_SNAPSHOT_MAGIC 0x4653534eu
++#define FFP_SUBTITLE_SNAPSHOT_TIMEOUT_MS 1500
++typedef struct FFPSubtitleSnapshotRequest {
++    uint32_t magic;
++    int width, height;
++    int serial;
++    int stream_index;
++    uint64_t base_generation;
++    uint64_t base_decode_generation;
++    int64_t expected_pts;
++    uint32_t expected_start_display_time;
++    uint32_t expected_end_display_time;
++    SDL_mutex *mutex;
++    SDL_cond *cond;
++    int refs;
++    int done;
++    int result;
++    AVSubtitle rendered;
++} FFPSubtitleSnapshotRequest;
++
+ enum ShowMode {
+     SHOW_MODE_NONE = -1, SHOW_MODE_VIDEO = 0, SHOW_MODE_WAVES, SHOW_MODE_RDFT, SHOW_MODE_NB
+ };
+@@ -263,6 +371,8 @@ typedef struct FFPOptions {
+     int loop, framedrop, infinite_buffer;
+     enum ShowMode show_mode;
+     char *audio_codec_name, *subtitle_codec_name, *video_codec_name;
++    char *arib_font;
++    int superimpose, arib_ignore_background, arib_force_outline;
+     double rdftspeed;
+     int autorotate, find_stream_info, filter_nbthreads, enable_vulkan;
+     char *vulkan_params, *hwaccel;
+@@ -303,7 +413,22 @@ typedef struct FFPFpsMeter {
+     int64_t total;
+ } FFPFpsMeter;
+ 
++typedef struct FFPDebugSubtitle {
++    int open, stream_index, is_arib;
++    int ignore_background, force_outline;
++    int canvas_width, canvas_height, active_rects;
++    int active_width, active_height;    /* canvas the displayed bitmap was rendered for */
++    AVRational time_base;
++    double stream_start, active_start, active_end;
++    uint64_t re_renders;
++    char codec[64], decoder[64], font[512], caption_type[16];
++    int cues_shown, cues_cleared, cues_uploaded;
++    int64_t history_bytes, history_events, history_appended_bytes;   /* ARIB caption history of the decoder */
++    int history_landed;                                              /* cues shown from it at a seek or open */
++} FFPDebugSubtitle;
++
+ typedef struct FFPDebug {
++    FFPDebugSubtitle subtitles[FFP_SUBTITLE_LAYER_COUNT];
+     AVRational v_avg_fr, v_r_fr;
+     AVRational v_flt_fr, v_flt_tb;
+     int v_flt_valid;
+@@ -366,12 +491,11 @@ typedef struct VideoState {
+     Clock extclk;
+ 
+     FrameQueue pictq;
+-    FrameQueue subpq;
+     FrameQueue sampq;
++    SubtitleLayer subtitles[FFP_SUBTITLE_LAYER_COUNT];
+ 
+     Decoder auddec;
+     Decoder viddec;
+-    Decoder subdec;
+ 
+     int audio_stream;
+ 
+@@ -415,10 +539,6 @@ typedef struct VideoState {
+     SDL_Texture *sub_texture;
+     SDL_Texture *vid_texture;
+ 
+-    int subtitle_stream;
+-    AVStream *subtitle_st;
+-    PacketQueue subtitleq;
+-
+     double frame_timer;
+     double frame_last_returned_time;
+     double frame_last_filter_delay;
+@@ -427,7 +547,8 @@ typedef struct VideoState {
+     PacketQueue videoq;
+     double max_frame_duration;      // maximum duration of a frame - above this, we consider the jump a timestamp discontinuity
+     struct SwsContext *sub_convert_ctx;
+-    int eof;
++    struct SwsContext *subtitle_rgba_ctx;
++    SDL_atomic_t eof;
+ 
+     char *filename;
+     int width, height, xleft, ytop;
+@@ -479,6 +600,8 @@ typedef struct VideoState {
+ #define FFP_CMD_PAUSE    4   /* i: 1 pause, 0 play, -1 toggle */
+ #define FFP_CMD_SEEK     5   /* d: seconds, i: FFP_SEEK_* */
+ #define FFP_CMD_CYCLE    6   /* i: media type */
++#define FFP_CMD_SUB_VISIBLE 7  /* i: subtitle layer, d: visible */
++#define FFP_CMD_REFRESH_CAPTION_STYLE 8 /* i: ignore_background | (force_outline << 1) */
+ 
+ typedef struct FFPCmd {
+     struct FFPCmd *next;
+@@ -534,6 +657,7 @@ struct FFPlayer {
+     char *vfilter, *afilter;
+     SDL_atomic_t vfilter_gen, afilter_gen;
+     SDL_atomic_t volume, muted;
++    SDL_atomic_t subtitle_visible[FFP_SUBTITLE_LAYER_COUNT];
+     double position, duration;      /* mirrors for ffp_get_position/duration */
+     char *media_info;
+     int state;
+@@ -566,6 +690,16 @@ struct FFPlayer {
+     int64_t starve_since;
+ 
+     AVFrame *last_frame;            /* last displayed frame, for snapshots (snap_mutex) */
++    VideoState *snap_is;            /* media matching last_frame, guarded by snap_mutex */
++    AVSubtitle last_subtitles[FFP_SUBTITLE_LAYER_COUNT];
++    int last_subtitle_width[FFP_SUBTITLE_LAYER_COUNT];
++    int last_subtitle_height[FFP_SUBTITLE_LAYER_COUNT];
++    int last_subtitle_visible[FFP_SUBTITLE_LAYER_COUNT];
++    int last_subtitle_is_arib[FFP_SUBTITLE_LAYER_COUNT];
++    int last_subtitle_serial[FFP_SUBTITLE_LAYER_COUNT];
++    int last_subtitle_stream_index[FFP_SUBTITLE_LAYER_COUNT];
++    uint64_t last_subtitle_generation[FFP_SUBTITLE_LAYER_COUNT];
++    uint64_t last_subtitle_decode_generation[FFP_SUBTITLE_LAYER_COUNT];
+ 
+     const FFPPresenterOps *pres_ops;        /* loop thread; the SDL ops unless a presenter was set up for the open */
+     FFPPresParams pparams;                  /* presenter parameters (mutex), persist across opens */
+@@ -640,6 +774,7 @@ static void ffp_opts_defaults(FFPOptions
+     o->framedrop = -1;
+     o->infinite_buffer = -1;
+     o->show_mode = SHOW_MODE_NONE;
++    o->superimpose = 1;
+     o->rdftspeed = 0.02;
+     o->autorotate = 1;
+     o->find_stream_info = 1;
+@@ -656,6 +791,7 @@ static void ffp_opts_free(FFPOptions *o)
+     av_freep(&o->audio_codec_name);
+     av_freep(&o->subtitle_codec_name);
+     av_freep(&o->video_codec_name);
++    av_freep(&o->arib_font);
+     av_freep(&o->vulkan_params);
+     av_freep(&o->video_background);
+     av_freep(&o->hwaccel);
+@@ -1141,9 +1277,13 @@ static void ffp_clear_filter_cmds(FFPlay
+     SDL_UnlockMutex(ffp->mutex);
+ }
+ 
+-static void ffp_store_snapshot(FFPlayer *ffp, const Frame *vp)
++static int ffp_subtitle_copy(AVSubtitle *dst, const AVSubtitle *src);
++
++static void ffp_store_snapshot(FFPlayer *ffp, VideoState *is, const Frame *vp)
+ {
++    int i;
+     SDL_LockMutex(ffp->snap_mutex);
++    ffp->snap_is = is;
+     if (!ffp->last_frame)
+         ffp->last_frame = av_frame_alloc();
+     if (ffp->last_frame) {
+@@ -1151,9 +1291,90 @@ static void ffp_store_snapshot(FFPlayer
+         if (av_frame_ref(ffp->last_frame, vp->frame) < 0)
+             av_frame_unref(ffp->last_frame);
+     }
++    for (i = 0; i < FFP_SUBTITLE_LAYER_COUNT; i++) {
++        SubtitleLayer *layer = &is->subtitles[i];
++        avsubtitle_free(&ffp->last_subtitles[i]);
++        ffp->last_subtitle_width[i] = ffp->last_subtitle_height[i] = 0;
++        ffp->last_subtitle_visible[i] = i != FFP_SUBTITLE_SUPERIMPOSE || is->o->superimpose;
++        ffp->last_subtitle_is_arib[i] = layer->is_arib;
++        ffp->last_subtitle_stream_index[i] = layer->stream_index;
++        ffp->last_subtitle_generation[i] = layer->generation;
++        SDL_LockMutex(layer->packets.mutex);
++        ffp->last_subtitle_serial[i] = layer->packets.serial;
++        SDL_UnlockMutex(layer->packets.mutex);
++        SDL_LockMutex(is->dbg_mutex);
++        ffp->last_subtitle_decode_generation[i] = layer->cue_decode_generation;
++        SDL_UnlockMutex(is->dbg_mutex);
++        if (layer->active_valid && layer->active.num_rects > 0 &&
++            ffp_subtitle_copy(&ffp->last_subtitles[i], &layer->active) >= 0) {
++            ffp->last_subtitle_width[i] = layer->active_width;
++            ffp->last_subtitle_height[i] = layer->active_height;
++        }
++    }
+     SDL_UnlockMutex(ffp->snap_mutex);
+ }
+ 
++static int ffp_subtitle_copy(AVSubtitle *dst, const AVSubtitle *src)
++{
++    AVSubtitle copy;
++    int i, row;
++
++    if (!dst || !src)
++        return AVERROR(EINVAL);
++    avsubtitle_free(dst);
++    copy = *src;
++    copy.rects = NULL;
++    copy.num_rects = 0;
++    if (src->num_rects) {
++        copy.rects = av_calloc(src->num_rects, sizeof(*copy.rects));
++        if (!copy.rects)
++            return AVERROR(ENOMEM);
++    }
++    for (i = 0; i < src->num_rects; i++) {
++        const AVSubtitleRect *from = src->rects[i];
++        AVSubtitleRect *to;
++        int stride, height;
++        size_t bytes;
++
++        if (!from)
++            goto fail;
++        to = av_mallocz(sizeof(*to));
++        if (!to)
++            goto fail;
++        *to = *from;
++        memset(to->data, 0, sizeof(to->data));
++        to->text = NULL;
++        to->ass = NULL;
++        copy.rects[i] = to;
++        copy.num_rects++;
++
++        if (from->data[0]) {
++            stride = FFABS(from->linesize[0]);
++            height = FFMAX(from->h, 0);
++            if (!stride || !height || from->w > stride || av_size_mult(stride, height, &bytes) < 0)
++                goto fail;
++            to->data[0] = av_mallocz(bytes);
++            if (!to->data[0])
++                goto fail;
++            to->linesize[0] = stride;
++            for (row = 0; row < height; row++)
++                memcpy(to->data[0] + (size_t)row * stride,
++                       from->data[0] + row * from->linesize[0], FFMIN(from->w, stride));
++        }
++        if (from->data[1]) {
++            to->data[1] = av_memdup(from->data[1], AVPALETTE_SIZE);
++            if (!to->data[1])
++                goto fail;
++        }
++    }
++    *dst = copy;
++    return 0;
++
++fail:
++    avsubtitle_free(&copy);
++    return AVERROR(ENOMEM);
++}
++
+ static inline
+ int cmp_audio_fmts(enum AVSampleFormat fmt1, int64_t channel_count1,
+                    enum AVSampleFormat fmt2, int64_t channel_count2)
+@@ -1234,6 +1455,7 @@ static int packet_queue_init(PacketQueue
+         return AVERROR(ENOMEM);
+     }
+     q->abort_request = 1;
++    q->stream_index = -1;
+     return 0;
+ }
+ 
+@@ -1248,6 +1470,7 @@ static void packet_queue_flush(PacketQue
+     q->size = 0;
+     q->duration = 0;
+     q->serial++;
++    q->eof_packet_sent = 0;
+     SDL_UnlockMutex(q->mutex);
+ }
+ 
+@@ -1263,6 +1486,7 @@ static void packet_queue_abort(PacketQue
+ {
+     SDL_LockMutex(q->mutex);
+ 
++    q->stream_index = -1;
+     q->abort_request = 1;
+ 
+     SDL_CondSignal(q->cond);
+@@ -1270,12 +1494,133 @@ static void packet_queue_abort(PacketQue
+     SDL_UnlockMutex(q->mutex);
+ }
+ 
+-static void packet_queue_start(PacketQueue *q)
++static void packet_queue_start(PacketQueue *q, int stream_index)
+ {
+     SDL_LockMutex(q->mutex);
+     q->abort_request = 0;
+     q->serial++;
++    q->stream_index = stream_index;
++    q->eof_packet_sent = 0;
++    SDL_UnlockMutex(q->mutex);
++}
++
++static void packet_queue_start_routed(PacketQueue *q, SDL_atomic_t *routing_stream_index,
++                                      int stream_index)
++{
++    SDL_LockMutex(q->mutex);
++    q->abort_request = 0;
++    q->serial++;
++    q->eof_packet_sent = 0;
++    SDL_AtomicSet(routing_stream_index, stream_index);
++    SDL_UnlockMutex(q->mutex);
++}
++
++static void packet_queue_abort_routed(PacketQueue *q, SDL_atomic_t *routing_stream_index)
++{
++    SDL_LockMutex(q->mutex);
++    SDL_AtomicSet(routing_stream_index, -1);
++    q->abort_request = 1;
++    SDL_CondSignal(q->cond);
++    SDL_UnlockMutex(q->mutex);
++}
++
++static void packet_queue_route_snapshot(PacketQueue *q, SDL_atomic_t *routing_stream_index,
++                                        int *stream_index, int *serial)
++{
++    SDL_LockMutex(q->mutex);
++    *stream_index = SDL_AtomicGet(routing_stream_index);
++    *serial = q->serial;
++    SDL_UnlockMutex(q->mutex);
++}
++
++static void packet_queue_av_snapshot(PacketQueue *q, int *stream_index, int *serial)
++{
++    SDL_LockMutex(q->mutex);
++    *stream_index = q->abort_request ? -1 : q->stream_index;
++    *serial = q->serial;
++    SDL_UnlockMutex(q->mutex);
++}
++
++static int packet_queue_put_av_nullpacket(PacketQueue *q, int stream_index, int serial)
++{
++    AVPacket *pkt = NULL;
++    int ret = 0;
++
++    SDL_LockMutex(q->mutex);
++    if (stream_index >= 0 && !q->abort_request && q->serial == serial &&
++        q->stream_index == stream_index && !q->eof_packet_sent) {
++        pkt = av_packet_alloc();
++        if (!pkt) {
++            ret = AVERROR(ENOMEM);
++        } else {
++            pkt->stream_index = stream_index;
++            ret = packet_queue_put_private(q, pkt);
++            if (ret >= 0) {
++                pkt = NULL;
++                q->eof_packet_sent = 1;
++            }
++        }
++    }
++    SDL_UnlockMutex(q->mutex);
++
++    av_packet_free(&pkt);
++    return ret;
++}
++
++static int packet_queue_put_routed(PacketQueue *q, SDL_atomic_t *routing_stream_index,
++                                   int stream_index, int serial, AVPacket *pkt)
++{
++    AVPacket *pkt1 = av_packet_alloc();
++    int ret = 0;
++    int queued = 0;
++
++    if (!pkt1) {
++        av_packet_unref(pkt);
++        return AVERROR(ENOMEM);
++    }
++
++    SDL_LockMutex(q->mutex);
++    if (!q->abort_request && q->serial == serial &&
++        SDL_AtomicGet(routing_stream_index) == stream_index) {
++        av_packet_move_ref(pkt1, pkt);
++        ret = packet_queue_put_private(q, pkt1);
++        if (ret >= 0) {
++            pkt1 = NULL;
++            queued = 1;
++        }
++    }
+     SDL_UnlockMutex(q->mutex);
++
++    av_packet_free(&pkt1);
++    return ret < 0 ? ret : queued;
++}
++
++static int packet_queue_put_routed_nullpacket(PacketQueue *q, SDL_atomic_t *routing_stream_index,
++                                              int stream_index, int serial, AVPacket *pkt)
++{
++    AVPacket *pkt1 = NULL;
++    int ret = 0;
++
++    SDL_LockMutex(q->mutex);
++    if (!q->abort_request && q->serial == serial &&
++        SDL_AtomicGet(routing_stream_index) == stream_index && !q->eof_packet_sent) {
++        pkt1 = av_packet_alloc();
++        if (!pkt1) {
++            ret = AVERROR(ENOMEM);
++        } else {
++            pkt->stream_index = stream_index;
++            av_packet_move_ref(pkt1, pkt);
++            ret = packet_queue_put_private(q, pkt1);
++            if (ret >= 0) {
++                pkt1 = NULL;
++                q->eof_packet_sent = 1;
++            }
++        }
++    }
++    SDL_UnlockMutex(q->mutex);
++
++    av_packet_free(&pkt1);
++    return ret;
+ }
+ 
+ /* return < 0 if aborted, 0 if no packet and > 0 if packet.  */
+@@ -1326,6 +1671,377 @@ static int decoder_init(Decoder *d, AVCo
+     return 0;
+ }
+ 
++static void decoder_subtitle_resize(Decoder *d)
++{
++    SubtitleLayer *layer = d->subtitle_layer;
++    FFPSubtitleResizeRequest *request;
++    char size[48];
++    int ret;
++
++    d->subtitle_rerender = 0;
++    d->subtitle_rerender_generation = 0;
++    d->subtitle_rerender_decode_generation = 0;
++    d->subtitle_attime = 0;
++    if (!layer || !d->pkt->opaque_ref)
++        return;
++    if (d->pkt->opaque_ref->size >= sizeof(FFPSubtitleAtTimeRequest) &&
++        ((FFPSubtitleAtTimeRequest *)d->pkt->opaque_ref->data)->magic == FFP_SUBTITLE_ATTIME_MAGIC) {
++        d->subtitle_attime = 1;
++        d->subtitle_attime_serial = ((FFPSubtitleAtTimeRequest *)d->pkt->opaque_ref->data)->serial;
++        return;
++    }
++    if (d->pkt->opaque_ref->size < sizeof(*request))
++        return;
++    request = (FFPSubtitleResizeRequest *)d->pkt->opaque_ref->data;
++    if (request->magic != FFP_SUBTITLE_RESIZE_MAGIC)
++        return;
++
++    snprintf(size, sizeof(size), "%dx%d", request->width, request->height);
++    ret = av_opt_set(d->avctx->priv_data, "canvas_size", size, 0);
++    if (ret < 0) {
++        av_log(d->avctx, AV_LOG_WARNING, "could not resize ARIB subtitle canvas to %s: %s\n",
++               size, av_err2str(ret));
++        return;
++    }
++    SDL_LockMutex(layer->is->dbg_mutex);
++    layer->canvas_width = request->width;
++    layer->canvas_height = request->height;
++    layer->re_renders++;
++    layer->is->dbg.subtitles[layer->id].canvas_width = request->width;
++    layer->is->dbg.subtitles[layer->id].canvas_height = request->height;
++    layer->is->dbg.subtitles[layer->id].re_renders = layer->re_renders;
++    SDL_UnlockMutex(layer->is->dbg_mutex);
++    d->subtitle_rerender = 1;
++    d->subtitle_rerender_generation = request->base_generation;
++    d->subtitle_rerender_decode_generation = request->base_decode_generation;
++}
++
++static void ffp_subtitle_snapshot_request_free(FFPSubtitleSnapshotRequest *request)
++{
++    avsubtitle_free(&request->rendered);
++    SDL_DestroyCond(request->cond);
++    SDL_DestroyMutex(request->mutex);
++    av_free(request);
++}
++
++static void ffp_subtitle_snapshot_request_unref(FFPSubtitleSnapshotRequest *request)
++{
++    int free_request;
++
++    SDL_LockMutex(request->mutex);
++    free_request = --request->refs == 0;
++    SDL_UnlockMutex(request->mutex);
++    if (free_request)
++        ffp_subtitle_snapshot_request_free(request);
++}
++
++static void ffp_subtitle_snapshot_packet_free(void *opaque, uint8_t *data)
++{
++    FFPSubtitleSnapshotRequest *request = opaque;
++
++    (void)data;
++    SDL_LockMutex(request->mutex);
++    if (!request->done) {
++        request->result = AVERROR_EXIT;
++        request->done = 1;
++        SDL_CondSignal(request->cond);
++    }
++    SDL_UnlockMutex(request->mutex);
++    ffp_subtitle_snapshot_request_unref(request);
++}
++
++static void ffp_subtitle_snapshot_complete(FFPSubtitleSnapshotRequest *request,
++                                           int result, AVSubtitle *rendered)
++{
++    SDL_LockMutex(request->mutex);
++    if (!request->done) {
++        if (result >= 0 && rendered) {
++            request->rendered = *rendered;
++            memset(rendered, 0, sizeof(*rendered));
++        }
++        request->result = result;
++        request->done = 1;
++        SDL_CondSignal(request->cond);
++    }
++    SDL_UnlockMutex(request->mutex);
++}
++
++static FFPSubtitleSnapshotRequest *ffp_subtitle_snapshot_request_from_packet(const AVPacket *pkt)
++{
++    FFPSubtitleSnapshotRequest *request;
++
++    if (!pkt || !pkt->opaque_ref || pkt->opaque_ref->size < sizeof(*request))
++        return NULL;
++    request = (FFPSubtitleSnapshotRequest *)pkt->opaque_ref->data;
++    return request->magic == FFP_SUBTITLE_SNAPSHOT_MAGIC ? request : NULL;
++}
++
++static int ffp_subtitle_snapshot_matches(const AVSubtitle *subtitle,
++                                        const FFPSubtitleSnapshotRequest *request)
++{
++    int i;
++
++    if (!subtitle || subtitle->format != 0 || !subtitle->num_rects ||
++        subtitle->pts != request->expected_pts ||
++        subtitle->start_display_time != request->expected_start_display_time ||
++        subtitle->end_display_time != request->expected_end_display_time)
++        return 0;
++    for (i = 0; i < subtitle->num_rects; i++) {
++        const AVSubtitleRect *rect = subtitle->rects[i];
++        if (!rect || !(rect->flags & AV_SUBTITLE_FLAG_RERENDER))
++            return 0;
++    }
++    return 1;
++}
++
++static int ffp_subtitle_snapshot_state_matches(SubtitleLayer *layer,
++                                               const FFPSubtitleSnapshotRequest *request)
++{
++    int serial;
++    uint64_t decode_generation;
++
++    SDL_LockMutex(layer->packets.mutex);
++    serial = layer->packets.serial;
++    SDL_UnlockMutex(layer->packets.mutex);
++    SDL_LockMutex(layer->is->dbg_mutex);
++    decode_generation = layer->cue_decode_generation;
++    SDL_UnlockMutex(layer->is->dbg_mutex);
++
++    return serial == request->serial && decode_generation == request->base_decode_generation;
++}
++
++static int decoder_subtitle_snapshot_set_canvas(Decoder *d, int width, int height)
++{
++    char size[48];
++
++    snprintf(size, sizeof(size), "%dx%d", width, height);
++    return av_opt_set(d->avctx->priv_data, "canvas_size", size, 0);
++}
++
++static void decoder_subtitle_snapshot_count(SubtitleLayer *layer)
++{
++    SDL_LockMutex(layer->is->dbg_mutex);
++    layer->re_renders++;
++    layer->is->dbg.subtitles[layer->id].re_renders = layer->re_renders;
++    SDL_UnlockMutex(layer->is->dbg_mutex);
++}
++
++/* Runs only on the subtitle decoder thread. The temporary results stay private: neither the playback cue
++ * queue nor its PTS/generation state is changed, and the original decoder canvas is always restored. */
++static void decoder_subtitle_snapshot(Decoder *d, FFPSubtitleSnapshotRequest *request)
++{
++    SubtitleLayer *layer = d->subtitle_layer;
++    AVPacket empty_pkt = { 0 };
++    AVSubtitle rendered = { 0 };
++    AVSubtitle restored = { 0 };
++    int old_width, old_height;
++    int got_rendered = 0, got_restored = 0;
++    int ret, restore_ret, exact_ok = 0, restore_ok = 0;
++
++    empty_pkt.pts = empty_pkt.dts = AV_NOPTS_VALUE;
++    /* Name the requested cue so the codec re-renders exactly that one (inverse of sub.pts derivation). */
++    if (request->expected_pts != AV_NOPTS_VALUE &&
++        d->avctx->pkt_timebase.num > 0 && d->avctx->pkt_timebase.den > 0)
++        empty_pkt.pts = av_rescale_q(request->expected_pts, AV_TIME_BASE_Q, d->avctx->pkt_timebase);
++    if (!layer || !layer->is_arib || request->stream_index != layer->stream_index ||
++        d->pkt_serial != request->serial ||
++        !ffp_subtitle_snapshot_state_matches(layer, request)) {
++        ret = AVERROR(EAGAIN);
++        goto done;
++    }
++
++    SDL_LockMutex(layer->is->dbg_mutex);
++    old_width = layer->canvas_width;
++    old_height = layer->canvas_height;
++    SDL_UnlockMutex(layer->is->dbg_mutex);
++    if (old_width <= 0 || old_height <= 0 || request->width <= 0 || request->height <= 0) {
++        ret = AVERROR(EINVAL);
++        goto done;
++    }
++
++    if (old_width == request->width && old_height == request->height) {
++        AVSubtitle intermediate = { 0 };
++        int got_intermediate = 0;
++        int temporary_width = request->width < INT_MAX ? request->width + 1 : request->width - 1;
++
++        /* Force the runtime path to produce a fresh bitmap even if a resize request already moved the
++         * decoder to this size but its replacement has not reached the playback cue model yet. */
++        ret = decoder_subtitle_snapshot_set_canvas(d, temporary_width, request->height);
++        if (ret < 0) {
++            AVSubtitle retry = { 0 };
++            int got_retry = 0;
++            restore_ret = decoder_subtitle_snapshot_set_canvas(d, old_width, old_height);
++            if (restore_ret >= 0) {
++                decoder_subtitle_snapshot_count(layer);
++                avcodec_decode_subtitle2(d->avctx, &retry, &got_retry, &empty_pkt);
++            }
++            avsubtitle_free(&retry);
++            goto done;
++        }
++        decoder_subtitle_snapshot_count(layer);
++        ret = avcodec_decode_subtitle2(d->avctx, &intermediate, &got_intermediate, &empty_pkt);
++        avsubtitle_free(&intermediate);
++
++        restore_ret = decoder_subtitle_snapshot_set_canvas(d, old_width, old_height);
++        if (restore_ret < 0) {
++            av_log(d->avctx, AV_LOG_ERROR, "could not restore ARIB subtitle canvas to %dx%d after snapshot: %s\n",
++                   old_width, old_height, av_err2str(restore_ret));
++            ret = restore_ret;
++            goto snapshot_done;
++        }
++        decoder_subtitle_snapshot_count(layer);
++        ret = avcodec_decode_subtitle2(d->avctx, &rendered, &got_rendered, &empty_pkt);
++        if (ret >= 0) {
++            restore_ok = 1;
++            if (got_rendered && ffp_subtitle_snapshot_matches(&rendered, request))
++                exact_ok = 1;
++        } else {
++            AVSubtitle retry = { 0 };
++            int got_retry = 0;
++            av_log(d->avctx, AV_LOG_WARNING, "ARIB snapshot rerender at the live canvas failed: %s\n",
++                   av_err2str(ret));
++            avsubtitle_free(&rendered);
++            restore_ret = avcodec_decode_subtitle2(d->avctx, &retry, &got_retry, &empty_pkt);
++            if (restore_ret >= 0)
++                restore_ok = 1;
++            avsubtitle_free(&retry);
++        }
++        goto snapshot_done;
++    }
++
++    ret = decoder_subtitle_snapshot_set_canvas(d, request->width, request->height);
++    if (ret < 0) {
++        av_log(d->avctx, AV_LOG_WARNING, "could not set ARIB snapshot canvas to %dx%d: %s\n",
++               request->width, request->height, av_err2str(ret));
++        goto done;
++    }
++    decoder_subtitle_snapshot_count(layer);
++    ret = avcodec_decode_subtitle2(d->avctx, &rendered, &got_rendered, &empty_pkt);
++    if (ret >= 0 && got_rendered && ffp_subtitle_snapshot_matches(&rendered, request))
++        exact_ok = 1;
++
++    restore_ret = decoder_subtitle_snapshot_set_canvas(d, old_width, old_height);
++    if (restore_ret < 0) {
++        av_log(d->avctx, AV_LOG_ERROR, "could not restore ARIB subtitle canvas to %dx%d after snapshot: %s\n",
++               old_width, old_height, av_err2str(restore_ret));
++    } else {
++        decoder_subtitle_snapshot_count(layer);
++        restore_ret = avcodec_decode_subtitle2(d->avctx, &restored, &got_restored, &empty_pkt);
++        if (restore_ret < 0)
++            av_log(d->avctx, AV_LOG_WARNING, "ARIB subtitle canvas restore rerender failed: %s\n",
++                   av_err2str(restore_ret));
++        else
++            restore_ok = 1;
++    }
++
++snapshot_done:
++    if (exact_ok && restore_ok && ffp_subtitle_snapshot_state_matches(layer, request))
++        ret = 0;
++    else
++        ret = AVERROR_INVALIDDATA;
++
++done:
++    if (ret >= 0)
++        ffp_subtitle_snapshot_complete(request, 0, &rendered);
++    else
++        ffp_subtitle_snapshot_complete(request, ret, NULL);
++    avsubtitle_free(&rendered);
++    avsubtitle_free(&restored);
++}
++
++static int ffp_subtitle_snapshot_rerender(SubtitleLayer *layer, int stream_index, int serial,
++                                          uint64_t base_generation, uint64_t base_decode_generation,
++                                          int width, int height, const AVSubtitle *expected,
++                                          AVSubtitle *rendered)
++{
++    FFPSubtitleSnapshotRequest *request = NULL;
++    AVPacket *pkt = NULL;
++    int ret;
++
++    if (!layer || !expected || !rendered || stream_index < 0 || !expected->num_rects ||
++        width <= 0 || height <= 0)
++        return AVERROR(EINVAL);
++    request = av_mallocz(sizeof(*request));
++    if (!request)
++        return AVERROR(ENOMEM);
++    request->magic = FFP_SUBTITLE_SNAPSHOT_MAGIC;
++    request->width = width;
++    request->height = height;
++    request->serial = serial;
++    request->stream_index = stream_index;
++    request->base_generation = base_generation;
++    request->base_decode_generation = base_decode_generation;
++    request->expected_pts = expected->pts;
++    request->expected_start_display_time = expected->start_display_time;
++    request->expected_end_display_time = expected->end_display_time;
++    request->mutex = SDL_CreateMutex();
++    request->cond = SDL_CreateCond();
++    request->refs = 1;
++    request->result = AVERROR(EAGAIN);
++    if (!request->mutex || !request->cond) {
++        if (request->cond)
++            SDL_DestroyCond(request->cond);
++        if (request->mutex)
++            SDL_DestroyMutex(request->mutex);
++        av_free(request);
++        return AVERROR(ENOMEM);
++    }
++
++    pkt = av_packet_alloc();
++    if (!pkt) {
++        ret = AVERROR(ENOMEM);
++        goto fail;
++    }
++    pkt->buf = av_buffer_alloc(1);
++    if (!pkt->buf) {
++        ret = AVERROR(ENOMEM);
++        goto fail;
++    }
++    pkt->data = pkt->buf->data;
++    pkt->size = 0;
++    pkt->pts = pkt->dts = AV_NOPTS_VALUE;
++    pkt->stream_index = stream_index;
++    SDL_LockMutex(request->mutex);
++    request->refs++;
++    SDL_UnlockMutex(request->mutex);
++    pkt->opaque_ref = av_buffer_create((uint8_t *)request, sizeof(*request),
++                                       ffp_subtitle_snapshot_packet_free, request, 0);
++    if (!pkt->opaque_ref) {
++        ffp_subtitle_snapshot_request_unref(request);
++        ret = AVERROR(ENOMEM);
++        goto fail;
++    }
++
++    ret = packet_queue_put(&layer->packets, pkt);
++    if (ret < 0)
++        goto fail;
++    av_packet_free(&pkt);
++
++    SDL_LockMutex(request->mutex);
++    while (!request->done) {
++        if (SDL_CondWaitTimeout(request->cond, request->mutex,
++                                FFP_SUBTITLE_SNAPSHOT_TIMEOUT_MS) != 0)
++            break;
++    }
++    if (request->done && request->result >= 0) {
++        *rendered = request->rendered;
++        memset(&request->rendered, 0, sizeof(request->rendered));
++        ret = 0;
++    } else if (request->done) {
++        ret = request->result;
++    } else {
++        ret = AVERROR(EAGAIN);
++    }
++    SDL_UnlockMutex(request->mutex);
++    ffp_subtitle_snapshot_request_unref(request);
++    return ret;
++
++fail:
++    av_packet_free(&pkt);
++    ffp_subtitle_snapshot_request_unref(request);
++    return ret;
++}
++
+ static int decoder_decode_frame(Decoder *d, AVFrame *frame, AVSubtitle *sub) {
+     int ret = AVERROR(EAGAIN);
+ 
+@@ -1400,7 +2116,18 @@ static int decoder_decode_frame(Decoder
+         } while (1);
+ 
+         if (d->avctx->codec_type == AVMEDIA_TYPE_SUBTITLE) {
++            FFPSubtitleSnapshotRequest *snapshot_request =
++                ffp_subtitle_snapshot_request_from_packet(d->pkt);
+             int got_frame = 0;
++            if (snapshot_request) {
++                decoder_subtitle_snapshot(d, snapshot_request);
++                av_packet_unref(d->pkt);
++                ret = AVERROR(EAGAIN);
++                continue;
++            }
++            d->subtitle_packet_pts = d->pkt->pts != AV_NOPTS_VALUE ?
++                av_rescale_q(d->pkt->pts, d->avctx->pkt_timebase, AV_TIME_BASE_Q) : AV_NOPTS_VALUE;
++            decoder_subtitle_resize(d);
+             ret = avcodec_decode_subtitle2(d->avctx, sub, &got_frame, d->pkt);
+             if (ret < 0) {
+                 ret = AVERROR(EAGAIN);
+@@ -1434,7 +2161,8 @@ static int decoder_decode_frame(Decoder
+ 
+ static void decoder_destroy(Decoder *d) {
+     av_packet_free(&d->pkt);
+-    avcodec_free_context(&d->avctx);
++    if (!d->subtitle_context_owned_by_thread)
++        avcodec_free_context(&d->avctx);
+ }
+ 
+ static void frame_queue_unref_item(Frame *vp)
+@@ -1760,72 +2488,404 @@ static void draw_video_background(VideoS
+ 
+ static int ffp_download_frame(AVFrame *frame);
+ 
+-static void video_image_display(VideoState *is)
++static int ffp_subtitle_visible(VideoState *is, int layer_id)
+ {
+-    Frame *vp;
+-    Frame *sp = NULL;
+-    SDL_Rect *rect = &is->render_params.target_rect;
++    return layer_id >= 0 && layer_id < FFP_SUBTITLE_LAYER_COUNT &&
++           SDL_AtomicGet(&is->ffp->subtitle_visible[layer_id]) &&
++           (layer_id != FFP_SUBTITLE_SUPERIMPOSE || is->o->superimpose);
++}
++
++static void ffp_subtitle_debug_sync(SubtitleLayer *layer)
++{
++    FFPDebugSubtitle *dbg;
++    VideoState *is = layer->is;
++
++    SDL_LockMutex(is->dbg_mutex);
++    dbg = &is->dbg.subtitles[layer->id];
++    if (dbg->open) {
++        dbg->canvas_width = layer->canvas_width;
++        dbg->canvas_height = layer->canvas_height;
++        dbg->active_rects = layer->active_valid ? layer->active.num_rects : 0;
++        dbg->active_width = layer->active_valid ? layer->active_width : 0;
++        dbg->active_height = layer->active_valid ? layer->active_height : 0;
++        dbg->active_start = layer->active_valid ? layer->active_start : NAN;
++        dbg->active_end = layer->active_valid ? layer->active_end : NAN;
++        dbg->re_renders = layer->re_renders;
++        dbg->cues_shown = SDL_AtomicGet(&layer->cues_shown);
++        dbg->cues_cleared = SDL_AtomicGet(&layer->cues_cleared);
++        dbg->cues_uploaded = SDL_AtomicGet(&layer->cues_uploaded);
++        dbg->history_landed = SDL_AtomicGet(&layer->attime_applied);
++    }
++    SDL_UnlockMutex(is->dbg_mutex);
++}
++
++static void ffp_subtitle_mark_shown(SubtitleLayer *layer)
++{
++    if (layer->active_valid && !layer->active_counted_shown) {
++        layer->active_counted_shown = 1;
++        SDL_AtomicAdd(&layer->cues_shown, 1);
++        ffp_subtitle_debug_sync(layer);
++    }
++}
++
++static void ffp_subtitle_clear_active(SubtitleLayer *layer, int count_clear)
++{
++    if (layer->active_valid) {
++        avsubtitle_free(&layer->active);
++        layer->active_valid = 0;
++        layer->active_counted_shown = 0;
++        layer->active_serial = -1;
++        layer->active_width = layer->active_height = 0;
++        layer->active_start = layer->active_end = NAN;
++        layer->active_generation = 0;
++        layer->generation++;
++        if (count_clear)
++            SDL_AtomicAdd(&layer->cues_cleared, 1);
++    }
++}
++
++/* Replaces the displayed bitmap with a re-render of the same cue; takes *sub only when it returns 1.
++ * The codec re-renders the cue named by the request even when it has decoded later cues ahead of
++ * playback, so identity is the cue's own pts/start/end, not the decode count. A newer cue already
++ * on screen changes active_generation and still wins. */
++static int ffp_subtitle_apply_rerender(SubtitleLayer *layer, AVSubtitle *sub, int serial,
++                                       uint64_t generation, int width, int height)
++{
++    if (!layer->active_valid || layer->active_generation != generation ||
++        layer->active_serial != serial || layer->active.pts != sub->pts ||
++        layer->active.start_display_time != sub->start_display_time ||
++        layer->active.end_display_time != sub->end_display_time)
++        return 0;
++    avsubtitle_free(&layer->active);
++    layer->active = *sub;
++    memset(sub, 0, sizeof(*sub));
++    layer->active_width = width;
++    layer->active_height = height;
++    return 1;
++}
++
++/* Asks the decoder for the cue that is on screen at the landing frame of a seek or open: its packet
++ * lies before the landing point and is not read again. The decoder answers from its caption history,
++ * for the part of the file it has decoded in this session. */
++static int ffp_subtitle_queue_attime(SubtitleLayer *layer, double pts, int serial)
++{
++    AVPacket *pkt = av_packet_alloc();
++    FFPSubtitleAtTimeRequest *request;
++    int ret;
++
++    if (!pkt)
++        return AVERROR(ENOMEM);
++    pkt->buf = av_buffer_alloc(1);
++    pkt->opaque_ref = av_buffer_allocz(sizeof(*request));
++    if (!pkt->buf || !pkt->opaque_ref ||
++        layer->startup_pkt_timebase.num <= 0 || layer->startup_pkt_timebase.den <= 0) {
++        av_packet_free(&pkt);
++        return AVERROR(ENOMEM);
++    }
++    pkt->data = pkt->buf->data;
++    pkt->size = 0;
++    pkt->dts = AV_NOPTS_VALUE;
++    pkt->pts = av_rescale_q(llrint(pts * AV_TIME_BASE), AV_TIME_BASE_Q, layer->startup_pkt_timebase);
++    pkt->flags |= AV_PKT_FLAG_ARIB_ACTIVE_AT;
++    pkt->stream_index = layer->stream_index;
++    request = (FFPSubtitleAtTimeRequest *)pkt->opaque_ref->data;
++    request->magic = FFP_SUBTITLE_ATTIME_MAGIC;
++    request->serial = serial;
++    ret = packet_queue_put(&layer->packets, pkt);
++    av_packet_free(&pkt);
++    return ret;
++}
++
++static void ffp_subtitle_update_layer(SubtitleLayer *layer, double pts, int serial)
++{
++    Frame *sp;
++    FrameQueue *queue = &layer->frames;
++    AVSubtitle pending = { 0 };
++    int pending_valid, pending_serial = 0, pending_width = 0, pending_height = 0;
++    uint64_t pending_generation = 0;
++    AVSubtitle attime = { 0 };
++    int attime_valid, attime_serial = 0, attime_width = 0, attime_height = 0;
++    int packet_serial;
++
++    /* video and subtitle packet queues have independent serial counters; serial is the video frame's */
++    SDL_LockMutex(layer->packets.mutex);
++    packet_serial = layer->packets.serial;
++    SDL_UnlockMutex(layer->packets.mutex);
++    if (layer->active_valid && layer->active_serial != layer->packets.serial)
++        ffp_subtitle_clear_active(layer, 1);
++    if (layer->is_arib && layer->stream_index >= 0 && !isnan(pts) && serial == layer->is->videoq.serial &&
++        layer->attime_requested_serial != packet_serial &&
++        ffp_subtitle_queue_attime(layer, pts, packet_serial) >= 0)
++        layer->attime_requested_serial = packet_serial;
++
++    while (frame_queue_nb_remaining(queue) > 0) {
++        double cue_start, cue_end;
++        sp = frame_queue_peek(queue);
++        if (sp->serial != layer->packets.serial) {
++            frame_queue_next(queue);
++            continue;
++        }
++        cue_start = sp->pts + sp->sub.start_display_time / 1000.0;
++        cue_end = sp->sub.end_display_time == UINT32_MAX ? HUGE_VAL :
++                  sp->pts + sp->sub.end_display_time / 1000.0;
++        /* 1 ms tolerance: a cue starting on the displayed frame must be due on it (video pts in 1/90000, cue pts in us) */
++        if (!sp->subtitle_rerender && !isnan(pts) && cue_start > pts + 0.001)
++            break;
++
++        if (sp->subtitle_rerender) {
++            ffp_subtitle_apply_rerender(layer, &sp->sub, sp->serial, sp->subtitle_rerender_generation,
++                                        sp->width, sp->height);
++        } else if (sp->sub.num_rects == 0) {
++            layer->event_serial = sp->serial;
++            ffp_subtitle_clear_active(layer, 0);
++            layer->generation++;
++            SDL_AtomicAdd(&layer->cues_cleared, 1);
++        } else {
++            layer->event_serial = sp->serial;
++            ffp_subtitle_clear_active(layer, 0);
++            layer->generation++;
++            layer->active = sp->sub;
++            memset(&sp->sub, 0, sizeof(sp->sub));
++            layer->active_valid = 1;
++            layer->active_counted_shown = 0;
++            layer->active_serial = sp->serial;
++            layer->active_width = sp->width;
++            layer->active_height = sp->height;
++            layer->active_start = cue_start;
++            layer->active_end = cue_end;
++            layer->active_generation = layer->generation;
++        }
++        frame_queue_next(queue);
++    }
++
++    /* Applied after the queue so a cue that started this tick wins over a re-render of the old one. */
++    SDL_LockMutex(layer->is->dbg_mutex);
++    pending_valid = layer->pending_rerender_valid;
++    if (pending_valid) {
++        pending = layer->pending_rerender;
++        pending_serial = layer->pending_rerender_serial;
++        pending_width = layer->pending_rerender_width;
++        pending_height = layer->pending_rerender_height;
++        pending_generation = layer->pending_rerender_generation;
++        memset(&layer->pending_rerender, 0, sizeof(layer->pending_rerender));
++        layer->pending_rerender_valid = 0;
++    }
++    SDL_UnlockMutex(layer->is->dbg_mutex);
++    if (pending_valid &&
++        !ffp_subtitle_apply_rerender(layer, &pending, pending_serial, pending_generation,
++                                     pending_width, pending_height))
++        avsubtitle_free(&pending);
++
++    SDL_LockMutex(layer->is->dbg_mutex);
++    attime_valid = layer->pending_attime_valid;
++    if (attime_valid) {
++        attime = layer->pending_attime;
++        attime_serial = layer->pending_attime_serial;
++        attime_width = layer->pending_attime_width;
++        attime_height = layer->pending_attime_height;
++        memset(&layer->pending_attime, 0, sizeof(layer->pending_attime));
++        layer->pending_attime_valid = 0;
++    }
++    SDL_UnlockMutex(layer->is->dbg_mutex);
++    if (attime_valid) {
++        /* Only onto an empty screen of the same serial that no queued cue or clear has touched: whatever the
++         * queue applied is the newer state. */
++        if (!layer->active_valid && attime_serial == packet_serial && layer->event_serial != packet_serial &&
++            attime.num_rects > 0) {
++            layer->generation++;
++            layer->active = attime;
++            memset(&attime, 0, sizeof(attime));
++            layer->active_valid = 1;
++            layer->active_counted_shown = 0;
++            layer->active_serial = attime_serial;
++            layer->active_width = attime_width;
++            layer->active_height = attime_height;
++            layer->active_start = layer->active.pts / (double)AV_TIME_BASE + layer->active.start_display_time / 1000.0;
++            layer->active_end = layer->active.end_display_time == UINT32_MAX ? HUGE_VAL :
++                                layer->active.pts / (double)AV_TIME_BASE + layer->active.end_display_time / 1000.0;
++            layer->active_generation = layer->generation;
++            SDL_AtomicAdd(&layer->attime_applied, 1);
++        }
++        avsubtitle_free(&attime);
++    }
++
++    if (layer->active_valid && !isnan(pts) && layer->active_end != HUGE_VAL && pts >= layer->active_end)
++        ffp_subtitle_clear_active(layer, 1);
++    ffp_subtitle_debug_sync(layer);
++}
++
++static int ffp_subtitle_upload_sdl(VideoState *is, SubtitleLayer *layer)
++{
++    int i;
++    int width = layer->active_width;
++    int height = layer->active_height;
+     SDL_Renderer *renderer = is->ffp->renderer;
+-    VkRenderer *vk_renderer = is->ffp->vk_renderer;
+ 
+-    vp = frame_queue_peek_last(&is->pictq);
+-    if (!vp->snapped) {
+-        ffp_store_snapshot(is->ffp, vp);
+-        vp->snapped = 1;
++    if (!layer->active_valid || layer->active.format != 0 || !layer->active.num_rects || width <= 0 || height <= 0)
++        return 0;
++    if (layer->texture_generation == layer->active_generation &&
++        layer->texture_width == width && layer->texture_height == height)
++        return 0;
++    if (realloc_texture(renderer, &layer->texture, SDL_PIXELFORMAT_ARGB8888, width, height,
++                        SDL_BLENDMODE_BLEND, 1) < 0)
++        return AVERROR_EXTERNAL;
++    {
++        void *pixels;
++        int pitch;
++        if (SDL_LockTexture(layer->texture, NULL, &pixels, &pitch) < 0)
++            return AVERROR_EXTERNAL;
++        memset(pixels, 0, (size_t)pitch * height);
++        SDL_UnlockTexture(layer->texture);
+     }
+-    calculate_display_rect(rect, is->xleft, is->ytop, is->width, is->height, vp->width, vp->height, vp->sar);
+-    if (vk_renderer) {
+-        vk_renderer_display(vk_renderer, vp->frame, &is->render_params);
+-        return;
++    for (i = 0; i < layer->active.num_rects; i++) {
++        AVSubtitleRect *r = layer->active.rects[i];
++        SDL_Rect dst;
++        const uint8_t *src[4];
++        int linesize[4];
++        uint8_t *pixels[4];
++        int pitch[4];
++        int sx, sy;
++
++        if (!r || !r->data[0] || !r->data[1] || r->w <= 0 || r->h <= 0)
++            continue;
++        dst.x = av_clip(r->x, 0, width);
++        dst.y = av_clip(r->y, 0, height);
++        dst.w = av_clip(r->w - (dst.x - r->x), 0, width - dst.x);
++        dst.h = av_clip(r->h - (dst.y - r->y), 0, height - dst.y);
++        sx = dst.x - r->x;
++        sy = dst.y - r->y;
++        if (dst.w <= 0 || dst.h <= 0)
++            continue;
++        src[0] = r->data[0] + sy * r->linesize[0] + sx;
++        src[1] = r->data[1];
++        src[2] = src[3] = NULL;
++        linesize[0] = r->linesize[0];
++        linesize[1] = r->linesize[1];
++        linesize[2] = linesize[3] = 0;
++        is->sub_convert_ctx = sws_getCachedContext(is->sub_convert_ctx, dst.w, dst.h, AV_PIX_FMT_PAL8,
++            dst.w, dst.h, AV_PIX_FMT_BGRA, SWS_POINT, NULL, NULL, NULL);
++        if (!is->sub_convert_ctx)
++            return AVERROR(ENOMEM);
++        if (SDL_LockTexture(layer->texture, &dst, (void **)pixels, pitch) < 0)
++            return AVERROR_EXTERNAL;
++        sws_scale(is->sub_convert_ctx, src, linesize, 0, dst.h, pixels, pitch);
++        SDL_UnlockTexture(layer->texture);
+     }
++    layer->texture_generation = layer->active_generation;
++    layer->texture_width = width;
++    layer->texture_height = height;
++    SDL_AtomicAdd(&layer->cues_uploaded, 1);
++    ffp_subtitle_debug_sync(layer);
++    return 0;
++}
+ 
+-    if (is->subtitle_st) {
+-        if (frame_queue_nb_remaining(&is->subpq) > 0) {
+-            sp = frame_queue_peek(&is->subpq);
+-
+-            if (vp->pts >= sp->pts + ((float) sp->sub.start_display_time / 1000)) {
+-                if (!sp->uploaded) {
+-                    uint8_t* pixels[4];
+-                    int pitch[4];
+-                    int i;
+-                    if (!sp->width || !sp->height) {
+-                        sp->width = vp->width;
+-                        sp->height = vp->height;
+-                    }
+-                    if (realloc_texture(renderer, &is->sub_texture, SDL_PIXELFORMAT_ARGB8888, sp->width, sp->height, SDL_BLENDMODE_BLEND, 1) < 0)
+-                        return;
++static int ffp_subtitle_queue_resize(SubtitleLayer *layer, int width, int height)
++{
++    AVPacket *pkt = av_packet_alloc();
++    FFPSubtitleResizeRequest *request;
++    int ret;
+ 
+-                    for (i = 0; i < sp->sub.num_rects; i++) {
+-                        AVSubtitleRect *sub_rect = sp->sub.rects[i];
++    if (!pkt)
++        return AVERROR(ENOMEM);
++    pkt->buf = av_buffer_alloc(1);
++    pkt->opaque_ref = av_buffer_allocz(sizeof(*request));
++    if (!pkt->buf || !pkt->opaque_ref) {
++        av_packet_free(&pkt);
++        return AVERROR(ENOMEM);
++    }
++    pkt->data = pkt->buf->data;
++    pkt->size = 0;
++    pkt->pts = pkt->dts = AV_NOPTS_VALUE;
++    /* Name the displayed cue so the codec re-renders that one, not just its newest decoded caption. */
++    if (layer->active_valid && layer->active.pts != AV_NOPTS_VALUE &&
++        layer->startup_pkt_timebase.num > 0 && layer->startup_pkt_timebase.den > 0)
++        pkt->pts = av_rescale_q(layer->active.pts, AV_TIME_BASE_Q, layer->startup_pkt_timebase);
++    pkt->stream_index = layer->stream_index;
++    request = (FFPSubtitleResizeRequest *)pkt->opaque_ref->data;
++    request->magic = FFP_SUBTITLE_RESIZE_MAGIC;
++    request->width = width;
++    request->height = height;
++    request->base_generation = layer->active_valid ? layer->active_generation : 0;
++    SDL_LockMutex(layer->is->dbg_mutex);
++    request->base_decode_generation = layer->cue_decode_generation;
++    SDL_UnlockMutex(layer->is->dbg_mutex);
++    ret = packet_queue_put(&layer->packets, pkt);
++    av_packet_free(&pkt);
++    if (ret >= 0) {
++        layer->resize_requested_width = width;
++        layer->resize_requested_height = height;
++        layer->resize_requested_at = av_gettime_relative();
++    }
++    return ret;
++}
+ 
+-                        sub_rect->x = av_clip(sub_rect->x, 0, sp->width );
+-                        sub_rect->y = av_clip(sub_rect->y, 0, sp->height);
+-                        sub_rect->w = av_clip(sub_rect->w, 0, sp->width  - sub_rect->x);
+-                        sub_rect->h = av_clip(sub_rect->h, 0, sp->height - sub_rect->y);
+-
+-                        is->sub_convert_ctx = sws_getCachedContext(is->sub_convert_ctx,
+-                            sub_rect->w, sub_rect->h, AV_PIX_FMT_PAL8,
+-                            sub_rect->w, sub_rect->h, AV_PIX_FMT_BGRA,
+-                            0, NULL, NULL, NULL);
+-                        if (!is->sub_convert_ctx) {
+-                            av_log(NULL, AV_LOG_FATAL, "Cannot initialize the conversion context\n");
+-                            return;
+-                        }
+-                        if (!SDL_LockTexture(is->sub_texture, (SDL_Rect *)sub_rect, (void **)pixels, pitch)) {
+-                            sws_scale(is->sub_convert_ctx, (const uint8_t * const *)sub_rect->data, sub_rect->linesize,
+-                                      0, sub_rect->h, pixels, pitch);
+-                            SDL_UnlockTexture(is->sub_texture);
+-                        }
+-                    }
+-                    sp->uploaded = 1;
+-                }
+-            } else
+-                sp = NULL;
++static void ffp_subtitle_note_video_rect(VideoState *is, int width, int height)
++{
++    int64_t now = av_gettime_relative();
++    int i;
++    for (i = 0; i < FFP_SUBTITLE_LAYER_COUNT; i++) {
++        SubtitleLayer *layer = &is->subtitles[i];
++        if (width <= 0 || height <= 0)
++            continue;
++        if (layer->resize_candidate_width != width || layer->resize_candidate_height != height) {
++            layer->resize_candidate_width = width;
++            layer->resize_candidate_height = height;
++            layer->resize_candidate_since = now;
+         }
+     }
++}
++
++static void ffp_subtitle_check_resize(VideoState *is, int64_t now)
++{
++    int i;
++    for (i = 0; i < FFP_SUBTITLE_LAYER_COUNT; i++) {
++        SubtitleLayer *layer = &is->subtitles[i];
++        int width, height;
++        if (!layer->is_arib || layer->stream_index < 0 ||
++            layer->resize_candidate_width <= 0 || layer->resize_candidate_height <= 0 ||
++            now - layer->resize_candidate_since < 100000)
++            continue;
++        SDL_LockMutex(is->dbg_mutex);
++        width = layer->canvas_width;
++        height = layer->canvas_height;
++        SDL_UnlockMutex(is->dbg_mutex);
++        /* A request still unapplied after 0.5 s was lost (a seek / flush at open drops queued packets): ask again,
++         * otherwise a window resize right after open would leave the canvas at the pre-resize size (blurry). */
++        if ((width != layer->resize_candidate_width || height != layer->resize_candidate_height) &&
++            (layer->resize_requested_width != layer->resize_candidate_width ||
++             layer->resize_requested_height != layer->resize_candidate_height ||
++             now - layer->resize_requested_at > 500000)) {
++            if (ffp_subtitle_queue_resize(layer, layer->resize_candidate_width,
++                                          layer->resize_candidate_height) < 0)
++                av_log(NULL, AV_LOG_WARNING, "could not queue ARIB subtitle resize %dx%d\n",
++                       layer->resize_candidate_width, layer->resize_candidate_height);
++        }
++    }
++}
+ 
+-    if (vp->frame->hw_frames_ctx && ffp_download_frame(vp->frame) < 0)     /* after a presenter fallback */
++static void video_image_display(VideoState *is)
++{
++    Frame *vp = frame_queue_peek_last(&is->pictq);
++    SDL_Rect *rect = &is->render_params.target_rect;
++    SDL_Renderer *renderer = is->ffp->renderer;
++    VkRenderer *vk_renderer = is->ffp->vk_renderer;
++    int output_w = 0, output_h = 0, i;
++
++    ffp_store_snapshot(is->ffp, is, vp);
++    vp->snapped = 1;
++    if (vk_renderer) {
++        calculate_display_rect(rect, is->xleft, is->ytop, is->width, is->height, vp->width, vp->height, vp->sar);
++        vk_renderer_display(vk_renderer, vp->frame, &is->render_params);
+         return;
++    }
++    if (vp->frame->hw_frames_ctx && ffp_download_frame(vp->frame) < 0)
++        return;
++    if (SDL_GetRendererOutputSize(renderer, &output_w, &output_h) < 0 || output_w <= 0 || output_h <= 0) {
++        output_w = FFMAX(is->width, 1);
++        output_h = FFMAX(is->height, 1);
++    }
++    calculate_display_rect(rect, 0, 0, output_w, output_h, vp->width, vp->height, vp->sar);
++    ffp_subtitle_note_video_rect(is, rect->w, rect->h);
+     set_sdl_yuv_conversion_mode(vp->frame);
+ 
+     if (!vp->uploaded) {
+@@ -1840,22 +2900,13 @@ static void video_image_display(VideoSta
+     draw_video_background(is);
+     SDL_RenderCopyEx(renderer, is->vid_texture, NULL, rect, 0, NULL, vp->flip_v ? SDL_FLIP_VERTICAL : 0);
+     set_sdl_yuv_conversion_mode(NULL);
+-    if (sp) {
+-#if USE_ONEPASS_SUBTITLE_RENDER
+-        SDL_RenderCopy(renderer, is->sub_texture, NULL, rect);
+-#else
+-        int i;
+-        double xratio = (double)rect->w / (double)sp->width;
+-        double yratio = (double)rect->h / (double)sp->height;
+-        for (i = 0; i < sp->sub.num_rects; i++) {
+-            SDL_Rect *sub_rect = (SDL_Rect*)sp->sub.rects[i];
+-            SDL_Rect target = {.x = rect.x + sub_rect->x * xratio,
+-                               .y = rect.y + sub_rect->y * yratio,
+-                               .w = sub_rect->w * xratio,
+-                               .h = sub_rect->h * yratio};
+-            SDL_RenderCopy(renderer, is->sub_texture, sub_rect, &target);
+-        }
+-#endif
++    for (i = 0; i < FFP_SUBTITLE_LAYER_COUNT; i++) {
++        SubtitleLayer *layer = &is->subtitles[i];
++        if (!ffp_subtitle_visible(is, i) || !layer->active_valid || !layer->active.num_rects)
++            continue;
++        if (ffp_subtitle_upload_sdl(is, layer) >= 0 && layer->texture &&
++            SDL_RenderCopy(renderer, layer->texture, NULL, rect) == 0)
++            ffp_subtitle_mark_shown(layer);
+     }
+ }
+ 
+@@ -2280,6 +3331,67 @@ static void ffp_dbg_stream_open(VideoSta
+     SDL_UnlockMutex(is->dbg_mutex);
+ }
+ 
++static void ffp_arib_font_option(char *dst, size_t size, const char *font)
++{
++    if (!av_strstart(font, "file:", NULL))
++        snprintf(dst, size, "file:%s", font);
++    else
++        av_strlcpy(dst, font, size);
++    /* av_get_token treats backslashes as escapes; Windows also accepts '/' in paths. */
++    for (char *p = dst + 5; *p; p++)
++        if (*p == '\\')
++            *p = '/';
++}
++
++static void ffp_dbg_subtitle_open(VideoState *is, int layer_id, AVCodecContext *avctx,
++                                  const AVCodec *codec, int index, int arib)
++{
++    FFPDebugSubtitle *s = &is->dbg.subtitles[layer_id];
++    AVStream *st = is->ic->streams[index];
++
++    SDL_LockMutex(is->dbg_mutex);
++    memset(s, 0, sizeof(*s));
++    s->open = 1;
++    s->stream_index = index;
++    s->time_base = st->time_base;
++    s->stream_start = ffp_dbg_start_time(st);
++    s->is_arib = arib;
++    s->canvas_width = is->subtitles[layer_id].canvas_width;
++    s->canvas_height = is->subtitles[layer_id].canvas_height;
++    s->active_start = NAN;
++    s->active_end = NAN;
++    ffp_dbg_set_str(s->codec, sizeof(s->codec), avcodec_get_name(avctx->codec_id));
++    ffp_dbg_set_str(s->decoder, sizeof(s->decoder), codec->name);
++    ffp_dbg_set_str(s->caption_type, sizeof(s->caption_type),
++                    layer_id == FFP_SUBTITLE_SUPERIMPOSE ? "superimpose" : "caption");
++    if (arib) {
++        s->ignore_background = layer_id == FFP_SUBTITLE_CAPTION && is->o->arib_ignore_background;
++        s->force_outline = layer_id == FFP_SUBTITLE_CAPTION && is->o->arib_force_outline;
++        if (is->o->arib_font && *is->o->arib_font) {
++            ffp_arib_font_option(s->font, sizeof(s->font), is->o->arib_font);
++        } else {
++            ffp_dbg_set_str(s->font, sizeof(s->font), "libaribcaption default");
++        }
++    }
++    if (layer_id == FFP_SUBTITLE_CAPTION) {
++        is->dbg.s_open = 1;
++        is->dbg.s_index = index;
++        ffp_dbg_set_str(is->dbg.s_codec, sizeof(is->dbg.s_codec), avcodec_get_name(avctx->codec_id));
++        is->dbg.s_tb = st->time_base;
++        is->dbg.s_start = ffp_dbg_start_time(st);
++    }
++    SDL_UnlockMutex(is->dbg_mutex);
++}
++
++static void ffp_dbg_subtitle_closed(VideoState *is, int layer_id)
++{
++    SDL_LockMutex(is->dbg_mutex);
++    memset(&is->dbg.subtitles[layer_id], 0, sizeof(is->dbg.subtitles[layer_id]));
++    if (layer_id == FFP_SUBTITLE_CAPTION)
++        is->dbg.s_open = 0;
++    SDL_UnlockMutex(is->dbg_mutex);
++}
++
+ static void ffp_dbg_audio_out(VideoState *is)
+ {
+     FFPDebug *d = &is->dbg;
+@@ -2399,10 +3511,11 @@ static void ffp_dbg_stream_closed(VideoS
+     SDL_UnlockMutex(is->dbg_mutex);
+ }
+ 
+-static void stream_component_close(VideoState *is, int stream_index)
++static void stream_component_close(VideoState *is, int stream_index, int subtitle_layer)
+ {
+     AVFormatContext *ic = is->ic;
+     AVCodecParameters *codecpar;
++    SubtitleLayer *sl = NULL;
+ 
+     if (stream_index < 0 || stream_index >= ic->nb_streams)
+         return;
+@@ -2433,14 +3546,44 @@ static void stream_component_close(Video
+         decoder_destroy(&is->viddec);
+         break;
+     case AVMEDIA_TYPE_SUBTITLE:
+-        decoder_abort(&is->subdec, &is->subpq);
+-        decoder_destroy(&is->subdec);
++        if (subtitle_layer < 0 || subtitle_layer >= FFP_SUBTITLE_LAYER_COUNT)
++            return;
++        sl = &is->subtitles[subtitle_layer];
++        packet_queue_abort_routed(&sl->packets, &sl->routing_stream_index);
++        decoder_abort(&sl->decoder, &sl->frames);
++        decoder_destroy(&sl->decoder);
++        if (sl->startup_sem)
++            SDL_DestroySemaphore(sl->startup_sem);
++        sl->startup_sem = NULL;
++        if (sl->startup_release_sem)
++            SDL_DestroySemaphore(sl->startup_release_sem);
++        sl->startup_release_sem = NULL;
++        avsubtitle_free(&sl->active);
++        sl->active_valid = 0;
++        sl->active_serial = -1;
++        sl->active_width = sl->active_height = 0;
++        sl->active_start = sl->active_end = NAN;
++        sl->generation++;
++        /* the decoder thread is gone, so the pending slot has no other user */
++        if (sl->pending_rerender_valid)
++            avsubtitle_free(&sl->pending_rerender);
++        sl->pending_rerender_valid = 0;
++        if (sl->pending_attime_valid)
++            avsubtitle_free(&sl->pending_attime);
++        sl->pending_attime_valid = 0;
+         break;
+     default:
+         break;
+     }
+ 
+-    ffp_dbg_stream_closed(is, codecpar->codec_type);
++    if (codecpar->codec_type == AVMEDIA_TYPE_SUBTITLE) {
++        ffp_dbg_subtitle_closed(is, subtitle_layer);
++        sl->st = NULL;
++        sl->stream_index = -1;
++        sl->is_arib = 0;
++    } else {
++        ffp_dbg_stream_closed(is, codecpar->codec_type);
++    }
+     ic->streams[stream_index]->discard = AVDISCARD_ALL;
+     switch (codecpar->codec_type) {
+     case AVMEDIA_TYPE_AUDIO:
+@@ -2452,8 +3595,6 @@ static void stream_component_close(Video
+         is->video_stream = -1;
+         break;
+     case AVMEDIA_TYPE_SUBTITLE:
+-        is->subtitle_st = NULL;
+-        is->subtitle_stream = -1;
+         break;
+     default:
+         break;
+@@ -2470,6 +3611,11 @@ static void stream_destroy_textures(Vide
+     if (is->sub_texture)
+         SDL_DestroyTexture(is->sub_texture);
+     is->vis_texture = is->vid_texture = is->sub_texture = NULL;
++    for (int i = 0; i < FFP_SUBTITLE_LAYER_COUNT; i++) {
++        if (is->subtitles[i].texture)
++            SDL_DestroyTexture(is->subtitles[i].texture);
++        is->subtitles[i].texture = NULL;
++    }
+ }
+ 
+ /* joins every thread of this playback and frees it; callable from any thread
+@@ -2483,24 +3629,31 @@ static void stream_close(VideoState *is)
+ 
+     /* close each stream */
+     if (is->audio_stream >= 0)
+-        stream_component_close(is, is->audio_stream);
++        stream_component_close(is, is->audio_stream, -1);
+     if (is->video_stream >= 0)
+-        stream_component_close(is, is->video_stream);
+-    if (is->subtitle_stream >= 0)
+-        stream_component_close(is, is->subtitle_stream);
++        stream_component_close(is, is->video_stream, -1);
++    if (is->subtitles[FFP_SUBTITLE_CAPTION].stream_index >= 0)
++        stream_component_close(is, is->subtitles[FFP_SUBTITLE_CAPTION].stream_index, FFP_SUBTITLE_CAPTION);
++    if (is->subtitles[FFP_SUBTITLE_SUPERIMPOSE].stream_index >= 0)
++        stream_component_close(is, is->subtitles[FFP_SUBTITLE_SUPERIMPOSE].stream_index, FFP_SUBTITLE_SUPERIMPOSE);
+ 
+     avformat_close_input(&is->ic);
+ 
+     packet_queue_destroy(&is->videoq);
+     packet_queue_destroy(&is->audioq);
+-    packet_queue_destroy(&is->subtitleq);
++    for (int i = 0; i < FFP_SUBTITLE_LAYER_COUNT; i++)
++        packet_queue_destroy(&is->subtitles[i].packets);
+ 
+     /* free all pictures */
+     frame_queue_destroy(&is->pictq);
+     frame_queue_destroy(&is->sampq);
+-    frame_queue_destroy(&is->subpq);
++    for (int i = 0; i < FFP_SUBTITLE_LAYER_COUNT; i++) {
++        frame_queue_destroy(&is->subtitles[i].frames);
++        avsubtitle_free(&is->subtitles[i].active);
++    }
+     SDL_DestroyCond(is->continue_read_thread);
+     sws_freeContext(is->sub_convert_ctx);
++    sws_freeContext(is->subtitle_rgba_ctx);
+     av_free(is->filename);
+     av_free(is->window_title);
+     av_free(is->vfilter_good);
+@@ -2584,6 +3737,12 @@ static int video_display(VideoState *is)
+ 
+     if (!is->width)
+         video_open(is);
++    if (is->show_mode == SHOW_MODE_VIDEO && is->video_st) {
++        Frame *vp = frame_queue_peek_last(&is->pictq);
++        int i;
++        for (i = 0; i < FFP_SUBTITLE_LAYER_COUNT; i++)
++            ffp_subtitle_update_layer(&is->subtitles[i], vp->pts, vp->serial);
++    }
+ 
+     /* Positive means a stale CUDA frame was skipped, not displayed. */
+     ret = ffp->pres_ops->display(is);
+@@ -2816,8 +3975,6 @@ static void video_refresh(void *opaque,
+     double time;
+     int new_frame = 0;
+ 
+-    Frame *sp, *sp2;
+-
+     if (!is->paused && get_master_sync_type(is) == AV_SYNC_EXTERNAL_CLOCK && is->realtime)
+         check_external_clock_speed(is);
+ 
+@@ -2882,40 +4039,7 @@ retry:
+                 }
+             }
+ 
+-            if (is->subtitle_st) {
+-                while (frame_queue_nb_remaining(&is->subpq) > 0) {
+-                    sp = frame_queue_peek(&is->subpq);
+-
+-                    if (frame_queue_nb_remaining(&is->subpq) > 1)
+-                        sp2 = frame_queue_peek_next(&is->subpq);
+-                    else
+-                        sp2 = NULL;
+-
+-                    if (sp->serial != is->subtitleq.serial
+-                            || (is->vidclk.pts > (sp->pts + ((float) sp->sub.end_display_time / 1000)))
+-                            || (sp2 && is->vidclk.pts > (sp2->pts + ((float) sp2->sub.start_display_time / 1000))))
+-                    {
+-                        if (sp->uploaded) {
+-                            int i;
+-                            for (i = 0; i < sp->sub.num_rects; i++) {
+-                                AVSubtitleRect *sub_rect = sp->sub.rects[i];
+-                                uint8_t *pixels;
+-                                int pitch, j;
+-
+-                                if (!SDL_LockTexture(is->sub_texture, (SDL_Rect *)sub_rect, (void **)&pixels, &pitch)) {
+-                                    for (j = 0; j < sub_rect->h; j++, pixels += pitch)
+-                                        memset(pixels, 0, sub_rect->w << 2);
+-                                    SDL_UnlockTexture(is->sub_texture);
+-                                }
+-                            }
+-                        }
+-                        frame_queue_next(&is->subpq);
+-                    } else {
+-                        break;
+-                    }
+-                }
+-            }
+-
++            /* Subtitle cues are independently retained and retired against this presented PTS. */
+             frame_queue_next(&is->pictq);
+             is->force_refresh = 1;
+             new_frame = 1;
+@@ -2947,8 +4071,8 @@ display:
+                 aqsize = is->audioq.size;
+             if (is->video_st)
+                 vqsize = is->videoq.size;
+-            if (is->subtitle_st)
+-                sqsize = is->subtitleq.size;
++            sqsize = is->subtitles[FFP_SUBTITLE_CAPTION].packets.size +
++                     is->subtitles[FFP_SUBTITLE_SUPERIMPOSE].packets.size;
+             av_diff = ffp_av_diff(is);
+ 
+             av_bprint_init(&buf, 0, AV_BPRINT_SIZE_AUTOMATIC);
+@@ -3675,9 +4799,8 @@ static int audio_thread(void *arg)
+     return ret;
+ }
+ 
+-static int decoder_start(Decoder *d, int (*fn)(void *), const char *thread_name, void* arg)
++static int decoder_start_thread(Decoder *d, int (*fn)(void *), const char *thread_name, void *arg)
+ {
+-    packet_queue_start(d->queue);
+     d->decoder_tid = SDL_CreateThread(fn, thread_name, arg);
+     if (!d->decoder_tid) {
+         av_log(NULL, AV_LOG_ERROR, "SDL_CreateThread(): %s\n", SDL_GetError());
+@@ -3686,6 +4809,35 @@ static int decoder_start(Decoder *d, int
+     return 0;
+ }
+ 
++static int decoder_start(Decoder *d, int stream_index, int (*fn)(void *),
++                         const char *thread_name, void *arg)
++{
++    int ret;
++
++    packet_queue_start(d->queue, stream_index);
++    ret = decoder_start_thread(d, fn, thread_name, arg);
++    if (ret < 0) {
++        packet_queue_abort(d->queue);
++        packet_queue_flush(d->queue);
++    }
++    return ret;
++}
++
++static int decoder_start_routed_subtitle(Decoder *d, SDL_atomic_t *routing_stream_index,
++                                         int stream_index, int (*fn)(void *),
++                                         const char *thread_name, void *arg)
++{
++    int ret;
++
++    packet_queue_start_routed(d->queue, routing_stream_index, stream_index);
++    ret = decoder_start_thread(d, fn, thread_name, arg);
++    if (ret < 0) {
++        packet_queue_abort_routed(d->queue, routing_stream_index);
++        packet_queue_flush(d->queue);
++    }
++    return ret;
++}
++
+ static int video_thread(void *arg)
+ {
+     VideoState *is = arg;
+@@ -3799,37 +4951,163 @@ static int video_thread(void *arg)
+     return 0;
+ }
+ 
++static void ffp_dbg_subtitle_open(VideoState *is, int layer_id, AVCodecContext *avctx,
++                                  const AVCodec *codec, int index, int arib);
++
++static int decoder_subtitle_open_arib(Decoder *dec)
++{
++    SubtitleLayer *layer = dec->subtitle_layer;
++    AVCodecContext *avctx;
++    int ret;
++
++    avctx = avcodec_alloc_context3(NULL);
++    if (!avctx)
++        return AVERROR(ENOMEM);
++    dec->avctx = avctx;
++    ret = avcodec_parameters_to_context(avctx, layer->startup_codecpar);
++    if (ret < 0)
++        return ret;
++    avctx->pkt_timebase = layer->startup_pkt_timebase;
++    avctx->codec_id = layer->startup_codec->id;
++    avctx->lowres = layer->startup_lowres;
++    if (layer->startup_fast)
++        avctx->flags2 |= AV_CODEC_FLAG2_FAST;
++
++    ret = avcodec_open2(avctx, layer->startup_codec, &layer->startup_opts);
++    if (ret < 0)
++        return ret;
++    ret = ffp_check_avoptions(layer->startup_opts);
++    if (ret < 0)
++        return ret;
++
++    ffp_dbg_subtitle_open(layer->is, layer->id, avctx, layer->startup_codec,
++                          layer->startup_stream_index, 1);
++    return 0;
++}
++
++/* Runs on the subtitle thread, the one using the decoder. */
++static void ffp_subtitle_history_stats(SubtitleLayer *layer)
++{
++    void *priv = layer->decoder.avctx ? layer->decoder.avctx->priv_data : NULL;
++    int64_t bytes = 0, events = 0, appended = 0;
++    FFPDebugSubtitle *dbg;
++
++    if (!priv)
++        return;
++    av_opt_get_int(priv, "history_bytes", 0, &bytes);
++    av_opt_get_int(priv, "history_events", 0, &events);
++    av_opt_get_int(priv, "history_appended_bytes", 0, &appended);
++    SDL_LockMutex(layer->is->dbg_mutex);
++    dbg = &layer->is->dbg.subtitles[layer->id];
++    dbg->history_bytes = bytes;
++    dbg->history_events = events;
++    dbg->history_appended_bytes = appended;
++    SDL_UnlockMutex(layer->is->dbg_mutex);
++}
++
+ static int subtitle_thread(void *arg)
+ {
+-    VideoState *is = arg;
++    SubtitleLayer *layer = arg;
++    VideoState *is = layer->is;
++    Decoder *dec = &layer->decoder;
++    FrameQueue *queue = &layer->frames;
+     Frame *sp;
+     int got_subtitle;
++    int ret = 0;
++    int startup_signaled = 0;
+     double pts;
+ 
+-    for (;;) {
+-        if (!(sp = frame_queue_peek_writable(&is->subpq)))
+-            return 0;
++    if (dec->subtitle_context_owned_by_thread) {
++        ret = decoder_subtitle_open_arib(dec);
++        if (ret < 0)
++            goto the_end;
++        layer->startup_result = 0;
++        SDL_SemPost(layer->startup_sem);
++        startup_signaled = 1;
++        if (SDL_SemWait(layer->startup_release_sem) < 0) {
++            ret = AVERROR_EXTERNAL;
++            goto the_end;
++        }
++    }
+ 
+-        if ((got_subtitle = decoder_decode_frame(&is->subdec, NULL, &sp->sub)) < 0)
++    for (;;) {
++        if (!(sp = frame_queue_peek_writable(queue)))
+             break;
+ 
+-        pts = 0;
++        if ((got_subtitle = decoder_decode_frame(dec, NULL, &sp->sub)) < 0)
++            break;
++        if (layer->is_arib)
++            ffp_subtitle_history_stats(layer);
+ 
+         if (got_subtitle && sp->sub.format == 0) {
+-            if (sp->sub.pts != AV_NOPTS_VALUE)
+-                pts = sp->sub.pts / (double)AV_TIME_BASE;
++            pts = sp->sub.pts != AV_NOPTS_VALUE ? sp->sub.pts / (double)AV_TIME_BASE :
++                  dec->subtitle_packet_pts != AV_NOPTS_VALUE ? dec->subtitle_packet_pts / (double)AV_TIME_BASE : 0.0;
+             sp->pts = pts;
+-            sp->serial = is->subdec.pkt_serial;
+-            sp->width = is->subdec.avctx->width;
+-            sp->height = is->subdec.avctx->height;
++            sp->serial = dec->pkt_serial;
++            sp->width = dec->avctx->width > 0 ? dec->avctx->width : layer->canvas_width;
++            sp->height = dec->avctx->height > 0 ? dec->avctx->height : layer->canvas_height;
++            if (sp->width <= 0 && is->video_st)
++                sp->width = is->video_st->codecpar->width;
++            if (sp->height <= 0 && is->video_st)
++                sp->height = is->video_st->codecpar->height;
+             sp->uploaded = 0;
+-
+-            /* now we can update the picture count */
+-            frame_queue_push(&is->subpq);
++            sp->subtitle_rerender = dec->subtitle_rerender;
++            sp->subtitle_rerender_generation = dec->subtitle_rerender_generation;
++            sp->subtitle_rerender_decode_generation = dec->subtitle_rerender_decode_generation;
++            if (dec->subtitle_attime) {
++                if (dec->subtitle_attime_serial != sp->serial) {
++                    avsubtitle_free(&sp->sub);
++                    memset(&sp->sub, 0, sizeof(sp->sub));
++                    continue;
++                }
++                SDL_LockMutex(is->dbg_mutex);
++                if (layer->pending_attime_valid)
++                    avsubtitle_free(&layer->pending_attime);
++                layer->pending_attime = sp->sub;
++                layer->pending_attime_valid = 1;
++                layer->pending_attime_serial = sp->serial;
++                layer->pending_attime_width = sp->width;
++                layer->pending_attime_height = sp->height;
++                SDL_UnlockMutex(is->dbg_mutex);
++                memset(&sp->sub, 0, sizeof(sp->sub));
++                continue;
++            }
++            if (sp->subtitle_rerender) {
++                /* The newest request wins. */
++                SDL_LockMutex(is->dbg_mutex);
++                if (layer->pending_rerender_valid)
++                    avsubtitle_free(&layer->pending_rerender);
++                layer->pending_rerender = sp->sub;
++                layer->pending_rerender_valid = 1;
++                layer->pending_rerender_serial = sp->serial;
++                layer->pending_rerender_width = sp->width;
++                layer->pending_rerender_height = sp->height;
++                layer->pending_rerender_generation = sp->subtitle_rerender_generation;
++                SDL_UnlockMutex(is->dbg_mutex);
++                memset(&sp->sub, 0, sizeof(sp->sub));
++                continue;
++            }
++            SDL_LockMutex(is->dbg_mutex);
++            layer->cue_decode_generation++;
++            SDL_UnlockMutex(is->dbg_mutex);
++            frame_queue_push(queue);
++            /* a paused picture is only redrawn on request: show a cue that arrives after it */
++            if (is->paused)
++                is->force_refresh = 1;
+         } else if (got_subtitle) {
+             avsubtitle_free(&sp->sub);
+         }
+     }
++
++the_end:
++    if (dec->subtitle_context_owned_by_thread) {
++        av_dict_free(&layer->startup_opts);
++        avcodec_free_context(&dec->avctx);
++        if (!startup_signaled) {
++            layer->startup_result = ret < 0 ? ret : AVERROR_EXIT;
++            SDL_SemPost(layer->startup_sem);
++        }
++    }
+     return 0;
+ }
+ 
+@@ -4340,12 +5618,78 @@ static int create_hwaccel(VideoState *is
+     return ret;
+ }
+ 
++static const char *ffp_arib_type(AVStream *st)
++{
++    const AVDictionaryEntry *entry = av_dict_get(st->metadata, "arib_type", NULL, 0);
++    if (entry && entry->value && *entry->value)
++        return entry->value;
++    return st->codecpar->codec_id == AV_CODEC_ID_ARIB_CAPTION ? "caption" : "";
++}
++
++static int ffp_arib_is_superimpose(AVStream *st)
++{
++    const char *type = ffp_arib_type(st);
++    return !av_strcasecmp(type, "superimpose");
++}
++
++/* Identity of a caption stream of a file: the ARIB decoder keeps its caption history under it, so a
++ * reopen of the same file (a new decoder) continues from it and another file starts empty. Streams
++ * that are not local files have no identity (the history is not shared). */
++static void ffp_history_key(AVFormatContext *ic, int stream_index, int layer, char *key, size_t size)
++{
++    int64_t file_size = ic->pb ? avio_size(ic->pb) : -1;
++    const char *url = ic->url ? ic->url : "";
++    const char *path = url;
++    wchar_t wide[4096];
++    struct _stat64 st;
++
++    key[0] = 0;
++    av_strstart(url, "file:", &path);
++    if (strstr(path, "://") || file_size <= 0)
++        return;
++    if (MultiByteToWideChar(CP_UTF8, 0, path, -1, wide, FF_ARRAY_ELEMS(wide)) <= 0 || _wstat64(wide, &st) < 0)
++        return;
++    snprintf(key, size, "%s|%"PRId64"|%"PRId64"|%d|%d", url, file_size, (int64_t)st.st_mtime, stream_index, layer);
++}
++
++static void ffp_subtitle_canvas_size(VideoState *is, int video_w, int video_h, AVRational sar,
++                                     int *canvas_w, int *canvas_h)
++{
++    SDL_Rect rect = { 0, 0, 1, 1 };
++    int out_w = 0, out_h = 0;
++
++    SDL_LockMutex(is->ffp->mutex);
++    out_w = is->ffp->render_w;
++    out_h = is->ffp->render_h;
++    SDL_UnlockMutex(is->ffp->mutex);
++    if (out_w <= 0 || out_h <= 0) {
++        out_w = FFMAX(is->width, 1);
++        out_h = FFMAX(is->height, 1);
++    }
++    if (video_w <= 0 || video_h <= 0) {
++        if (is->video_st) {
++            video_w = is->video_st->codecpar->width;
++            video_h = is->video_st->codecpar->height;
++        }
++    }
++    if (video_w > 0 && video_h > 0) {
++        if (sar.num <= 0 || sar.den <= 0)
++            sar = (AVRational){ 1, 1 };
++        calculate_display_rect(&rect, 0, 0, out_w, out_h, video_w, video_h, sar);
++    }
++    *canvas_w = FFMAX(rect.w, 1);
++    *canvas_h = FFMAX(rect.h, 1);
++}
++
+ /* open a given stream. Return 0 if OK */
+-static int stream_component_open(VideoState *is, int stream_index)
++static int stream_component_open(VideoState *is, int stream_index, int subtitle_layer)
+ {
+     AVFormatContext *ic = is->ic;
+-    AVCodecContext *avctx;
++    AVCodecContext *avctx = NULL;
++    const AVCodecParameters *codecpar;
+     const AVCodec *codec;
++    enum AVMediaType codec_type;
++    enum AVCodecID codec_id;
+     const char *forced_codec_name = NULL;
+     AVDictionary *opts = NULL;
+     int sample_rate;
+@@ -4354,24 +5698,31 @@ static int stream_component_open(VideoSt
+     const FFPOptions *o = is->o;
+     int stream_lowres = o->lowres;
+     int gen;
++    SubtitleLayer *sl = NULL;
++    int arib = 0;
++    int canvas_w = 0, canvas_h = 0;
++    char canvas_size[48];
++    char history_key[4200];
++    char font_option[4096];
+ 
+     if (stream_index < 0 || stream_index >= ic->nb_streams)
+         return -1;
+ 
+-    avctx = avcodec_alloc_context3(NULL);
+-    if (!avctx)
+-        return AVERROR(ENOMEM);
+-
+-    ret = avcodec_parameters_to_context(avctx, ic->streams[stream_index]->codecpar);
+-    if (ret < 0)
+-        goto fail;
+-    avctx->pkt_timebase = ic->streams[stream_index]->time_base;
++    codecpar = ic->streams[stream_index]->codecpar;
++    codec_type = codecpar->codec_type;
++    codec_id = codecpar->codec_id;
++    if (codec_type == AVMEDIA_TYPE_SUBTITLE) {
++        if (subtitle_layer < 0 || subtitle_layer >= FFP_SUBTITLE_LAYER_COUNT)
++            return AVERROR(EINVAL);
++        sl = &is->subtitles[subtitle_layer];
++    }
+ 
+-    codec = avcodec_find_decoder(avctx->codec_id);
++    codec = avcodec_find_decoder(codec_id);
+ 
+-    switch(avctx->codec_type){
++    switch(codec_type){
+         case AVMEDIA_TYPE_AUDIO   : is->last_audio_stream    = stream_index; forced_codec_name =    o->audio_codec_name; break;
+-        case AVMEDIA_TYPE_SUBTITLE: is->last_subtitle_stream = stream_index; forced_codec_name = o->subtitle_codec_name; break;
++        case AVMEDIA_TYPE_SUBTITLE: if (subtitle_layer == FFP_SUBTITLE_CAPTION) is->last_subtitle_stream = stream_index;
++                                    forced_codec_name = o->subtitle_codec_name; break;
+         case AVMEDIA_TYPE_VIDEO   : is->last_video_stream    = stream_index; forced_codec_name =    o->video_codec_name; break;
+     }
+     if (forced_codec_name)
+@@ -4380,23 +5731,37 @@ static int stream_component_open(VideoSt
+         if (forced_codec_name) av_log(NULL, AV_LOG_WARNING,
+                                       "No codec could be found with name '%s'\n", forced_codec_name);
+         else                   av_log(NULL, AV_LOG_WARNING,
+-                                      "No decoder could be found for codec %s\n", avcodec_get_name(avctx->codec_id));
++                                      "No decoder could be found for codec %s\n", avcodec_get_name(codec_id));
+         ret = AVERROR(EINVAL);
+         goto fail;
+     }
+ 
+-    avctx->codec_id = codec->id;
++    codec_id = codec->id;
++    arib = sl && codec_id == AV_CODEC_ID_ARIB_CAPTION;
++    if (!arib) {
++        avctx = avcodec_alloc_context3(NULL);
++        if (!avctx) {
++            ret = AVERROR(ENOMEM);
++            goto fail;
++        }
++        ret = avcodec_parameters_to_context(avctx, codecpar);
++        if (ret < 0)
++            goto fail;
++        avctx->pkt_timebase = ic->streams[stream_index]->time_base;
++        avctx->codec_id = codec_id;
++    }
+     if (stream_lowres > codec->max_lowres) {
+-        av_log(avctx, AV_LOG_WARNING, "The maximum value for lowres supported by the decoder is %d\n",
++        av_log(NULL, AV_LOG_WARNING, "The maximum value for lowres supported by the decoder is %d\n",
+                 codec->max_lowres);
+         stream_lowres = codec->max_lowres;
+     }
+-    avctx->lowres = stream_lowres;
+-
+-    if (o->fast)
+-        avctx->flags2 |= AV_CODEC_FLAG2_FAST;
++    if (!arib) {
++        avctx->lowres = stream_lowres;
++        if (o->fast)
++            avctx->flags2 |= AV_CODEC_FLAG2_FAST;
++    }
+ 
+-    ret = ffp_filter_codec_opts(o->codec_opts, avctx->codec_id, ic,
++    ret = ffp_filter_codec_opts(o->codec_opts, codec_id, ic,
+                                 ic->streams[stream_index], codec, &opts);
+     if (ret < 0)
+         goto fail;
+@@ -4406,9 +5771,31 @@ static int stream_component_open(VideoSt
+     if (stream_lowres)
+         av_dict_set_int(&opts, "lowres", stream_lowres, 0);
+ 
++    if (sl && arib) {
++        AVRational sar = is->video_st ? av_guess_sample_aspect_ratio(ic, is->video_st, NULL) : (AVRational){1, 1};
++        ffp_subtitle_canvas_size(is, is->video_st ? is->video_st->codecpar->width : 0,
++                                 is->video_st ? is->video_st->codecpar->height : 0, sar,
++                                 &canvas_w, &canvas_h);
++        av_dict_set(&opts, "sub_type", "bitmap", 0);
++        av_dict_set(&opts, "caption_type", subtitle_layer == FFP_SUBTITLE_SUPERIMPOSE ? "superimpose" : "caption", 0);
++        snprintf(canvas_size, sizeof(canvas_size), "%dx%d", canvas_w, canvas_h);
++        av_dict_set(&opts, "canvas_size", canvas_size, 0);
++        ffp_history_key(ic, stream_index, subtitle_layer, history_key, sizeof(history_key));
++        if (history_key[0])
++            av_dict_set(&opts, "history_key", history_key, 0);
++        if (o->arib_font && *o->arib_font) {
++            ffp_arib_font_option(font_option, sizeof(font_option), o->arib_font);
++            av_dict_set(&opts, "font", font_option, 0);
++        }
++        if (subtitle_layer == FFP_SUBTITLE_CAPTION) {
++            av_dict_set(&opts, "ignore_background", o->arib_ignore_background ? "1" : "0", 0);
++            av_dict_set(&opts, "force_outline_text", o->arib_force_outline ? "1" : "0", 0);
++        }
++    }
++
+     av_dict_set(&opts, "flags", "+copy_opaque", AV_DICT_MULTIKEY);
+ 
+-    if (avctx->codec_type == AVMEDIA_TYPE_VIDEO) {
++    if (codec_type == AVMEDIA_TYPE_VIDEO) {
+         ffp_dbg_video_reset(is);
+         ret = ffp_setup_hwaccel(is, avctx, &codec, forced_codec_name != NULL);
+         if (ret < 0)
+@@ -4428,17 +5815,31 @@ static int stream_component_open(VideoSt
+             avctx->extra_hw_frames = SDL_AtomicGet(&is->pres_state) == 1 ? 8 : 4;    /* + the frame queue, the snapshot */
+     }
+ 
+-    if ((ret = avcodec_open2(avctx, codec, &opts)) < 0) {
+-        goto fail;
++    if (!arib) {
++        if ((ret = avcodec_open2(avctx, codec, &opts)) < 0)
++            goto fail;
++        ret = ffp_check_avoptions(opts);
++        if (ret < 0)
++            goto fail;
++    }
++    if (sl) {
++        sl->canvas_width = arib ? canvas_w : 0;
++        sl->canvas_height = arib ? canvas_h : 0;
++        sl->resize_requested_width = arib ? canvas_w : 0;
++        sl->resize_requested_height = arib ? canvas_h : 0;
++    }
++    if (codec_type == AVMEDIA_TYPE_SUBTITLE) {
++        if (!arib)
++            ffp_dbg_subtitle_open(is, subtitle_layer, avctx, codec, stream_index, 0);
++    } else {
++        ffp_dbg_stream_open(is, avctx, codec, stream_index);
+     }
+-    ret = ffp_check_avoptions(opts);
+-    if (ret < 0)
+-        goto fail;
+-    ffp_dbg_stream_open(is, avctx, codec, stream_index);
+ 
+-    is->eof = 0;
+-    ic->streams[stream_index]->discard = AVDISCARD_DEFAULT;
+-    switch (avctx->codec_type) {
++    if (codec_type != AVMEDIA_TYPE_SUBTITLE) {
++        SDL_AtomicSet(&is->eof, 0);
++        ic->streams[stream_index]->discard = AVDISCARD_DEFAULT;
++    }
++    switch (codec_type) {
+     case AVMEDIA_TYPE_AUDIO:
+         {
+             AVFilterContext *sink;
+@@ -4482,7 +5883,7 @@ static int stream_component_open(VideoSt
+             is->auddec.start_pts = is->audio_st->start_time;
+             is->auddec.start_pts_tb = is->audio_st->time_base;
+         }
+-        if ((ret = decoder_start(&is->auddec, audio_thread, "audio_decoder", is)) < 0)
++        if ((ret = decoder_start(&is->auddec, stream_index, audio_thread, "audio_decoder", is)) < 0)
+             goto out;
+         SDL_PauseAudioDevice(is->audio_dev, 0);
+         break;
+@@ -4494,18 +5895,143 @@ static int stream_component_open(VideoSt
+             goto fail;
+         is->viddec.reorder_pts = o->decoder_reorder_pts;
+         is->viddec.vs = is;
+-        if ((ret = decoder_start(&is->viddec, video_thread, "video_decoder", is)) < 0)
++        if ((ret = decoder_start(&is->viddec, stream_index, video_thread, "video_decoder", is)) < 0)
+             goto out;
+         is->queue_attachments_req = 1;
+         break;
+     case AVMEDIA_TYPE_SUBTITLE:
+-        is->subtitle_stream = stream_index;
+-        is->subtitle_st = ic->streams[stream_index];
+-
+-        if ((ret = decoder_init(&is->subdec, avctx, &is->subtitleq, is->continue_read_thread)) < 0)
+-            goto fail;
+-        if ((ret = decoder_start(&is->subdec, subtitle_thread, "subtitle_decoder", is)) < 0)
+-            goto out;
++        sl->is = is;
++        sl->id = subtitle_layer;
++        sl->visible = SDL_AtomicGet(&is->ffp->subtitle_visible[subtitle_layer]);
++        packet_queue_abort_routed(&sl->packets, &sl->routing_stream_index);
++        if (arib) {
++            sl->stream_index = -1;
++            sl->st = NULL;
++            sl->is_arib = 0;
++            sl->startup_stream_index = stream_index;
++        } else {
++            sl->stream_index = stream_index;
++            sl->st = ic->streams[stream_index];
++            sl->is_arib = 0;
++            sl->startup_stream_index = -1;
++        }
++        if (arib) {
++            sl->canvas_width = canvas_w;
++            sl->canvas_height = canvas_h;
++        }
++        sl->active_serial = -1;
++        sl->attime_requested_serial = -1;
++        sl->event_serial = -1;
++        SDL_AtomicSet(&sl->attime_applied, 0);
++        sl->re_renders = 0;
++        SDL_AtomicSet(&sl->cues_shown, 0);
++        SDL_AtomicSet(&sl->cues_cleared, 0);
++        SDL_AtomicSet(&sl->cues_uploaded, 0);
++        SDL_LockMutex(is->dbg_mutex);
++        sl->cue_decode_generation = 0;
++        SDL_UnlockMutex(is->dbg_mutex);
++        if (arib) {
++            if (!(sl->startup_sem = SDL_CreateSemaphore(0))) {
++                ret = AVERROR(ENOMEM);
++                goto fail;
++            }
++            if (!(sl->startup_release_sem = SDL_CreateSemaphore(0))) {
++                SDL_DestroySemaphore(sl->startup_sem);
++                sl->startup_sem = NULL;
++                ret = AVERROR(ENOMEM);
++                goto fail;
++            }
++            if ((ret = decoder_init(&sl->decoder, NULL, &sl->packets, is->continue_read_thread)) < 0) {
++                SDL_DestroySemaphore(sl->startup_sem);
++                SDL_DestroySemaphore(sl->startup_release_sem);
++                sl->startup_sem = NULL;
++                sl->startup_release_sem = NULL;
++                goto fail;
++            }
++            sl->decoder.subtitle_layer = sl;
++            sl->decoder.subtitle_context_owned_by_thread = 1;
++            sl->startup_codec = codec;
++            sl->startup_codecpar = codecpar;
++            sl->startup_pkt_timebase = ic->streams[stream_index]->time_base;
++            sl->startup_lowres = stream_lowres;
++            sl->startup_fast = o->fast;
++            sl->startup_result = AVERROR(EAGAIN);
++            sl->startup_opts = opts;
++            opts = NULL;
++            ret = decoder_start_routed_subtitle(&sl->decoder, &sl->routing_stream_index,
++                                                stream_index, subtitle_thread, "subtitle_decoder", sl);
++            if (ret < 0) {
++                av_dict_free(&sl->startup_opts);
++                decoder_destroy(&sl->decoder);
++                SDL_DestroySemaphore(sl->startup_sem);
++                SDL_DestroySemaphore(sl->startup_release_sem);
++                sl->startup_sem = NULL;
++                sl->startup_release_sem = NULL;
++                sl->startup_codec = NULL;
++                sl->startup_codecpar = NULL;
++                sl->startup_stream_index = -1;
++                sl->stream_index = -1;
++                sl->st = NULL;
++                sl->is_arib = 0;
++                ic->streams[stream_index]->discard = AVDISCARD_ALL;
++                goto out;
++            }
++            ic->streams[stream_index]->discard = AVDISCARD_DEFAULT;
++            if (SDL_SemWait(sl->startup_sem) < 0)
++                ret = AVERROR_EXTERNAL;
++            else
++                ret = sl->startup_result;
++            if (ret < 0) {
++                packet_queue_abort_routed(&sl->packets, &sl->routing_stream_index);
++                ic->streams[stream_index]->discard = AVDISCARD_ALL;
++                if (sl->startup_release_sem)
++                    SDL_SemPost(sl->startup_release_sem);
++                decoder_abort(&sl->decoder, &sl->frames);
++                if (sl->startup_sem)
++                    SDL_DestroySemaphore(sl->startup_sem);
++                sl->startup_sem = NULL;
++                if (sl->startup_release_sem)
++                    SDL_DestroySemaphore(sl->startup_release_sem);
++                sl->startup_release_sem = NULL;
++                decoder_destroy(&sl->decoder);
++                sl->startup_codec = NULL;
++                sl->startup_codecpar = NULL;
++                sl->startup_stream_index = -1;
++                sl->stream_index = -1;
++                sl->st = NULL;
++                sl->is_arib = 0;
++                goto out;
++            }
++            SDL_DestroySemaphore(sl->startup_sem);
++            sl->startup_sem = NULL;
++            sl->startup_codec = NULL;
++            sl->startup_codecpar = NULL;
++            sl->startup_stream_index = -1;
++            sl->stream_index = stream_index;
++            sl->st = ic->streams[stream_index];
++            sl->is_arib = 1;
++            SDL_SemPost(sl->startup_release_sem);
++        } else {
++            if ((ret = decoder_init(&sl->decoder, avctx, &sl->packets, is->continue_read_thread)) < 0) {
++                ffp_dbg_subtitle_closed(is, subtitle_layer);
++                sl->stream_index = -1;
++                sl->st = NULL;
++                goto fail;
++            }
++            sl->decoder.subtitle_layer = sl;
++            if ((ret = decoder_start_routed_subtitle(&sl->decoder, &sl->routing_stream_index,
++                                                     stream_index, subtitle_thread,
++                                                     "subtitle_decoder", sl)) < 0) {
++                ffp_dbg_subtitle_closed(is, subtitle_layer);
++                decoder_destroy(&sl->decoder);
++                sl->stream_index = -1;
++                sl->st = NULL;
++                sl->is_arib = 0;
++                ic->streams[stream_index]->discard = AVDISCARD_ALL;
++                goto out;
++            }
++            ic->streams[stream_index]->discard = AVDISCARD_DEFAULT;
++        }
+         break;
+     default:
+         break;
+@@ -4513,9 +6039,26 @@ static int stream_component_open(VideoSt
+     goto out;
+ 
+ fail:
+-    if (avctx->codec_type == AVMEDIA_TYPE_AUDIO)
++    if (codec_type == AVMEDIA_TYPE_AUDIO)
+         avfilter_graph_free(&is->agraph);
+-    avcodec_free_context(&avctx);
++    if (arib && sl && sl->startup_stream_index == stream_index) {
++        packet_queue_abort_routed(&sl->packets, &sl->routing_stream_index);
++        if (sl->startup_sem)
++            SDL_DestroySemaphore(sl->startup_sem);
++        sl->startup_sem = NULL;
++        if (sl->startup_release_sem)
++            SDL_DestroySemaphore(sl->startup_release_sem);
++        sl->startup_release_sem = NULL;
++        sl->startup_codec = NULL;
++        sl->startup_codecpar = NULL;
++        sl->startup_stream_index = -1;
++        sl->stream_index = -1;
++        sl->st = NULL;
++        sl->is_arib = 0;
++        ic->streams[stream_index]->discard = AVDISCARD_ALL;
++    }
++    if (avctx)
++        avcodec_free_context(&avctx);
+ out:
+     av_channel_layout_uninit(&ch_layout);
+     av_dict_free(&opts);
+@@ -4536,6 +6079,45 @@ static int stream_has_enough_packets(AVS
+            queue->nb_packets > MIN_FRAMES && (!queue->duration || av_q2d(st->time_base) * queue->duration > 1.0);
+ }
+ 
++static int ffp_find_arib_stream(AVFormatContext *ic, int video_index, const char *wanted_type)
++{
++    AVProgram *program = video_index >= 0 ? av_find_program_from_stream(ic, NULL, video_index) : NULL;
++    int pass, i;
++
++    for (pass = 0; pass < (program && av_strcasecmp(wanted_type, "superimpose") ? 2 : 1); pass++) {
++        int count = pass == 0 && program ? program->nb_stream_indexes : ic->nb_streams;
++        for (i = 0; i < count; i++) {
++            int index = pass == 0 && program ? program->stream_index[i] : i;
++            AVStream *st = ic->streams[index];
++            const char *type;
++            if (st->codecpar->codec_type != AVMEDIA_TYPE_SUBTITLE ||
++                st->codecpar->codec_id != AV_CODEC_ID_ARIB_CAPTION)
++                continue;
++            type = ffp_arib_type(st);
++            if (!av_strcasecmp(type, wanted_type))
++                return index;
++        }
++    }
++    return -1;
++}
++
++static int ffp_find_non_super_subtitle(AVFormatContext *ic, int video_index)
++{
++    AVProgram *program = video_index >= 0 ? av_find_program_from_stream(ic, NULL, video_index) : NULL;
++    int pass, i;
++
++    for (pass = 0; pass < (program ? 2 : 1); pass++) {
++        int count = pass == 0 && program ? program->nb_stream_indexes : ic->nb_streams;
++        for (i = 0; i < count; i++) {
++            int index = pass == 0 && program ? program->stream_index[i] : i;
++            AVStream *st = ic->streams[index];
++            if (st->codecpar->codec_type == AVMEDIA_TYPE_SUBTITLE && !ffp_arib_is_superimpose(st))
++                return index;
++        }
++    }
++    return -1;
++}
++
+ static int is_realtime(AVFormatContext *s)
+ {
+     if(   !strcmp(s->iformat->name, "rtp")
+@@ -4620,7 +6202,9 @@ static void ffp_build_media_info(VideoSt
+         switch (par->codec_type) {
+         case AVMEDIA_TYPE_VIDEO:    type = "video";    selected = i == is->video_stream;    break;
+         case AVMEDIA_TYPE_AUDIO:    type = "audio";    selected = i == is->audio_stream;    break;
+-        case AVMEDIA_TYPE_SUBTITLE: type = "subtitle"; selected = i == is->subtitle_stream; break;
++        case AVMEDIA_TYPE_SUBTITLE: type = "subtitle"; selected =
++            i == is->subtitles[FFP_SUBTITLE_CAPTION].stream_index ||
++            i == is->subtitles[FFP_SUBTITLE_SUPERIMPOSE].stream_index; break;
+         default: continue;
+         }
+         if (!first)
+@@ -4649,6 +6233,21 @@ static void ffp_build_media_info(VideoSt
+         } else if (par->codec_type == AVMEDIA_TYPE_AUDIO) {
+             av_bprintf(bp, ",\"sample_rate\":%d,\"channels\":%d",
+                        par->sample_rate, par->ch_layout.nb_channels);
++        } else if (par->codec_type == AVMEDIA_TYPE_SUBTITLE &&
++                   (par->codec_id == AV_CODEC_ID_ARIB_CAPTION || av_dict_get(st->metadata, "arib_type", NULL, 0))) {
++            char *end = NULL;
++            long component_tag = -1;
++            av_bprintf(bp, ",\"arib_type\":");
++            json_string(bp, ffp_arib_type(st));
++            t = av_dict_get(st->metadata, "component_tag", NULL, 0);
++            if (!t)
++                t = av_dict_get(st->metadata, "arib_component_tag", NULL, 0);
++            if (t && t->value && *t->value) {
++                long parsed = strtol(t->value, &end, 0);
++                if (end && !*end && parsed >= 0 && parsed <= 255)
++                    component_tag = parsed;
++            }
++            av_bprintf(bp, ",\"component_tag\":%ld", component_tag);
+         }
+         av_bprintf(bp, ",\"selected\":%s,\"language\":", selected ? "true" : "false");
+         t = av_dict_get(st->metadata, "language", NULL, 0);
+@@ -4738,6 +6337,11 @@ static int read_thread(void *arg)
+     int err, i, ret;
+     int aret = AVERROR_STREAM_NOT_FOUND, vret = AVERROR_STREAM_NOT_FOUND;
+     int st_index[AVMEDIA_TYPE_NB];
++    int super_index = -1;
++    int audio_route_index, audio_route_serial;
++    int video_route_index, video_route_serial;
++    int subtitle_route_index[FFP_SUBTITLE_LAYER_COUNT];
++    int subtitle_route_serial[FFP_SUBTITLE_LAYER_COUNT];
+     AVPacket *pkt = NULL;
+     int64_t stream_start_time;
+     char metadata_description[96];
+@@ -4754,7 +6358,7 @@ static int read_thread(void *arg)
+     }
+ 
+     memset(st_index, -1, sizeof(st_index));
+-    is->eof = 0;
++    SDL_AtomicSet(&is->eof, 0);
+ 
+     pkt = av_packet_alloc();
+     if (!pkt) {
+@@ -4883,14 +6487,25 @@ static int read_thread(void *arg)
+                                 st_index[AVMEDIA_TYPE_AUDIO],
+                                 st_index[AVMEDIA_TYPE_VIDEO],
+                                 NULL, 0);
+-    if (!o->video_disable && !o->subtitle_disable)
+-        st_index[AVMEDIA_TYPE_SUBTITLE] =
+-            av_find_best_stream(ic, AVMEDIA_TYPE_SUBTITLE,
+-                                st_index[AVMEDIA_TYPE_SUBTITLE],
+-                                (st_index[AVMEDIA_TYPE_AUDIO] >= 0 ?
+-                                 st_index[AVMEDIA_TYPE_AUDIO] :
+-                                 st_index[AVMEDIA_TYPE_VIDEO]),
+-                                NULL, 0);
++    if (!o->video_disable && !o->subtitle_disable) {
++        int requested = st_index[AVMEDIA_TYPE_SUBTITLE];
++        int related = st_index[AVMEDIA_TYPE_AUDIO] >= 0 ? st_index[AVMEDIA_TYPE_AUDIO] : st_index[AVMEDIA_TYPE_VIDEO];
++        int best = requested == INT_MAX ? AVERROR_STREAM_NOT_FOUND :
++                   av_find_best_stream(ic, AVMEDIA_TYPE_SUBTITLE, requested, related, NULL, 0);
++        int selected = best;
++        int arib_caption = ffp_find_arib_stream(ic, st_index[AVMEDIA_TYPE_VIDEO], "caption");
++
++        if (requested == INT_MAX) {
++            selected = INT_MAX;
++        } else if (!o->wanted_stream_spec[AVMEDIA_TYPE_SUBTITLE] && arib_caption >= 0) {
++            selected = arib_caption;
++        }
++        if (selected < 0 || (selected < ic->nb_streams && ffp_arib_is_superimpose(ic->streams[selected])))
++            selected = ffp_find_non_super_subtitle(ic, st_index[AVMEDIA_TYPE_VIDEO]);
++        st_index[AVMEDIA_TYPE_SUBTITLE] = selected;
++        if (o->superimpose)
++            super_index = ffp_find_arib_stream(ic, st_index[AVMEDIA_TYPE_VIDEO], "superimpose");
++    }
+ 
+     is->show_mode = o->show_mode;
+     if (st_index[AVMEDIA_TYPE_VIDEO] >= 0) {
+@@ -4903,18 +6518,20 @@ static int read_thread(void *arg)
+ 
+     /* open the streams */
+     if (st_index[AVMEDIA_TYPE_AUDIO] >= 0) {
+-        aret = stream_component_open(is, st_index[AVMEDIA_TYPE_AUDIO]);
++        aret = stream_component_open(is, st_index[AVMEDIA_TYPE_AUDIO], -1);
+     }
+ 
+     if (st_index[AVMEDIA_TYPE_VIDEO] >= 0) {
+-        vret = stream_component_open(is, st_index[AVMEDIA_TYPE_VIDEO]);
++        vret = stream_component_open(is, st_index[AVMEDIA_TYPE_VIDEO], -1);
+     }
+     if (is->show_mode == SHOW_MODE_NONE)
+         is->show_mode = vret >= 0 ? SHOW_MODE_VIDEO : SHOW_MODE_RDFT;
+ 
+     if (st_index[AVMEDIA_TYPE_SUBTITLE] >= 0) {
+-        stream_component_open(is, st_index[AVMEDIA_TYPE_SUBTITLE]);
++        stream_component_open(is, st_index[AVMEDIA_TYPE_SUBTITLE], FFP_SUBTITLE_CAPTION);
+     }
++    if (super_index >= 0)
++        stream_component_open(is, super_index, FFP_SUBTITLE_SUPERIMPOSE);
+ 
+     if (is->video_stream < 0 && is->audio_stream < 0) {
+         av_log(NULL, AV_LOG_FATAL, "Failed to open file '%s' or configure filtergraph\n",
+@@ -4965,8 +6582,9 @@ static int read_thread(void *arg)
+             } else {
+                 if (is->audio_stream >= 0)
+                     packet_queue_flush(&is->audioq);
+-                if (is->subtitle_stream >= 0)
+-                    packet_queue_flush(&is->subtitleq);
++                for (i = 0; i < FFP_SUBTITLE_LAYER_COUNT; i++)
++                    if (SDL_AtomicGet(&is->subtitles[i].routing_stream_index) >= 0)
++                        packet_queue_flush(&is->subtitles[i].packets);
+                 if (is->video_stream >= 0)
+                     packet_queue_flush(&is->videoq);
+                 if (is->seek_flags & AVSEEK_FLAG_BYTE) {
+@@ -4977,7 +6595,7 @@ static int read_thread(void *arg)
+             }
+             is->seek_req = 0;
+             is->queue_attachments_req = 1;
+-            is->eof = 0;
++            SDL_AtomicSet(&is->eof, 0);
+             SDL_AtomicSet(&is->eof_notified, 0);
+             if (is->paused)
+                 step_to_next_frame(is);
+@@ -4992,17 +6610,21 @@ static int read_thread(void *arg)
+             is->queue_attachments_req = 0;
+         }
+ 
+-        /* if the queue are full, no need to read more */
+-        if (is->infinite_buffer<1 &&
+-              (is->audioq.size + is->videoq.size + is->subtitleq.size > MAX_QUEUE_SIZE
+-            || (stream_has_enough_packets(is->audio_st, is->audio_stream, &is->audioq) &&
+-                stream_has_enough_packets(is->video_st, is->video_stream, &is->videoq) &&
+-                stream_has_enough_packets(is->subtitle_st, is->subtitle_stream, &is->subtitleq)))) {
+-            /* wait 10 ms */
+-            SDL_LockMutex(wait_mutex);
+-            SDL_CondWaitTimeout(is->continue_read_thread, wait_mutex, 10);
+-            SDL_UnlockMutex(wait_mutex);
+-            continue;
++        {
++            /* The caption / superimpose queues are not asked for "enough":
++             * their streams are sparse (a cue every few seconds) and never reach MIN_FRAMES, which made the read-ahead
++             * run to MAX_QUEUE_SIZE (~11 s / 15 MB of broadcast video) whenever captions were on. Their packets are
++             * interleaved with audio / video in the container, so reading for audio / video delivers them in time. */
++            if (is->infinite_buffer<1 &&
++                  (is->audioq.size + is->videoq.size + is->subtitles[FFP_SUBTITLE_CAPTION].packets.size +
++                   is->subtitles[FFP_SUBTITLE_SUPERIMPOSE].packets.size > MAX_QUEUE_SIZE
++                || (stream_has_enough_packets(is->audio_st, is->audio_stream, &is->audioq) &&
++                    stream_has_enough_packets(is->video_st, is->video_stream, &is->videoq)))) {
++                SDL_LockMutex(wait_mutex);
++                SDL_CondWaitTimeout(is->continue_read_thread, wait_mutex, 10);
++                SDL_UnlockMutex(wait_mutex);
++                continue;
++            }
+         }
+         if (!is->paused &&
+             (!is->audio_st || (is->auddec.finished == is->audioq.serial && frame_queue_nb_remaining(&is->sampq) == 0)) &&
+@@ -5017,16 +6639,24 @@ static int read_thread(void *arg)
+                 ffp_set_state(ffp, FFP_ST_ENDED, 0);
+             }
+         }
++        packet_queue_av_snapshot(&is->audioq, &audio_route_index, &audio_route_serial);
++        packet_queue_av_snapshot(&is->videoq, &video_route_index, &video_route_serial);
++        for (i = 0; i < FFP_SUBTITLE_LAYER_COUNT; i++)
++            packet_queue_route_snapshot(&is->subtitles[i].packets,
++                                        &is->subtitles[i].routing_stream_index,
++                                        &subtitle_route_index[i], &subtitle_route_serial[i]);
+         ret = av_read_frame(ic, pkt);
+         if (ret < 0) {
+-            if ((ret == AVERROR_EOF || avio_feof(ic->pb)) && !is->eof) {
+-                if (is->video_stream >= 0)
+-                    packet_queue_put_nullpacket(&is->videoq, pkt, is->video_stream);
+-                if (is->audio_stream >= 0)
+-                    packet_queue_put_nullpacket(&is->audioq, pkt, is->audio_stream);
+-                if (is->subtitle_stream >= 0)
+-                    packet_queue_put_nullpacket(&is->subtitleq, pkt, is->subtitle_stream);
+-                is->eof = 1;
++            if (ret == AVERROR_EOF || avio_feof(ic->pb)) {
++                packet_queue_put_av_nullpacket(&is->videoq, video_route_index, video_route_serial);
++                packet_queue_put_av_nullpacket(&is->audioq, audio_route_index, audio_route_serial);
++                for (i = 0; i < FFP_SUBTITLE_LAYER_COUNT; i++)
++                    packet_queue_put_routed_nullpacket(&is->subtitles[i].packets,
++                                                       &is->subtitles[i].routing_stream_index,
++                                                       subtitle_route_index[i],
++                                                       subtitle_route_serial[i], pkt);
++                av_packet_unref(pkt);
++                SDL_AtomicSet(&is->eof, 1);
+             }
+             if (ic->pb && ic->pb->error) {
+                 ret = ic->pb->error;
+@@ -5037,7 +6667,7 @@ static int read_thread(void *arg)
+             SDL_UnlockMutex(wait_mutex);
+             continue;
+         } else {
+-            is->eof = 0;
++            SDL_AtomicSet(&is->eof, 0);
+         }
+ 
+         if (o->show_status && ic->streams[pkt->stream_index]->event_flags &
+@@ -5065,8 +6695,18 @@ static int read_thread(void *arg)
+         } else if (pkt->stream_index == is->video_stream && pkt_in_play_range
+                    && !(is->video_st->disposition & AV_DISPOSITION_ATTACHED_PIC)) {
+             packet_queue_put(&is->videoq, pkt);
+-        } else if (pkt->stream_index == is->subtitle_stream && pkt_in_play_range) {
+-            packet_queue_put(&is->subtitleq, pkt);
++        } else if (pkt->stream_index == subtitle_route_index[FFP_SUBTITLE_CAPTION] && pkt_in_play_range) {
++            packet_queue_put_routed(&is->subtitles[FFP_SUBTITLE_CAPTION].packets,
++                                    &is->subtitles[FFP_SUBTITLE_CAPTION].routing_stream_index,
++                                    subtitle_route_index[FFP_SUBTITLE_CAPTION],
++                                    subtitle_route_serial[FFP_SUBTITLE_CAPTION], pkt);
++            av_packet_unref(pkt);
++        } else if (pkt->stream_index == subtitle_route_index[FFP_SUBTITLE_SUPERIMPOSE] && pkt_in_play_range) {
++            packet_queue_put_routed(&is->subtitles[FFP_SUBTITLE_SUPERIMPOSE].packets,
++                                    &is->subtitles[FFP_SUBTITLE_SUPERIMPOSE].routing_stream_index,
++                                    subtitle_route_index[FFP_SUBTITLE_SUPERIMPOSE],
++                                    subtitle_route_serial[FFP_SUBTITLE_SUPERIMPOSE], pkt);
++            av_packet_unref(pkt);
+         } else {
+             av_packet_unref(pkt);
+         }
+@@ -5088,6 +6728,7 @@ static int read_thread(void *arg)
+ static VideoState *stream_open(FFPlayer *ffp, const char *filename, FFPOptions *o)
+ {
+     VideoState *is;
++    int i;
+ 
+     is = av_mallocz(sizeof(VideoState));
+     if (!is) {
+@@ -5099,8 +6740,19 @@ static VideoState *stream_open(FFPlayer
+     is->id = SDL_AtomicAdd(&g_ffp.next_id, 1) + 1;
+     is->last_video_stream = is->video_stream = -1;
+     is->last_audio_stream = is->audio_stream = -1;
+-    is->last_subtitle_stream = is->subtitle_stream = -1;
++    is->last_subtitle_stream = -1;
+     is->last_seek_pos = NAN;
++    for (i = 0; i < FFP_SUBTITLE_LAYER_COUNT; i++) {
++        is->subtitles[i].is = is;
++        is->subtitles[i].id = i;
++        is->subtitles[i].stream_index = -1;
++        SDL_AtomicSet(&is->subtitles[i].routing_stream_index, -1);
++        is->subtitles[i].startup_stream_index = -1;
++        is->subtitles[i].active_serial = -1;
++        is->subtitles[i].active_start = is->subtitles[i].active_end = NAN;
++        is->subtitles[i].d3d_generation = UINT64_MAX;
++        is->subtitles[i].visible = SDL_AtomicGet(&ffp->subtitle_visible[i]);
++    }
+     if (ffp->d3d) {
+         /* the presenter's CUDA context (~100 MB private, ~160 MB GPU) only for an open that uses CUDA: a CUDA decoder or
+          * filter / filter device. A later change that adds CUDA reopens the item (new hwaccel / filter_hw_device). */
+@@ -5128,15 +6780,19 @@ static VideoState *stream_open(FFPlayer
+     /* start video display */
+     if (frame_queue_init(&is->pictq, &is->videoq, VIDEO_PICTURE_QUEUE_SIZE, 1) < 0)
+         goto fail;
+-    if (frame_queue_init(&is->subpq, &is->subtitleq, SUBPICTURE_QUEUE_SIZE, 0) < 0)
+-        goto fail;
+     if (frame_queue_init(&is->sampq, &is->audioq, SAMPLE_QUEUE_SIZE, 1) < 0)
+         goto fail;
++    for (i = 0; i < FFP_SUBTITLE_LAYER_COUNT; i++)
++        if (frame_queue_init(&is->subtitles[i].frames, &is->subtitles[i].packets,
++                             SUBPICTURE_QUEUE_SIZE, 0) < 0)
++            goto fail;
+ 
+     if (packet_queue_init(&is->videoq) < 0 ||
+-        packet_queue_init(&is->audioq) < 0 ||
+-        packet_queue_init(&is->subtitleq) < 0)
++        packet_queue_init(&is->audioq) < 0)
+         goto fail;
++    for (i = 0; i < FFP_SUBTITLE_LAYER_COUNT; i++)
++        if (packet_queue_init(&is->subtitles[i].packets) < 0)
++            goto fail;
+ 
+     if (!(is->continue_read_thread = SDL_CreateCond())) {
+         av_log(NULL, AV_LOG_FATAL, "SDL_CreateCond(): %s\n", SDL_GetError());
+@@ -5191,7 +6847,7 @@ static void stream_cycle_channel(VideoSt
+         old_index = is->audio_stream;
+     } else {
+         start_index = is->last_subtitle_stream;
+-        old_index = is->subtitle_stream;
++        old_index = is->subtitles[FFP_SUBTITLE_CAPTION].stream_index;
+     }
+     stream_index = start_index;
+ 
+@@ -5233,8 +6889,11 @@ static void stream_cycle_channel(VideoSt
+                     goto the_end;
+                 break;
+             case AVMEDIA_TYPE_VIDEO:
+-            case AVMEDIA_TYPE_SUBTITLE:
+                 goto the_end;
++            case AVMEDIA_TYPE_SUBTITLE:
++                if (!ffp_arib_is_superimpose(st))
++                    goto the_end;
++                break;
+             default:
+                 break;
+             }
+@@ -5248,8 +6907,8 @@ static void stream_cycle_channel(VideoSt
+            old_index,
+            stream_index);
+ 
+-    stream_component_close(is, old_index);
+-    stream_component_open(is, stream_index);
++    stream_component_close(is, old_index, codec_type == AVMEDIA_TYPE_SUBTITLE ? FFP_SUBTITLE_CAPTION : -1);
++    stream_component_open(is, stream_index, codec_type == AVMEDIA_TYPE_SUBTITLE ? FFP_SUBTITLE_CAPTION : -1);
+ }
+ 
+ 
+@@ -5645,6 +7304,155 @@ static void ffp_pres_teardown(FFPlayer *
+     ffp_set_dbg_renderer(ffp);
+ }
+ 
++static void ffp_d3d_overlay_free(FFPOverlayRect *rects, uint8_t **pixels, int count)
++{
++    int i;
++    if (pixels) {
++        for (i = 0; i < count; i++)
++            av_free(pixels[i]);
++    }
++    av_free(pixels);
++    av_free(rects);
++}
++
++static int ffp_d3d_overlay_build(VideoState *is, SubtitleLayer *layer,
++                                 FFPOverlayRect **out_rects, uint8_t ***out_pixels, int *out_count)
++{
++    FFPOverlayRect *rects = NULL;
++    uint8_t **pixels = NULL;
++    int count = 0, i;
++
++    *out_rects = NULL;
++    *out_pixels = NULL;
++    *out_count = 0;
++    if (!layer->active_valid || layer->active.format != 0 || !layer->active.num_rects)
++        return 0;
++    rects = av_calloc(layer->active.num_rects, sizeof(*rects));
++    pixels = av_calloc(layer->active.num_rects, sizeof(*pixels));
++    if (!rects || !pixels)
++        goto nomem;
++
++    for (i = 0; i < layer->active.num_rects; i++) {
++        AVSubtitleRect *r = layer->active.rects[i];
++        int x, y, w, h, sx, sy, stride;
++        const uint8_t *src[4];
++        int src_stride[4];
++        uint8_t *dst[4];
++        int dst_stride[4];
++
++        if (!r || !r->data[0] || !r->data[1] || r->w <= 0 || r->h <= 0)
++            continue;
++        x = av_clip(r->x, 0, layer->active_width);
++        y = av_clip(r->y, 0, layer->active_height);
++        w = av_clip(r->w - (x - r->x), 0, layer->active_width - x);
++        h = av_clip(r->h - (y - r->y), 0, layer->active_height - y);
++        sx = x - r->x;
++        sy = y - r->y;
++        if (w <= 0 || h <= 0)
++            continue;
++        stride = w * 4;
++        pixels[count] = av_malloc((size_t)stride * h);
++        if (!pixels[count])
++            goto nomem;
++        src[0] = r->data[0] + sy * r->linesize[0] + sx;
++        src[1] = r->data[1];
++        src[2] = src[3] = NULL;
++        src_stride[0] = r->linesize[0];
++        src_stride[1] = r->linesize[1];
++        src_stride[2] = src_stride[3] = 0;
++        dst[0] = pixels[count];
++        dst[1] = dst[2] = dst[3] = NULL;
++        dst_stride[0] = stride;
++        dst_stride[1] = dst_stride[2] = dst_stride[3] = 0;
++        is->subtitle_rgba_ctx = sws_getCachedContext(is->subtitle_rgba_ctx, w, h, AV_PIX_FMT_PAL8,
++            w, h, AV_PIX_FMT_RGBA, SWS_POINT, NULL, NULL, NULL);
++        if (!is->subtitle_rgba_ctx)
++            goto nomem;
++        if (sws_scale(is->subtitle_rgba_ctx, src, src_stride, 0, h, dst, dst_stride) < 0)
++            goto nomem;
++        rects[count].rgba = pixels[count];
++        rects[count].x = x;
++        rects[count].y = y;
++        rects[count].width = w;
++        rects[count].height = h;
++        rects[count].stride = stride;
++        count++;
++    }
++    *out_rects = rects;
++    *out_pixels = pixels;
++    *out_count = count;
++    return 0;
++
++nomem:
++    ffp_d3d_overlay_free(rects, pixels, layer->active.num_rects);
++    return AVERROR(ENOMEM);
++}
++
++static int ffp_d3d_sync_overlays(VideoState *is)
++{
++    FFPlayer *ffp = is->ffp;
++    int i;
++    for (i = 0; i < FFP_SUBTITLE_LAYER_COUNT; i++) {
++        SubtitleLayer *layer = &is->subtitles[i];
++        FFPOverlayLayer overlay;
++        FFPOverlayRect *rects = NULL, placeholder;
++        uint8_t **pixels = NULL;
++        int rect_count = 0;
++        int canvas_width, canvas_height;
++        int width, height, visible, content_changed;
++        char err[256] = "";
++        int ret;
++
++        SDL_LockMutex(is->dbg_mutex);
++        canvas_width = layer->canvas_width;
++        canvas_height = layer->canvas_height;
++        SDL_UnlockMutex(is->dbg_mutex);
++        width = layer->active_valid ? layer->active_width : canvas_width;
++        height = layer->active_valid ? layer->active_height : canvas_height;
++        visible = ffp_subtitle_visible(is, i);
++        content_changed = layer->d3d_generation != layer->generation ||
++                          layer->d3d_canvas_width != width || layer->d3d_canvas_height != height;
++        memset(&overlay, 0, sizeof(overlay));
++        memset(&placeholder, 0, sizeof(placeholder));
++        overlay.generation = layer->generation;
++        overlay.visible = visible;
++        overlay.canvas_width = width;
++        overlay.canvas_height = height;
++        if (content_changed) {
++            ret = ffp_d3d_overlay_build(is, layer, &rects, &pixels, &rect_count);
++            if (ret < 0) {
++                av_log(NULL, AV_LOG_WARNING, "could not convert D3D11 subtitle overlay: %s\n", av_err2str(ret));
++                continue;
++            }
++            overlay.rects = rects;
++            overlay.rect_count = rect_count;
++        } else {
++            overlay.rects = layer->d3d_rect_count ? &placeholder : NULL;
++            overlay.rect_count = layer->d3d_rect_count;
++        }
++        if (content_changed || layer->d3d_visible != visible) {
++            ret = ffp_d3d11_set_overlay(ffp->d3d, i, &overlay, err, sizeof(err));
++            if (ret < 0) {
++                av_log(NULL, AV_LOG_WARNING, "D3D11 %s overlay update failed: %s\n",
++                       i == FFP_SUBTITLE_CAPTION ? "caption" : "superimpose",
++                       err[0] ? err : "unknown error");
++            } else {
++                if (content_changed) {
++                    layer->d3d_generation = layer->generation;
++                    layer->d3d_canvas_width = width;
++                    layer->d3d_canvas_height = height;
++                    layer->d3d_rect_count = rect_count;
++                    if (layer->active_valid && rect_count)
++                        SDL_AtomicAdd(&layer->cues_uploaded, 1);
++                }
++                layer->d3d_visible = visible;
++            }
++        }
++        ffp_d3d_overlay_free(rects, pixels, rect_count);
++    }
++    return 0;
++}
++
+ static int ffp_d3d_display(VideoState *is)
+ {
+     FFPlayer *ffp = is->ffp;
+@@ -5656,10 +7464,9 @@ static int ffp_d3d_display(VideoState *i
+     if (!is->video_st || (is->audio_st && is->show_mode != SHOW_MODE_VIDEO))
+         return g_pres_sdl.display(is);
+     vp = frame_queue_peek_last(&is->pictq);
+-    if (!vp->snapped) {
+-        ffp_store_snapshot(ffp, vp);
+-        vp->snapped = 1;
+-    }
++    ffp_d3d_sync_overlays(is);
++    ffp_store_snapshot(ffp, is, vp);
++    vp->snapped = 1;
+     SDL_LockMutex(ffp->mutex);
+     pp = ffp->pparams;
+     SDL_UnlockMutex(ffp->mutex);
+@@ -5674,6 +7481,12 @@ static int ffp_d3d_display(VideoState *i
+       SDL_AtomicSet(&is->dbg.pres_cuda_readdressed, readdressed);
+       SDL_AtomicSet(&is->dbg.pres_dropped_readdress, dropped); }
+     if (display_result > 0) return 1; /* retired frame: do not count as displayed */
++    {
++        int i;
++        for (i = 0; i < FFP_SUBTITLE_LAYER_COUNT; i++)
++            if (ffp_subtitle_visible(is, i))
++                ffp_subtitle_mark_shown(&is->subtitles[i]);
++    }
+     SDL_AtomicSet(&ffp->pres_cuda_active, vp->frame->format == AV_PIX_FMT_CUDA);
+     { int shader, copied;
+       ffp_d3d11_shader_stats(ffp->d3d, &shader, &copied);
+@@ -5690,6 +7503,11 @@ static int ffp_d3d_display(VideoState *i
+         if (vp->frame->format == AV_PIX_FMT_CUDA)
+             SDL_AtomicAdd(direct ? &is->dbg.pres_cuda_zero_copy : &is->dbg.pres_cuda_copied, 1);
+     }
++    {
++        FFPD3D11OverlayStats overlay_stats;
++        ffp_d3d11_overlay_stats(ffp->d3d, &overlay_stats);
++        ffp_subtitle_note_video_rect(is, overlay_stats.video_rect.width, overlay_stats.video_rect.height);
++    }
+     return 0;
+ }
+ 
+@@ -5732,6 +7550,7 @@ static int ffp_create_video(FFPlayer *ff
+     int flags = SDL_WINDOW_HIDDEN;
+     int enable_vulkan = 0;
+     int pass;
++    int out_w = 0, out_h = 0;
+     SDL_RendererInfo *info = &ffp->renderer_info;
+ 
+     if (ffp->hwnd) {
+@@ -5834,6 +7653,12 @@ static int ffp_create_video(FFPlayer *ff
+             goto fail;
+         }
+     }
++    if (!ffp->vk_renderer && ffp->renderer && !SDL_GetRendererOutputSize(ffp->renderer, &out_w, &out_h)) {
++        ffp->render_w = out_w;
++        ffp->render_h = out_h;
++    } else {
++        SDL_GetWindowSize(ffp->window, &ffp->render_w, &ffp->render_h);
++    }
+     /* the renderer object that was really created (not the enable_vulkan request) */
+     SDL_LockMutex(ffp->dbg_mutex);
+     if (ffp->vk_renderer)
+@@ -5962,6 +7787,7 @@ static VideoState *ffp_detach_media(FFPl
+     av_freep(&ffp->media_info);
+     SDL_UnlockMutex(ffp->mutex);
+     SDL_LockMutex(ffp->snap_mutex);
++    ffp->snap_is = NULL;
+     av_frame_free(&ffp->last_frame);
+     SDL_UnlockMutex(ffp->snap_mutex);
+     return is;
+@@ -6024,6 +7850,28 @@ static void ffp_cmd_pause(FFPlayer *ffp,
+         ffp_set_state(ffp, is->paused ? FFP_ST_PAUSED : FFP_ST_PLAYING, 0);
+ }
+ 
++static void ffp_cmd_refresh_caption_style(FFPlayer *ffp, int flags)
++{
++    VideoState *is = ffp->is;
++    SubtitleLayer *layer;
++    int stream_index, ret;
++
++    if (!is)
++        return;
++    is->o->arib_ignore_background = !!(flags & 1);
++    is->o->arib_force_outline = !!(flags & 2);
++    layer = &is->subtitles[FFP_SUBTITLE_CAPTION];
++    if (!is->ic || layer->stream_index < 0 || !layer->is_arib)
++        return;
++    stream_index = layer->stream_index;
++    stream_component_close(is, stream_index, FFP_SUBTITLE_CAPTION);
++    ret = stream_component_open(is, stream_index, FFP_SUBTITLE_CAPTION);
++    if (ret < 0)
++        av_log(NULL, AV_LOG_WARNING, "could not reopen ARIB caption decoder for style update: %s\n",
++               av_err2str(ret));
++    is->force_refresh = 1;
++}
++
+ /* returns 1 if the instance was destroyed (and must not be touched anymore) */
+ static int ffp_exec_cmd(FFPlayer *ffp, FFPCmd *c)
+ {
+@@ -6060,9 +7908,19 @@ static int ffp_exec_cmd(FFPlayer *ffp, F
+     case FFP_CMD_CYCLE:
+         if (is && is->ic && SDL_AtomicGet(&is->prepared)) {
+             stream_cycle_channel(is, c->i);
++            is->force_refresh = 1;
+             ffp_update_media_info(is);
+         }
+         break;
++    case FFP_CMD_SUB_VISIBLE:
++        if (is) {
++            is->subtitles[c->i].visible = !!c->d;
++            is->force_refresh = 1;
++        }
++        break;
++    case FFP_CMD_REFRESH_CAPTION_STYLE:
++        ffp_cmd_refresh_caption_style(ffp, c->i);
++        break;
+     }
+     return destroyed;
+ }
+@@ -6459,7 +8317,7 @@ static int ffp_fq_remaining(FrameQueue *
+ 
+ static int ffp_starved(VideoState *is)
+ {
+-    if (is->paused || is->eof || SDL_AtomicGet(&is->failed) || is->abort_request)
++    if (is->paused || SDL_AtomicGet(&is->eof) || SDL_AtomicGet(&is->failed) || is->abort_request)
+         return 0;
+     if (is->video_st && !(is->video_st->disposition & AV_DISPOSITION_ATTACHED_PIC) &&
+         is->viddec.finished != is->videoq.serial &&
+@@ -6523,6 +8381,7 @@ static void ffp_sync_hosted_size(FFPlaye
+         ffp->render_w = ow;
+         ffp->render_h = oh;
+         SDL_UnlockMutex(ffp->mutex);
++        is->force_refresh = 1;
+         if (SDL_AtomicGet(&is->prepared))
+             ffp_update_media_info(is);
+     }
+@@ -6536,6 +8395,16 @@ static void ffp_tick(FFPlayer *ffp, doub
+ 
+     ffp_apply_pending_seek(ffp, is);
+     ffp_sync_hosted_size(ffp, is);
++    ffp_subtitle_check_resize(is, now);
++    {   /* a re-rendered caption is waiting: redraw so it is shown while paused too */
++        int i, pending = 0;
++        SDL_LockMutex(is->dbg_mutex);
++        for (i = 0; i < FFP_SUBTITLE_LAYER_COUNT; i++)
++            pending |= is->subtitles[i].pending_rerender_valid || is->subtitles[i].pending_attime_valid;
++        SDL_UnlockMutex(is->dbg_mutex);
++        if (pending)
++            is->force_refresh = 1;
++    }
+     if (SDL_AtomicGet(&ffp->pres_dirty)) {
+         SDL_AtomicSet(&ffp->pres_dirty, 0);
+         is->force_refresh = 1;
+@@ -6778,6 +8647,7 @@ static void ffp_release(void)
+ static void ffp_free_instance(FFPlayer *ffp)
+ {
+     FFPCmd *c, *next;
++    int i;
+ 
+     for (c = ffp->cmd_head; c; c = next) {
+         next = c->next;
+@@ -6790,6 +8660,8 @@ static void ffp_free_instance(FFPlayer *
+     av_free(ffp->afilter);
+     av_free(ffp->media_info);
+     av_frame_free(&ffp->last_frame);
++    for (i = 0; i < FFP_SUBTITLE_LAYER_COUNT; i++)
++        avsubtitle_free(&ffp->last_subtitles[i]);
+     if (ffp->create_sem)
+         SDL_DestroySemaphore(ffp->create_sem);
+     if (ffp->mutex)
+@@ -6854,6 +8726,8 @@ FFP_API FFPlayer *FFP_CALL ffp_create(vo
+     ffp->position = NAN;
+     SDL_AtomicSet(&ffp->volume, SDL_MIX_MAXVOLUME);
+     SDL_AtomicSet(&ffp->muted, 0);
++    SDL_AtomicSet(&ffp->subtitle_visible[FFP_SUBTITLE_CAPTION], 1);
++    SDL_AtomicSet(&ffp->subtitle_visible[FFP_SUBTITLE_SUPERIMPOSE], 1);
+ 
+ #if CONFIG_AVDEVICE
+     avdevice_register_all();
+@@ -7288,6 +9162,10 @@ static const FFPOptDef ffp_optdefs[] = {
+     { "rdftspeed",        OT_MSEC,   OO(rdftspeed) },
+     { "acodec",           OT_STRING, OO(audio_codec_name) },
+     { "scodec",           OT_STRING, OO(subtitle_codec_name) },
++    { "arib_font",        OT_STRING, OO(arib_font) },
++    { "superimpose",      OT_BOOL,   OO(superimpose) },
++    { "arib_ignore_background", OT_BOOL, OO(arib_ignore_background) },
++    { "arib_force_outline", OT_BOOL,  OO(arib_force_outline) },
+     { "vcodec",           OT_STRING, OO(video_codec_name) },
+     { "autorotate",       OT_BOOL,   OO(autorotate) },
+     { "find_stream_info", OT_BOOL,   OO(find_stream_info) },
+@@ -7743,6 +9621,23 @@ FFP_API int FFP_CALL ffp_cycle_stream(FF
+     return ffp_post_simple(ffp, FFP_CMD_CYCLE, 0, type);
+ }
+ 
++FFP_API int FFP_CALL ffp_set_subtitle_visible(FFPlayer *ffp, int layer, int on)
++{
++    if (!ffp || layer < 0 || layer >= FFP_SUBTITLE_LAYER_COUNT)
++        return FFP_EINVAL;
++    SDL_AtomicSet(&ffp->subtitle_visible[layer], !!on);
++    return ffp_post_simple(ffp, FFP_CMD_SUB_VISIBLE, !!on, layer);
++}
++
++FFP_API int FFP_CALL ffp_refresh_caption_style(FFPlayer *ffp, int ignore_background, int force_outline)
++{
++    int flags;
++    if (!ffp)
++        return FFP_EINVAL;
++    flags = !!ignore_background | (!!force_outline << 1);
++    return ffp_post_simple(ffp, FFP_CMD_REFRESH_CAPTION_STYLE, 0, flags);
++}
++
+ static int ffp_set_filter(FFPlayer *ffp, int audio, const char *str)
+ {
+     char *dup = NULL;
+@@ -7938,11 +9833,246 @@ FFP_API int FFP_CALL ffp_snapshot(FFPlay
+     return ffp->pres_ops->snapshot(ffp, src, out_bgra, width, height, stride);
+ }
+ 
++static int ffp_snapshot_composite_subtitle(uint8_t *bgra, int width, int height, int stride,
++                                           const AVSubtitle *subtitle, int canvas_w, int canvas_h)
++{
++    int i;
++    if (!bgra || !subtitle || canvas_w <= 0 || canvas_h <= 0 || width <= 0 || height <= 0)
++        return 0;
++    for (i = 0; i < subtitle->num_rects; i++) {
++        AVSubtitleRect *r = subtitle->rects[i];
++        int x, y, w, h, sx, sy, dx, dy, dw, dh, row, col;
++        struct SwsContext *sws;
++        uint8_t *converted = NULL;
++        const uint8_t *src[4];
++        int src_stride[4];
++        uint8_t *dst[4];
++        int dst_stride[4];
++
++        if (!r || !r->data[0] || !r->data[1] || r->w <= 0 || r->h <= 0)
++            continue;
++        x = av_clip(r->x, 0, canvas_w);
++        y = av_clip(r->y, 0, canvas_h);
++        w = av_clip(r->w - (x - r->x), 0, canvas_w - x);
++        h = av_clip(r->h - (y - r->y), 0, canvas_h - y);
++        sx = x - r->x;
++        sy = y - r->y;
++        if (w <= 0 || h <= 0)
++            continue;
++        dx = av_rescale_rnd(x, width, canvas_w, AV_ROUND_NEAR_INF);
++        dy = av_rescale_rnd(y, height, canvas_h, AV_ROUND_NEAR_INF);
++        dw = av_rescale_rnd(x + w, width, canvas_w, AV_ROUND_NEAR_INF) - dx;
++        dh = av_rescale_rnd(y + h, height, canvas_h, AV_ROUND_NEAR_INF) - dy;
++        dx = av_clip(dx, 0, width);
++        dy = av_clip(dy, 0, height);
++        dw = av_clip(dw, 0, width - dx);
++        dh = av_clip(dh, 0, height - dy);
++        if (dw <= 0 || dh <= 0)
++            continue;
++        converted = av_malloc((size_t)dw * dh * 4);
++        if (!converted)
++            return AVERROR(ENOMEM);
++        sws = sws_getContext(w, h, AV_PIX_FMT_PAL8, dw, dh, AV_PIX_FMT_BGRA,
++                             SWS_BICUBIC | SWS_ACCURATE_RND, NULL, NULL, NULL);
++        if (!sws) {
++            av_free(converted);
++            return AVERROR(ENOMEM);
++        }
++        src[0] = r->data[0] + sy * r->linesize[0] + sx;
++        src[1] = r->data[1];
++        src[2] = src[3] = NULL;
++        src_stride[0] = r->linesize[0];
++        src_stride[1] = r->linesize[1];
++        src_stride[2] = src_stride[3] = 0;
++        dst[0] = converted;
++        dst[1] = dst[2] = dst[3] = NULL;
++        dst_stride[0] = dw * 4;
++        dst_stride[1] = dst_stride[2] = dst_stride[3] = 0;
++        if (sws_scale(sws, src, src_stride, 0, h, dst, dst_stride) < 0) {
++            sws_freeContext(sws);
++            av_free(converted);
++            return AVERROR(EINVAL);
++        }
++        sws_freeContext(sws);
++        for (row = 0; row < dh; row++) {
++            uint8_t *out = bgra + (size_t)(dy + row) * stride + (size_t)dx * 4;
++            const uint8_t *in = converted + (size_t)row * dw * 4;
++            for (col = 0; col < dw; col++, out += 4, in += 4) {
++                unsigned a = in[3], ia = 255 - a;
++                out[0] = (uint8_t)((in[0] * a + out[0] * ia + 127) / 255);
++                out[1] = (uint8_t)((in[1] * a + out[1] * ia + 127) / 255);
++                out[2] = (uint8_t)((in[2] * a + out[2] * ia + 127) / 255);
++                out[3] = 255;
++            }
++        }
++        av_free(converted);
++    }
++    return 0;
++}
++
++FFP_API int FFP_CALL ffp_snapshot_ex(FFPlayer *ffp, unsigned flags, uint8_t **out_bgra,
++                                     int *width, int *height, int *stride)
++{
++    AVSubtitle subtitles[FFP_SUBTITLE_LAYER_COUNT] = { { 0 } };
++    AVFrame *src = NULL;
++    uint8_t *composite = NULL;
++    int canvas_w[FFP_SUBTITLE_LAYER_COUNT] = { 0, 0 };
++    int canvas_h[FFP_SUBTITLE_LAYER_COUNT] = { 0, 0 };
++    int visible[FFP_SUBTITLE_LAYER_COUNT] = { 0, 0 };
++    int is_arib[FFP_SUBTITLE_LAYER_COUNT] = { 0, 0 };
++    int serial[FFP_SUBTITLE_LAYER_COUNT] = { 0, 0 };
++    int stream_index[FFP_SUBTITLE_LAYER_COUNT] = { -1, -1 };
++    uint64_t generation[FFP_SUBTITLE_LAYER_COUNT] = { 0, 0 };
++    uint64_t decode_generation[FFP_SUBTITLE_LAYER_COUNT] = { 0, 0 };
++    int i, ret;
++
++    if (!ffp || !out_bgra || !width || !height || !stride || (flags & ~FFP_SNAPSHOT_SUBTITLES))
++        return FFP_EINVAL;
++    if (!(flags & FFP_SNAPSHOT_SUBTITLES))
++        return ffp_snapshot(ffp, out_bgra, width, height, stride);
++
++    SDL_LockMutex(ffp->snap_mutex);
++    if (ffp->last_frame && ffp->last_frame->buf[0])
++        src = av_frame_clone(ffp->last_frame);
++    for (i = 0; i < FFP_SUBTITLE_LAYER_COUNT; i++) {
++        visible[i] = SDL_AtomicGet(&ffp->subtitle_visible[i]) && ffp->last_subtitle_visible[i];
++        canvas_w[i] = ffp->last_subtitle_width[i];
++        canvas_h[i] = ffp->last_subtitle_height[i];
++        is_arib[i] = ffp->last_subtitle_is_arib[i];
++        serial[i] = ffp->last_subtitle_serial[i];
++        stream_index[i] = ffp->last_subtitle_stream_index[i];
++        generation[i] = ffp->last_subtitle_generation[i];
++        decode_generation[i] = ffp->last_subtitle_decode_generation[i];
++        if (visible[i] && ffp->last_subtitles[i].num_rects &&
++            ffp_subtitle_copy(&subtitles[i], &ffp->last_subtitles[i]) < 0)
++            visible[i] = 0;
++    }
++    SDL_UnlockMutex(ffp->snap_mutex);
++    if (!src) {
++        ret = FFP_EAGAIN;
++        goto end;
++    }
++    ret = ffp->pres_ops->snapshot(ffp, src, out_bgra, width, height, stride);
++    src = NULL; /* presenter consumes the clone */
++    if (ret < 0)
++        goto end;
++    composite = av_memdup(*out_bgra, (size_t)*stride * *height);
++    if (!composite) {
++        av_log(NULL, AV_LOG_WARNING, "subtitle snapshot allocation failed; using video-only snapshot\n");
++        ret = 0;
++        goto end;
++    }
++    for (i = 0; i < FFP_SUBTITLE_LAYER_COUNT; i++) {
++        if (visible[i] && subtitles[i].num_rects) {
++            if (is_arib[i] && stream_index[i] >= 0 &&
++                (canvas_w[i] != *width || canvas_h[i] != *height)) {
++                AVSubtitle rerendered = { 0 };
++                int rerender_ret = AVERROR(EAGAIN);
++
++                /* Keep the video frame and its cue snapshot paired. The mutex also prevents the media
++                 * from being destroyed while the request is queued and serviced by its decoder thread. */
++                SDL_LockMutex(ffp->snap_mutex);
++                if (ffp->snap_is && ffp->last_subtitle_is_arib[i] &&
++                    ffp->last_subtitle_stream_index[i] == stream_index[i] &&
++                    ffp->last_subtitle_serial[i] == serial[i] &&
++                    ffp->last_subtitle_generation[i] == generation[i] &&
++                    ffp->last_subtitle_decode_generation[i] == decode_generation[i]) {
++                    rerender_ret = ffp_subtitle_snapshot_rerender(&ffp->snap_is->subtitles[i],
++                        stream_index[i], serial[i], generation[i], decode_generation[i],
++                        *width, *height, &subtitles[i], &rerendered);
++                }
++                SDL_UnlockMutex(ffp->snap_mutex);
++                if (rerender_ret >= 0) {
++                    avsubtitle_free(&subtitles[i]);
++                    subtitles[i] = rerendered;
++                    canvas_w[i] = *width;
++                    canvas_h[i] = *height;
++                } else {
++                    av_log(NULL, AV_LOG_WARNING,
++                           "ARIB snapshot exact re-render failed for layer %d; using high-quality scaled bitmap: %s\n",
++                           i, av_err2str(rerender_ret));
++                }
++            }
++            ret = ffp_snapshot_composite_subtitle(composite, *width, *height, *stride,
++                &subtitles[i], canvas_w[i], canvas_h[i]);
++            if (ret < 0) {
++                av_log(NULL, AV_LOG_WARNING, "subtitle snapshot composition failed; using video-only snapshot: %s\n",
++                       av_err2str(ret));
++                ret = 0;
++                goto end;
++            }
++        }
++    }
++    memcpy(*out_bgra, composite, (size_t)*stride * *height);
++    ret = 0;
++end:
++    av_free(composite);
++    for (i = 0; i < FFP_SUBTITLE_LAYER_COUNT; i++)
++        avsubtitle_free(&subtitles[i]);
++    av_frame_free(&src);
++    return ret;
++}
++
+ FFP_API void FFP_CALL ffp_free(void *ptr)
+ {
+     av_free(ptr);
+ }
+ 
++FFP_API int FFP_CALL ffp_test_d3d11_readback_enable(FFPlayer *ffp, int enable)
++{
++    int ret = 0;
++
++    if (!ffp)
++        return FFP_EINVAL;
++    /* Keep the presenter alive while the test hook updates its own readback state. */
++    SDL_LockMutex(ffp->pres_mutex);
++    if (ffp->d3d)
++        ffp_d3d11_readback_test_enable(ffp->d3d, enable);
++    else
++        ret = FFP_EAGAIN;
++    SDL_UnlockMutex(ffp->pres_mutex);
++    return ret;
++}
++
++FFP_API int FFP_CALL ffp_test_d3d11_readback_last(FFPlayer *ffp, uint8_t **out_bgra,
++                                                  int *width, int *height, int *stride,
++                                                  int *video_x, int *video_y,
++                                                  int *video_width, int *video_height)
++{
++    FFPD3D11OverlayStats stats;
++    char err[256] = "";
++    int ret;
++
++    if (!ffp || !out_bgra || !width || !height || !stride || !video_x || !video_y ||
++        !video_width || !video_height)
++        return FFP_EINVAL;
++    *out_bgra = NULL;
++    *width = *height = *stride = 0;
++    *video_x = *video_y = *video_width = *video_height = 0;
++
++    /* pres_mutex pins the presenter across both internal queries; each query also takes the
++     * presenter's critical section while copying/reading its state. The returned pixels are
++     * an owned copy, so callers never touch the presenter's live staging/readback buffer. */
++    SDL_LockMutex(ffp->pres_mutex);
++    if (!ffp->d3d) {
++        ret = FFP_EAGAIN;
++    } else {
++        ffp_d3d11_overlay_stats(ffp->d3d, &stats);
++        ret = ffp_d3d11_readback_last(ffp->d3d, out_bgra, width, height, stride, err, sizeof(err));
++        if (ret < 0) {
++            ret = !strcmp(err, "no composed back-buffer readback available") ?
++                  FFP_EAGAIN : AVERROR_EXTERNAL;
++        } else {
++            *video_x = stats.video_rect.x;
++            *video_y = stats.video_rect.y;
++            *video_width = stats.video_rect.width;
++            *video_height = stats.video_rect.height;
++        }
++    }
++    SDL_UnlockMutex(ffp->pres_mutex);
++    return ret;
++}
++
+ 
+ static void json_num(AVBPrint *bp, double d, int prec)
+ {
+@@ -7969,6 +10099,48 @@ static void json_rational(AVBPrint *bp,
+         av_bprintf(bp, "\"\"");
+ }
+ 
++static void ffp_dbg_subtitle_json(AVBPrint *bp, const FFPDebugSubtitle *s)
++{
++    char options[2048];
++    size_t used;
++
++    if (!s->open) {
++        av_bprintf(bp, "null");
++        return;
++    }
++    options[0] = 0;
++    if (s->is_arib) {
++        snprintf(options, sizeof(options), "sub_type=bitmap,caption_type=%s,canvas_size=%dx%d",
++                 s->caption_type, s->canvas_width, s->canvas_height);
++        used = strlen(options);
++        if (s->font[0] && used < sizeof(options))
++            snprintf(options + used, sizeof(options) - used, ",font=%s", s->font);
++        used = strlen(options);
++        if (s->stream_index >= 0 && used < sizeof(options) &&
++            !strcmp(s->caption_type, "caption"))
++            snprintf(options + used, sizeof(options) - used, ",ignore_background=%d,force_outline_text=%d",
++                     s->ignore_background, s->force_outline);
++    }
++    av_bprintf(bp, "{\"stream_index\":%d,\"codec\":", s->stream_index);
++    json_string(bp, s->codec);
++    av_bprintf(bp, ",\"decoder\":");
++    json_string(bp, s->decoder);
++    av_bprintf(bp, ",\"decoder_options\":");
++    json_string(bp, options);
++    av_bprintf(bp, ",\"resolved_font\":");
++    json_string(bp, s->font);
++    av_bprintf(bp, ",\"caption_type\":");
++    json_string(bp, s->caption_type);
++    av_bprintf(bp, ",\"active_cue\":{\"rect_count\":%d,\"bitmap_width\":%d,\"bitmap_height\":%d,\"start\":",
++               s->active_rects, s->active_width, s->active_height);
++    json_num(bp, s->active_start, 3);
++    av_bprintf(bp, ",\"end\":");
++    json_num(bp, s->active_end, 3);
++    av_bprintf(bp, "},\"canvas\":{\"width\":%d,\"height\":%d},\"counts\":{\"cues_shown\":%d,\"cues_cleared\":%d,\"cues_uploaded\":%d,\"rerenders\":%"PRIu64"},\"history\":{\"events\":%"PRId64",\"bytes\":%"PRId64",\"appended_bytes\":%"PRId64",\"landed\":%d}}",
++               s->canvas_width, s->canvas_height, s->cues_shown, s->cues_cleared, s->cues_uploaded, s->re_renders,
++               s->history_events, s->history_bytes, s->history_appended_bytes, s->history_landed);
++}
++
+ static void ffp_dbg_queue(AVBPrint *bp, const char *name, PacketQueue *q, AVRational tb)
+ {
+     int np, size;
+@@ -7988,7 +10160,7 @@ static void ffp_dbg_queue(AVBPrint *bp,
+  * all of which are only ever held for a few instructions. */
+ static void ffp_build_debug_info(FFPlayer *ffp, VideoState *is, const char *vf, const char *af,
+                                  double position, double duration, const FFPPresParams *pp,
+-                                 const char *pres_extra, AVBPrint *bp)
++                                 const FFPD3D11OverlayStats *ov, const char *pres_extra, AVBPrint *bp)
+ {
+     FFPDebug *d = &is->dbg;
+     double now = av_gettime_relative() / 1000000.0;
+@@ -8022,13 +10194,20 @@ static void ffp_build_debug_info(FFPlaye
+     av_bprintf(bp, ",\"error\":");
+     json_string(bp, ffp->dbg_pres_error);
+     av_bprintf(bp, ",\"frames_direct\":%d,\"frames_uploaded\":%d,"
+-               "\"frames_cuda_zero_copy\":%d,\"frames_cuda_copied\":%d,\"frames_cuda_readdressed\":%d,\"frames_dropped_readdress\":%d,\"route\":\"%s\",\"frames_shader\":%d,\"frames_d3d11_copied\":%d%s}",
++               "\"frames_cuda_zero_copy\":%d,\"frames_cuda_copied\":%d,\"frames_cuda_readdressed\":%d,\"frames_dropped_readdress\":%d,\"route\":\"%s\",\"frames_shader\":%d,\"frames_d3d11_copied\":%d%s",
+                SDL_AtomicGet(&d->pres_direct), SDL_AtomicGet(&d->pres_uploaded),
+                SDL_AtomicGet(&d->pres_cuda_zero_copy), SDL_AtomicGet(&d->pres_cuda_copied),
+                SDL_AtomicGet(&d->pres_cuda_readdressed),
+                SDL_AtomicGet(&d->pres_dropped_readdress),
+                !strcmp(ffp->dbg_renderer,"d3d11:shader") || !strcmp(ffp->dbg_renderer,"d3d11:shader-cuda") ? "shader" : "vp",
+                SDL_AtomicGet(&d->pres_shader), SDL_AtomicGet(&d->pres_d3d11_copied), pres_extra);
++    if (ov)     /* D3D-side overlay facts, distinct from the decoder-side subtitles.*.counts */
++        av_bprintf(bp, ",\"overlay\":{\"cue_uploads\":%"PRIu64",\"rects_uploaded\":%"PRIu64",\"cues_shown\":%"PRIu64
++                   ",\"rects_drawn\":%"PRIu64",\"draw_failures\":%"PRIu64",\"readback_failures\":%"PRIu64
++                   ",\"readback_seq\":%"PRIu64",\"readback_rects\":%"PRIu64"}",
++                   ov->cue_uploads, ov->rects_uploaded, ov->cues_shown, ov->rects_drawn, ov->draw_failures,
++                   ov->readback_failures, ov->readback_seq, ov->readback_rects);
++    av_bprintf(bp, "}");
+ 
+     if (d->v_open) {
+         lp = SDL_AtomicGet(&d->last_path);
+@@ -8140,6 +10319,12 @@ static void ffp_build_debug_info(FFPlaye
+         av_bprintf(bp, ",\"subtitle\":null");
+     }
+ 
++    av_bprintf(bp, ",\"subtitle_layers\":{\"caption\":");
++    ffp_dbg_subtitle_json(bp, &d->subtitles[FFP_SUBTITLE_CAPTION]);
++    av_bprintf(bp, ",\"superimpose\":");
++    ffp_dbg_subtitle_json(bp, &d->subtitles[FFP_SUBTITLE_SUPERIMPOSE]);
++    av_bprintf(bp, "}");
++
+     av_bprintf(bp, ",\"filters\":{\"vf_requested\":");
+     json_string(bp, vf);
+     av_bprintf(bp, ",\"af_requested\":");
+@@ -8206,7 +10391,10 @@ static void ffp_build_debug_info(FFPlaye
+     av_bprintf(bp, ",");
+     ffp_dbg_queue(bp, "video", &is->videoq, d->v_tb);
+     av_bprintf(bp, ",");
+-    ffp_dbg_queue(bp, "subtitle", &is->subtitleq, d->s_tb);
++    ffp_dbg_queue(bp, "subtitle", &is->subtitles[FFP_SUBTITLE_CAPTION].packets, d->s_tb);
++    av_bprintf(bp, ",");
++    ffp_dbg_queue(bp, "superimpose", &is->subtitles[FFP_SUBTITLE_SUPERIMPOSE].packets,
++                  d->subtitles[FFP_SUBTITLE_SUPERIMPOSE].time_base);
+     av_bprintf(bp, "}");
+ 
+     av_bprintf(bp, "}");
+@@ -8761,7 +10949,8 @@ FFP_API char *FFP_CALL ffp_get_debug_inf
+     double position, duration;
+     FFPPresParams pp;
+     AVBPrint pres;
+-    int ok = 0;
++    FFPD3D11OverlayStats ov;
++    int ok = 0, have_ov = 0;
+ 
+     if (!ffp || !ffp->dbg_mutex)
+         return NULL;
+@@ -8776,14 +10965,18 @@ FFP_API char *FFP_CALL ffp_get_debug_inf
+     /* Sampled before dbg_mutex so pres_mutex and dbg_mutex are never nested here. */
+     av_bprint_init(&pres, 0, AV_BPRINT_SIZE_UNLIMITED);
+     SDL_LockMutex(ffp->pres_mutex);
+-    if (ffp->d3d)
++    if (ffp->d3d) {
++        ffp_d3d11_overlay_stats(ffp->d3d, &ov);
+         ffp_d3d11_debug_json(ffp->d3d, &pres);
++        have_ov = 1;
++    }
+     SDL_UnlockMutex(ffp->pres_mutex);
+ 
+     av_bprint_init(&bp, 0, AV_BPRINT_SIZE_UNLIMITED);
+     SDL_LockMutex(ffp->dbg_mutex);
+     if (ffp->dbg_is && av_bprint_is_complete(&pres)) {
+-        ffp_build_debug_info(ffp, ffp->dbg_is, vf ? vf : "", af ? af : "", position, duration, &pp, pres.str, &bp);
++        ffp_build_debug_info(ffp, ffp->dbg_is, vf ? vf : "", af ? af : "", position, duration, &pp,
++                             have_ov ? &ov : NULL, pres.str, &bp);
+         ok = 1;
+     }
+     SDL_UnlockMutex(ffp->dbg_mutex);
+--- a/fftools/ffplay.h
++++ b/fftools/ffplay.h
+@@ -26,6 +26,7 @@
+ #ifndef FFTOOLS_FFPLAY_H
+ #define FFTOOLS_FFPLAY_H
+ 
++#include <stddef.h>
+ #include <stdint.h>
+ 
+ #ifdef _WIN32
+@@ -67,6 +68,19 @@ enum { FFP_SEEK_ABSOLUTE = 0, FFP_SEEK_R
+ /* ffp_cycle_stream types (same values as AVMediaType) */
+ enum { FFP_STREAM_VIDEO = 0, FFP_STREAM_AUDIO = 1, FFP_STREAM_SUBTITLE = 3 };
+ 
++enum { FFP_SUBTITLE_CAPTION = 0, FFP_SUBTITLE_SUPERIMPOSE = 1, FFP_SUBTITLE_LAYER_COUNT = 2 };
++
++/* Internal D3D11 bitmap-overlay boundary. Definitions live in ffplay_presenter.h;
++ * ffplay.c submits top-to-bottom, straight-alpha RGBA rects in canvas coordinates.
++ * The presenter copies the submitted pixels synchronously and reports the current
++ * letterboxed video rectangle through the stats structure. */
++struct FFPOverlayLayer;
++struct FFPD3D11;
++struct FFPD3D11OverlayStats;
++int  ffp_d3d11_set_overlay(struct FFPD3D11 *p, int layer,
++                           const struct FFPOverlayLayer *overlay, char *err, size_t err_size);
++void ffp_d3d11_overlay_stats(const struct FFPD3D11 *p, struct FFPD3D11OverlayStats *out);
++
+ /* Called on a library thread (player/read/decode thread). json is UTF-8, valid only
+  * for the duration of the call. Must return quickly; must not call ffp_destroy/ffp_stop/ffp_open. */
+ typedef void (FFP_CALL *ffp_event_cb)(void *user, int event, const char *json);
+@@ -106,6 +120,12 @@ FFP_API double      FFP_CALL ffp_get_dur
+ FFP_API char       *FFP_CALL ffp_get_media_info(FFPlayer *p);     /* JSON (see below) or NULL; ffp_free */
+ 
+ FFP_API int         FFP_CALL ffp_cycle_stream(FFPlayer *p, int type);
++/* Changes only presentation visibility; both decoders continue running, so an indefinite cue
++ * reappears when shown again. Superimpose visibility is independent of caption visibility. */
++FFP_API int         FFP_CALL ffp_set_subtitle_visible(FFPlayer *p, int layer, int on);
++/* Reopens only an active ARIB caption decoder with the new style; video/audio are untouched. */
++FFP_API int         FFP_CALL ffp_refresh_caption_style(FFPlayer *p, int ignore_background,
++                                                       int force_outline);
+ 
+ /* Filters. Strings persist on the instance across opens. NULL or "" = no filter.
+  * The new graph is built by the decode thread on the next frame through ffplay's
+@@ -130,8 +150,25 @@ FFP_API int         FFP_CALL ffp_filter_
+  * Returns FFP_EAGAIN if no frame has been displayed yet. */
+ FFP_API int         FFP_CALL ffp_snapshot(FFPlayer *p, uint8_t **out_bgra, int *width,
+                                           int *height, int *stride);
++/* ffp_snapshot_ex uses the same native-size video path. FFP_SNAPSHOT_SUBTITLES composites the
++ * currently active visible bitmap layers (caption if visible; superimpose if enabled and visible).
++ * ARIB layers are re-rendered at snapshot size and the live canvas is restored; a failed re-render
++ * falls back to high-quality scaling. Bit 0 is the only supported flag. */
++enum { FFP_SNAPSHOT_SUBTITLES = 1 };
++FFP_API int         FFP_CALL ffp_snapshot_ex(FFPlayer *p, unsigned flags, uint8_t **out_bgra,
++                                             int *width, int *height, int *stride);
+ FFP_API void        FFP_CALL ffp_free(void *ptr);
+ 
++/* TEST ONLY. Expensive composed-backbuffer readback for the D3D11 presenter; disabled by default.
++ * Enable before reading. On success the readback is BGRA8 (free with ffp_free), and the returned
++ * video rectangle is in the same back-buffer/client-pixel coordinate space. Returns FFP_EAGAIN
++ * when the D3D11 presenter or a captured frame is not available. */
++FFP_API int         FFP_CALL ffp_test_d3d11_readback_enable(FFPlayer *p, int enable);
++FFP_API int         FFP_CALL ffp_test_d3d11_readback_last(FFPlayer *p, uint8_t **out_bgra,
++                                                         int *width, int *height, int *stride,
++                                                         int *video_x, int *video_y,
++                                                         int *video_width, int *video_height);
++
+ /* JSON snapshot of the live decoder / filter graph / sync state of the current media, or NULL when nothing
+  * is open. Every value is what is actually in use at runtime (opened decoder, configured graphs, renderer
+  * object, ...), see docs/libffplay-api.md for the schema. Free with ffp_free. Thread-safe, never blocks
+@@ -240,9 +277,9 @@ FFP_API int         FFP_CALL ffp_set_pre
+  * hwframes=keep: a frame the presenter shows as is is not downloaded after the filter graph either). CUDA NV12/P010
+  * frames on the presenter adapter use a raw-buffer YUV shader (registered D3D11 buffer pool, zero presenter copies) or
+  * per-plane device-to-array copies (foreign allocations); other hardware domains are downloaded. System frames are
+- * uploaded once (NV12 / P010 through a D3D11 surface pool, swscale to NV12 / P010 / BGRA for other formats). Subtitles
+- * are not drawn by this presenter (use sn or burn them with a filter). The audio visualisation of audio-only media is
+- * drawn by SDL.
++ * uploaded once (NV12 / P010 through a D3D11 surface pool, swscale to NV12 / P010 / BGRA for other formats). Bitmap
++ * subtitles are drawn as upright overlays after either video route; text and ASS subtitle rectangles remain undrawn by
++ * D3D11. The audio visualisation of audio-only media is drawn by SDL.
+  * Rotation uses VideoProcessorSetStreamRotation, mirroring VideoProcessorSetStreamMirror (ID3D11VideoContext1) when the
+  * driver really mirrors (verified by a self test at the first use; otherwise ffp_set_presenter_params with flips
+  * returns FFP_EINVAL), eq uses the video processor's brightness / contrast / saturation filters (the honoured ranges
+--- a/fftools/ffplay_d3d11.c
++++ b/fftools/ffplay_d3d11.c
+@@ -209,6 +209,34 @@ typedef struct FFPCudaShaderGeometry {
+     const RECT *destination;
+ } FFPCudaShaderGeometry;
+ 
++typedef struct FFPOverlayRenderer {
++    ID3D11VertexShader *vs;
++    ID3D11PixelShader *ps;
++    ID3D11Buffer *constants;
++    ID3D11BlendState *blend;
++    ID3D11RasterizerState *raster;
++    ID3D11SamplerState *sampler;
++} FFPOverlayRenderer;
++
++typedef struct FFPOverlayTexture {
++    ID3D11Texture2D *texture;
++    ID3D11ShaderResourceView *srv;
++    int x, y, width, height;
++} FFPOverlayTexture;
++
++typedef struct FFPOverlayCache {
++    uint64_t generation;
++    int valid, visible;
++    int canvas_width, canvas_height;
++    int rect_count;
++    FFPOverlayTexture *rects;
++} FFPOverlayCache;
++
++typedef struct FFPOverlayCB {
++    float dest[4];
++    float target[4];
++} FFPOverlayCB;
++
+ typedef struct FFPCudaShaderCB {
+     unsigned input[4];   /* storage w,h, pitch in bytes, UV offset in bytes */
+     unsigned crop[4];    /* x,y,w,h */
+@@ -365,6 +393,108 @@ static HRESULT cs_compile(CSCompileFn fn
+     return hr;
+ }
+ 
++static const char ffp_overlay_vs_source[] =
++    "cbuffer Overlay : register(b0) { float4 dest; float4 target; };\n"
++    "struct VOut { float4 pos : SV_Position; float2 uv : TEXCOORD0; };\n"
++    "VOut main(uint id : SV_VertexID) {\n"
++    " float2 uv;\n"
++    " if (id == 0u) uv=float2(0,0); else if (id == 1u) uv=float2(1,0);\n"
++    " else if (id == 2u || id == 3u) uv=float2(0,1);\n"
++    " else if (id == 4u) uv=float2(1,0); else uv=float2(1,1);\n"
++    " float2 p=dest.xy+uv*dest.zw;\n"
++    " VOut o; o.pos=float4(p.x/target.x*2.0-1.0,1.0-p.y/target.y*2.0,0,1); o.uv=uv; return o;\n"
++    "}\n";
++static const char ffp_overlay_ps_source[] =
++    "Texture2D<float4> bitmap : register(t0); SamplerState linearClamp : register(s0);\n"
++    "float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {\n"
++    " return bitmap.Sample(linearClamp,uv);\n"
++    "}\n";
++
++static void ffp_overlay_renderer_free(FFPOverlayRenderer *r)
++{
++    if (!r) return;
++    CS_REL(r->sampler);
++    CS_REL(r->raster);
++    CS_REL(r->blend);
++    CS_REL(r->constants);
++    CS_REL(r->ps);
++    CS_REL(r->vs);
++    memset(r, 0, sizeof(*r));
++}
++
++static int ffp_overlay_renderer_create(ID3D11Device *dev, FFPOverlayRenderer *r,
++                                       char *err, size_t n)
++{
++    static const WCHAR *dlls[] = { L"d3dcompiler_47.dll", L"d3dcompiler_43.dll" };
++    HMODULE module = NULL;
++    CSCompileFn compile = NULL;
++    ID3DBlob *vsb = NULL, *psb = NULL;
++    D3D11_BUFFER_DESC bd;
++    D3D11_BLEND_DESC blend;
++    D3D11_RASTERIZER_DESC rd;
++    D3D11_SAMPLER_DESC sm;
++    D3D11_RENDER_TARGET_BLEND_DESC *bt;
++    HRESULT hr;
++    unsigned i;
++
++    for (i = 0; i < sizeof(dlls)/sizeof(dlls[0]); ++i) {
++        module = LoadLibraryW(dlls[i]);
++        if (module) {
++            compile = (CSCompileFn)(void *)GetProcAddress(module, "D3DCompile");
++            if (compile) break;
++            FreeLibrary(module);
++            module = NULL;
++        }
++    }
++    if (!compile) { cs_error(err, n, "D3DCompile unavailable for bitmap overlays", E_FAIL); goto fail; }
++    if (FAILED(cs_compile(compile, ffp_overlay_vs_source, "vs_5_0", &vsb, err, n)) ||
++        FAILED(cs_compile(compile, ffp_overlay_ps_source, "ps_5_0", &psb, err, n))) goto fail;
++    hr = dev->lpVtbl->CreateVertexShader(dev, vsb->lpVtbl->GetBufferPointer(vsb),
++                                          vsb->lpVtbl->GetBufferSize(vsb), NULL, &r->vs);
++    if (FAILED(hr)) { cs_error(err, n, "CreateVertexShader(overlay)", hr); goto fail; }
++    hr = dev->lpVtbl->CreatePixelShader(dev, psb->lpVtbl->GetBufferPointer(psb),
++                                         psb->lpVtbl->GetBufferSize(psb), NULL, &r->ps);
++    if (FAILED(hr)) { cs_error(err, n, "CreatePixelShader(overlay)", hr); goto fail; }
++    memset(&bd, 0, sizeof(bd));
++    bd.ByteWidth = sizeof(FFPOverlayCB);
++    bd.Usage = D3D11_USAGE_DEFAULT;
++    bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
++    hr = dev->lpVtbl->CreateBuffer(dev, &bd, NULL, &r->constants);
++    if (FAILED(hr)) { cs_error(err, n, "CreateBuffer(overlay constants)", hr); goto fail; }
++    memset(&blend, 0, sizeof(blend));
++    bt = &blend.RenderTarget[0];
++    bt->BlendEnable = TRUE;
++    bt->SrcBlend = D3D11_BLEND_ONE; /* overlay textures are premultiplied on upload */
++    bt->DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
++    bt->BlendOp = D3D11_BLEND_OP_ADD;
++    bt->SrcBlendAlpha = D3D11_BLEND_ONE;
++    bt->DestBlendAlpha = D3D11_BLEND_INV_SRC_ALPHA;
++    bt->BlendOpAlpha = D3D11_BLEND_OP_ADD;
++    bt->RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
++    hr = dev->lpVtbl->CreateBlendState(dev, &blend, &r->blend);
++    if (FAILED(hr)) { cs_error(err, n, "CreateBlendState(overlay)", hr); goto fail; }
++    memset(&rd, 0, sizeof(rd));
++    rd.FillMode = D3D11_FILL_SOLID;
++    rd.CullMode = D3D11_CULL_NONE;
++    rd.DepthClipEnable = TRUE;
++    hr = dev->lpVtbl->CreateRasterizerState(dev, &rd, &r->raster);
++    if (FAILED(hr)) { cs_error(err, n, "CreateRasterizerState(overlay)", hr); goto fail; }
++    memset(&sm, 0, sizeof(sm));
++    sm.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
++    sm.AddressU = sm.AddressV = sm.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
++    sm.MaxLOD = D3D11_FLOAT32_MAX;
++    hr = dev->lpVtbl->CreateSamplerState(dev, &sm, &r->sampler);
++    if (FAILED(hr)) { cs_error(err, n, "CreateSamplerState(overlay)", hr); goto fail; }
++    CS_REL(vsb); CS_REL(psb);
++    FreeLibrary(module);
++    return 0;
++fail:
++    CS_REL(vsb); CS_REL(psb);
++    if (module) FreeLibrary(module);
++    ffp_overlay_renderer_free(r);
++    return -1;
++}
++
+ /* Caller owns returned handle; no import library dependency on d3dcompiler.
+  * Not thread-safe against concurrent use of the same immediate context. */
+ static FFPCudaShader *ffp_cuda_shader_create(ID3D11Device *dev, char *err, size_t n)
+@@ -1056,6 +1186,22 @@ struct FFPD3D11 {
+     int sc_w, sc_h;
+ 
+     FFPVP disp, snap;
++    FFPOverlayRenderer overlay_renderer;
++    int overlay_renderer_ready;
++    FFPOverlayCache overlay[FFP_OVERLAY_LAYER_COUNT];
++    FFPVideoRect overlay_video_rect;
++    LONG64 overlay_cue_uploads, overlay_rects_uploaded;
++    LONG64 overlay_cues_shown, overlay_rects_drawn, overlay_draw_failures;
++    LONG64 overlay_readback_failures;
++    LONG64 overlay_readback_seq;            /* successful captures (written under cs) */
++    LONG64 overlay_readback_rects;          /* overlay rects drawn into the latest captured frame (under cs) */
++    int overlay_frame_rects;                /* rects drawn by the current display call (under cs) */
++    int overlay_readback_enabled;
++    int overlay_readback_valid, overlay_readback_w, overlay_readback_h, overlay_readback_stride;
++    int overlay_readback_stage_w, overlay_readback_stage_h;
++    size_t overlay_readback_capacity;
++    ID3D11Texture2D *overlay_readback_staging;
++    uint8_t *overlay_readback_data;
+ 
+     CRITICAL_SECTION cs;            /* display / snapshot */
+     AVBufferRef *up_frames;
+@@ -1081,6 +1227,331 @@ static void ffp_set_err(char *err, size_
+     }
+ }
+ 
++#define FFP_OVERLAY_MAX_RECTS 1024
++#define FFP_OVERLAY_MAX_BYTES (64u * 1024u * 1024u)
++
++static void ffp_overlay_cache_free(FFPOverlayCache *c)
++{
++    int i;
++    if (!c) return;
++    for (i = 0; i < c->rect_count; i++) {
++        FFP_REL(c->rects[i].srv);
++        FFP_REL(c->rects[i].texture);
++    }
++    av_freep(&c->rects);
++    c->rect_count = 0;
++}
++
++static int ffp_overlay_cache_update(FFPD3D11 *p, FFPOverlayCache *cache,
++                                    const FFPOverlayLayer *layer, char *err, size_t n)
++{
++    FFPOverlayTexture *rects = NULL;
++    uint64_t total_bytes = 0;
++    int i;
++
++    if (!layer || layer->rect_count < 0 || layer->rect_count > FFP_OVERLAY_MAX_RECTS ||
++        (layer->rect_count && (!layer->rects || layer->canvas_width <= 0 || layer->canvas_height <= 0 ||
++         layer->canvas_width > D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION ||
++         layer->canvas_height > D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION))) {
++        ffp_set_err(err, n, "invalid bitmap overlay layer", E_INVALIDARG);
++        return -1;
++    }
++    if (cache->valid && cache->generation == layer->generation &&
++        cache->canvas_width == layer->canvas_width && cache->canvas_height == layer->canvas_height &&
++        cache->rect_count == layer->rect_count) {
++        cache->visible = !!layer->visible;
++        return 0;
++    }
++    if (layer->rect_count) {
++        rects = av_calloc(layer->rect_count, sizeof(*rects));
++        if (!rects) {
++            ffp_set_err(err, n, "bitmap overlay allocation failed", E_OUTOFMEMORY);
++            return -1;
++        }
++    }
++    for (i = 0; i < layer->rect_count; i++) {
++        const FFPOverlayRect *src = &layer->rects[i];
++        D3D11_TEXTURE2D_DESC td;
++        D3D11_SUBRESOURCE_DATA sd;
++        uint8_t *pixels;
++        int x, y;
++        HRESULT hr;
++        if (!src->rgba || src->width <= 0 || src->height <= 0 || src->stride <= 0 ||
++            (int64_t)src->stride < (int64_t)src->width * 4 ||
++            src->width > D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION ||
++            src->height > D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION ||
++            (uint64_t)src->width * (uint64_t)src->height * 4u > FFP_OVERLAY_MAX_BYTES - total_bytes) {
++            ffp_set_err(err, n, "invalid RGBA bitmap overlay rect", E_INVALIDARG);
++            goto fail;
++        }
++        total_bytes += (uint64_t)src->width * (uint64_t)src->height * 4u;
++        memset(&td, 0, sizeof(td));
++        td.Width = (UINT)src->width;
++        td.Height = (UINT)src->height;
++        td.MipLevels = td.ArraySize = 1;
++        td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
++        td.SampleDesc.Count = 1;
++        td.Usage = D3D11_USAGE_DEFAULT;
++        td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
++        pixels = av_malloc((size_t)src->width * src->height * 4u);
++        if (!pixels) {
++            ffp_set_err(err, n, "bitmap overlay pixel allocation failed", E_OUTOFMEMORY);
++            goto fail;
++        }
++        for (y = 0; y < src->height; y++) {
++            const uint8_t *in = src->rgba + (size_t)y * src->stride;
++            uint8_t *out = pixels + (size_t)y * src->width * 4u;
++            for (x = 0; x < src->width; x++) {
++                unsigned a = in[x * 4 + 3];
++                out[x * 4 + 0] = (uint8_t)((in[x * 4 + 0] * a + 127u) / 255u);
++                out[x * 4 + 1] = (uint8_t)((in[x * 4 + 1] * a + 127u) / 255u);
++                out[x * 4 + 2] = (uint8_t)((in[x * 4 + 2] * a + 127u) / 255u);
++                out[x * 4 + 3] = (uint8_t)a;
++            }
++        }
++        sd.pSysMem = pixels;
++        sd.SysMemPitch = (UINT)src->width * 4u;
++        sd.SysMemSlicePitch = 0;
++        hr = p->dev->lpVtbl->CreateTexture2D(p->dev, &td, &sd, &rects[i].texture);
++        av_free(pixels);
++        if (FAILED(hr)) {
++            ffp_set_err(err, n, "CreateTexture2D(bitmap overlay)", hr);
++            goto fail;
++        }
++        hr = p->dev->lpVtbl->CreateShaderResourceView(p->dev, (ID3D11Resource *)rects[i].texture,
++                                                       NULL, &rects[i].srv);
++        if (FAILED(hr)) {
++            ffp_set_err(err, n, "CreateShaderResourceView(bitmap overlay)", hr);
++            goto fail;
++        }
++        rects[i].x = src->x;
++        rects[i].y = src->y;
++        rects[i].width = src->width;
++        rects[i].height = src->height;
++    }
++    ffp_overlay_cache_free(cache);
++    cache->rects = rects;
++    cache->rect_count = layer->rect_count;
++    cache->canvas_width = layer->canvas_width;
++    cache->canvas_height = layer->canvas_height;
++    cache->generation = layer->generation;
++    cache->visible = !!layer->visible;
++    cache->valid = 1;
++    InterlockedIncrement64(&p->overlay_cue_uploads);
++    InterlockedExchangeAdd64(&p->overlay_rects_uploaded, layer->rect_count);
++    return 0;
++fail:
++    if (rects) {
++        for (i = 0; i < layer->rect_count; i++) {
++            FFP_REL(rects[i].srv);
++            FFP_REL(rects[i].texture);
++        }
++        av_free(rects);
++    }
++    return -1;
++}
++
++static int ffp_overlay_draw(FFPD3D11 *p, ID3D11RenderTargetView *rtv,
++                            const RECT *video_rect, int tw, int th, char *err, size_t n)
++{
++    static const float blend_factor[4] = { 0, 0, 0, 0 };
++    ID3D11ShaderResourceView *null_srv = NULL;
++    ID3D11Buffer *null_cb = NULL;
++    D3D11_VIEWPORT vp;
++    int l, i, active = 0;
++
++    p->overlay_frame_rects = 0;
++    for (l = 0; l < FFP_OVERLAY_LAYER_COUNT; l++)
++        if (p->overlay[l].visible && p->overlay[l].rect_count &&
++            p->overlay[l].canvas_width > 0 && p->overlay[l].canvas_height > 0)
++            active = 1;
++    if (!active)
++        return 0;
++    if (!p->overlay_renderer_ready) {
++        if (ffp_overlay_renderer_create(p->dev, &p->overlay_renderer, err, n) < 0)
++            return -1;
++        p->overlay_renderer_ready = 1;
++    }
++    vp.TopLeftX = 0; vp.TopLeftY = 0;
++    vp.Width = (FLOAT)tw; vp.Height = (FLOAT)th;
++    vp.MinDepth = 0; vp.MaxDepth = 1;
++    p->ctx->lpVtbl->RSSetState(p->ctx, p->overlay_renderer.raster);
++    p->ctx->lpVtbl->RSSetViewports(p->ctx, 1, &vp);
++    p->ctx->lpVtbl->IASetInputLayout(p->ctx, NULL);
++    p->ctx->lpVtbl->IASetPrimitiveTopology(p->ctx, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
++    p->ctx->lpVtbl->VSSetShader(p->ctx, p->overlay_renderer.vs, NULL, 0);
++    p->ctx->lpVtbl->GSSetShader(p->ctx, NULL, NULL, 0);
++    p->ctx->lpVtbl->HSSetShader(p->ctx, NULL, NULL, 0);
++    p->ctx->lpVtbl->DSSetShader(p->ctx, NULL, NULL, 0);
++    p->ctx->lpVtbl->PSSetShader(p->ctx, p->overlay_renderer.ps, NULL, 0);
++    p->ctx->lpVtbl->PSSetSamplers(p->ctx, 0, 1, &p->overlay_renderer.sampler);
++    /* dest/target are read by the vertex shader; without a VS binding the quads get NaN positions and are culled */
++    p->ctx->lpVtbl->VSSetConstantBuffers(p->ctx, 0, 1, &p->overlay_renderer.constants);
++    p->ctx->lpVtbl->PSSetConstantBuffers(p->ctx, 0, 1, &p->overlay_renderer.constants);
++    p->ctx->lpVtbl->OMSetBlendState(p->ctx, p->overlay_renderer.blend, blend_factor, 0xffffffffu);
++    p->ctx->lpVtbl->OMSetRenderTargets(p->ctx, 1, &rtv, NULL);
++    for (l = 0; l < FFP_OVERLAY_LAYER_COUNT; l++) {
++        FFPOverlayCache *c = &p->overlay[l];
++        if (!c->visible || !c->rect_count || c->canvas_width <= 0 || c->canvas_height <= 0)
++            continue;
++        for (i = 0; i < c->rect_count; i++) {
++            FFPOverlayTexture *r = &c->rects[i];
++            FFPOverlayCB cb;
++            ID3D11ShaderResourceView *srv = r->srv;
++            cb.dest[0] = (float)video_rect->left + (float)r->x * (float)(video_rect->right-video_rect->left) / c->canvas_width;
++            cb.dest[1] = (float)video_rect->top + (float)r->y * (float)(video_rect->bottom-video_rect->top) / c->canvas_height;
++            cb.dest[2] = (float)r->width * (float)(video_rect->right-video_rect->left) / c->canvas_width;
++            cb.dest[3] = (float)r->height * (float)(video_rect->bottom-video_rect->top) / c->canvas_height;
++            cb.target[0] = (float)tw; cb.target[1] = (float)th; cb.target[2] = cb.target[3] = 0;
++            p->ctx->lpVtbl->UpdateSubresource(p->ctx, (ID3D11Resource *)p->overlay_renderer.constants, 0, NULL, &cb, 0, 0);
++            p->ctx->lpVtbl->PSSetShaderResources(p->ctx, 0, 1, &srv);
++            p->ctx->lpVtbl->Draw(p->ctx, 6, 0);
++            InterlockedIncrement64(&p->overlay_rects_drawn);
++            p->overlay_frame_rects++;
++        }
++        InterlockedIncrement64(&p->overlay_cues_shown);
++    }
++    p->ctx->lpVtbl->PSSetShaderResources(p->ctx, 0, 1, &null_srv);
++    p->ctx->lpVtbl->VSSetConstantBuffers(p->ctx, 0, 1, &null_cb);
++    p->ctx->lpVtbl->PSSetConstantBuffers(p->ctx, 0, 1, &null_cb);
++    p->ctx->lpVtbl->OMSetRenderTargets(p->ctx, 0, NULL, NULL);
++    return 0;
++}
++
++/* Test-only synchronous copy, called on the immediate-context owner while the
++ * presenter lock is held. It is disabled in normal playback. */
++static void ffp_overlay_capture_readback(FFPD3D11 *p, ID3D11Texture2D *bb, int w, int h)
++{
++    D3D11_TEXTURE2D_DESC td;
++    D3D11_MAPPED_SUBRESOURCE mapped;
++    size_t bytes;
++    int y;
++    if (!p->overlay_readback_enabled || !bb)
++        return;
++    if (!p->overlay_readback_staging || p->overlay_readback_stage_w != w || p->overlay_readback_stage_h != h) {
++        FFP_REL(p->overlay_readback_staging);
++        memset(&td, 0, sizeof(td));
++        td.Width = (UINT)w; td.Height = (UINT)h;
++        td.MipLevels = td.ArraySize = 1;
++        td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
++        td.SampleDesc.Count = 1;
++        td.Usage = D3D11_USAGE_STAGING;
++        td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
++        if (FAILED(p->dev->lpVtbl->CreateTexture2D(p->dev, &td, NULL, &p->overlay_readback_staging)))
++            goto fail;
++        p->overlay_readback_stage_w = w;
++        p->overlay_readback_stage_h = h;
++    }
++    p->ctx->lpVtbl->CopyResource(p->ctx, (ID3D11Resource *)p->overlay_readback_staging, (ID3D11Resource *)bb);
++    if (FAILED(p->ctx->lpVtbl->Map(p->ctx, (ID3D11Resource *)p->overlay_readback_staging, 0, D3D11_MAP_READ, 0, &mapped)))
++        goto fail;
++    bytes = (size_t)w * 4u * (size_t)h;
++    if (bytes / 4u / (size_t)h != (size_t)w) {
++        p->ctx->lpVtbl->Unmap(p->ctx, (ID3D11Resource *)p->overlay_readback_staging, 0);
++        goto fail;
++    }
++    if (p->overlay_readback_capacity < bytes) {
++        uint8_t *new_data = av_realloc(p->overlay_readback_data, bytes);
++        if (!new_data) {
++            p->ctx->lpVtbl->Unmap(p->ctx, (ID3D11Resource *)p->overlay_readback_staging, 0);
++            goto fail;
++        }
++        p->overlay_readback_data = new_data;
++        p->overlay_readback_capacity = bytes;
++    }
++    for (y = 0; y < h; y++)
++        memcpy(p->overlay_readback_data + (size_t)y * w * 4,
++               (const uint8_t *)mapped.pData + (size_t)y * mapped.RowPitch, (size_t)w * 4);
++    p->overlay_readback_stride = w * 4;
++    p->ctx->lpVtbl->Unmap(p->ctx, (ID3D11Resource *)p->overlay_readback_staging, 0);
++    p->overlay_readback_w = w;
++    p->overlay_readback_h = h;
++    p->overlay_readback_valid = 1;
++    p->overlay_readback_rects = p->overlay_frame_rects;     /* seq and rects change together under cs */
++    p->overlay_readback_seq++;
++    return;
++fail:
++    p->overlay_readback_valid = 0;
++    InterlockedIncrement64(&p->overlay_readback_failures);
++}
++
++int ffp_d3d11_set_overlay(FFPD3D11 *p, int layer, const FFPOverlayLayer *overlay,
++                          char *err, size_t err_size)
++{
++    int ret;
++    if (!p || layer < 0 || layer >= FFP_OVERLAY_LAYER_COUNT) {
++        ffp_set_err(err, err_size, "invalid bitmap overlay target", E_INVALIDARG);
++        return -1;
++    }
++    EnterCriticalSection(&p->cs);
++    ret = ffp_overlay_cache_update(p, &p->overlay[layer], overlay, err, err_size);
++    LeaveCriticalSection(&p->cs);
++    return ret;
++}
++
++void ffp_d3d11_overlay_stats(const FFPD3D11 *p, FFPD3D11OverlayStats *out)
++{
++    int i;
++    if (!out) return;
++    memset(out, 0, sizeof(*out));
++    if (!p) return;
++    EnterCriticalSection((CRITICAL_SECTION *)&p->cs);
++    out->video_rect = p->overlay_video_rect;
++    for (i = 0; i < FFP_OVERLAY_LAYER_COUNT; i++) {
++        out->canvas_width[i] = p->overlay[i].canvas_width;
++        out->canvas_height[i] = p->overlay[i].canvas_height;
++        out->generation[i] = p->overlay[i].generation;
++    }
++    out->readback_seq = (uint64_t)p->overlay_readback_seq;
++    out->readback_rects = (uint64_t)p->overlay_readback_rects;
++    LeaveCriticalSection((CRITICAL_SECTION *)&p->cs);
++    out->cue_uploads = InterlockedCompareExchange64((LONG64 *)&p->overlay_cue_uploads, 0, 0);
++    out->rects_uploaded = InterlockedCompareExchange64((LONG64 *)&p->overlay_rects_uploaded, 0, 0);
++    out->cues_shown = InterlockedCompareExchange64((LONG64 *)&p->overlay_cues_shown, 0, 0);
++    out->rects_drawn = InterlockedCompareExchange64((LONG64 *)&p->overlay_rects_drawn, 0, 0);
++    out->draw_failures = InterlockedCompareExchange64((LONG64 *)&p->overlay_draw_failures, 0, 0);
++    out->readback_failures = InterlockedCompareExchange64((LONG64 *)&p->overlay_readback_failures, 0, 0);
++}
++
++void ffp_d3d11_readback_test_enable(FFPD3D11 *p, int enable)
++{
++    if (!p) return;
++    EnterCriticalSection(&p->cs);
++    p->overlay_readback_enabled = !!enable;
++    if (!enable) p->overlay_readback_valid = 0;
++    LeaveCriticalSection(&p->cs);
++}
++
++int ffp_d3d11_readback_last(FFPD3D11 *p, uint8_t **bgra, int *w, int *h,
++                            int *stride, char *err, size_t err_size)
++{
++    uint8_t *copy;
++    if (!p || !bgra || !w || !h || !stride) {
++        ffp_set_err(err, err_size, "invalid D3D11 readback arguments", E_INVALIDARG);
++        return -1;
++    }
++    *bgra = NULL;
++    EnterCriticalSection(&p->cs);
++    if (!p->overlay_readback_valid || !p->overlay_readback_data) {
++        LeaveCriticalSection(&p->cs);
++        ffp_set_err(err, err_size, "no composed back-buffer readback available", E_FAIL);
++        return -1;
++    }
++    copy = av_memdup(p->overlay_readback_data,
++                     (size_t)p->overlay_readback_stride * p->overlay_readback_h);
++    if (!copy) {
++        LeaveCriticalSection(&p->cs);
++        ffp_set_err(err, err_size, "readback allocation failed", E_OUTOFMEMORY);
++        return -1;
++    }
++    *bgra = copy;
++    *w = p->overlay_readback_w;
++    *h = p->overlay_readback_h;
++    *stride = p->overlay_readback_stride;
++    LeaveCriticalSection(&p->cs);
++    return 0;
++}
++
+ #define CHECK_HR(expr, what) do {                       \
+     HRESULT hr_ = (expr);                               \
+     if (FAILED(hr_)) {                                  \
+@@ -2282,6 +2753,11 @@ void ffp_d3d11_destroy(FFPD3D11 *p)
+     ffp_cuda_registry_drain(p->cuda_reg);
+     ffp_destroy_swapchain(p);
+     ffp_vp_free(&p->snap);
++    ffp_overlay_cache_free(&p->overlay[FFP_OVERLAY_CAPTION]);
++    ffp_overlay_cache_free(&p->overlay[FFP_OVERLAY_SUPERIMPOSE]);
++    ffp_overlay_renderer_free(&p->overlay_renderer);
++    FFP_REL(p->overlay_readback_staging);
++    av_freep(&p->overlay_readback_data);
+     av_frame_free(&p->up_frame);
+     av_frame_free(&p->swf);
+     av_frame_free(&p->dl);
+@@ -2716,16 +3192,33 @@ int ffp_d3d11_display(FFPD3D11 *p, const
+     if (p->hwctx && InterlockedCompareExchange((volatile LONG *)&p->hwctx->decoder_bind_fallbacks, 0, 0))
+         ffp_d3d11_record_fallback(p, "decoder_pool_no_srv");     /* a decoder pool was created again without SHADER_RESOURCE */
+     if (f->format == AV_PIX_FMT_CUDA) {
++        memset(&in, 0, sizeof(in));
++        in.vis_w = FFMAX(f->width - f->crop_left, 1);
++        in.vis_h = FFMAX(f->height - f->crop_top, 1);
++        ffp_rotated_size(&in, pp->rotation, &rw, &rh);
++        dst = ffp_letterbox(p->sc_w, p->sc_h, rw, rh, ffp_eff_sar(f, pp->rotation));
++        p->overlay_video_rect.x = dst.left;
++        p->overlay_video_rect.y = dst.top;
++        p->overlay_video_rect.width = dst.right - dst.left;
++        p->overlay_video_rect.height = dst.bottom - dst.top;
+         CHECK_HR(p->sc->lpVtbl->GetBuffer(p->sc, 0, &ffp_IID_ID3D11Texture2D, (void **)&bb), "IDXGISwapChain::GetBuffer");
+         CHECK_HR(p->dev->lpVtbl->CreateRenderTargetView(p->dev, (ID3D11Resource *)bb, NULL, &rtv), "CUDA render target");
+         ret = ffp_cuda_render(p, f, pp, rtv, p->sc_w, p->sc_h, direct, err, err_size);
+-        FFP_REL(rtv);
+-        FFP_REL(bb);
+         if (ret < 0) goto done;
+         if (ret > 0) {
++            FFP_REL(rtv); FFP_REL(bb);
+             LeaveCriticalSection(&p->cs);
+             return 1; /* unsafe retired frame skipped, not a presenter failure */
+         }
++        ffp_lock_dev(p);
++        if (ffp_overlay_draw(p, rtv, &dst, p->sc_w, p->sc_h, err, err_size) < 0) {
++            InterlockedIncrement64(&p->overlay_draw_failures);
++            av_log(NULL, AV_LOG_WARNING, "D3D11 bitmap overlay draw failed: %s\n", err ? err : "unknown error");
++        }
++        ffp_overlay_capture_readback(p, bb, p->sc_w, p->sc_h);
++        ffp_unlock_dev(p);
++        FFP_REL(rtv);
++        FFP_REL(bb);
+         p->route_shader = 1;
+         InterlockedIncrement(&p->frames_shader);
+         InterlockedIncrement(*direct ? &p->frames_cuda_zero_copy : &p->frames_cuda_copied);
+@@ -2752,13 +3245,24 @@ int ffp_d3d11_display(FFPD3D11 *p, const
+         shader = FFP_ROUTE_PICK_VP;
+     }
+     *direct = in.direct;
++    ffp_rotated_size(&in, pp->rotation, &rw, &rh);
++    dst = ffp_letterbox(p->sc_w, p->sc_h, rw, rh, ffp_eff_sar(f, pp->rotation));
++    p->overlay_video_rect.x = dst.left;
++    p->overlay_video_rect.y = dst.top;
++    p->overlay_video_rect.width = dst.right - dst.left;
++    p->overlay_video_rect.height = dst.bottom - dst.top;
+     if (shader) {
+         int p010_no_vp = !p->lim.p010 && ffp_input_p010(&in);
+ 
+         CHECK_HR(p->sc->lpVtbl->GetBuffer(p->sc, 0, &ffp_IID_ID3D11Texture2D, (void **)&bb), "shader back buffer");
+         CHECK_HR(p->dev->lpVtbl->CreateRenderTargetView(p->dev, (ID3D11Resource *)bb, NULL, &rtv), "shader render target");
+         ffp_lock_dev(p);
+-        ret = ffp_d3d11_shader_render(p, &in, f, pp, rtv, p->sc_w, p->sc_h, NULL, &copied, err, err_size);
++        ret = ffp_d3d11_shader_render(p, &in, f, pp, rtv, p->sc_w, p->sc_h, &dst, &copied, err, err_size);
++        if (ret >= 0 && ffp_overlay_draw(p, rtv, &dst, p->sc_w, p->sc_h, err, err_size) < 0) {
++            InterlockedIncrement64(&p->overlay_draw_failures);
++            av_log(NULL, AV_LOG_WARNING, "D3D11 bitmap overlay draw failed: %s\n", err ? err : "unknown error");
++        }
++        if (ret >= 0) ffp_overlay_capture_readback(p, bb, p->sc_w, p->sc_h);
+         ffp_unlock_dev(p);
+         if (ret < 0 && p->shader_failed && p010_no_vp && !ffp_shader_route(&p->lim, pp)) {
+             /* no shader after all: P010 without video processor P010 input is downloaded and converted */
+@@ -2798,13 +3302,33 @@ int ffp_d3d11_display(FFPD3D11 *p, const
+     target.right = p->sc_w;
+     target.bottom = p->sc_h;
+ 
++    p->overlay_video_rect.x = dst.left;
++    p->overlay_video_rect.y = dst.top;
++    p->overlay_video_rect.width = dst.right - dst.left;
++    p->overlay_video_rect.height = dst.bottom - dst.top;
+     ffp_lock_dev(p);
+     ret = ffp_blt(p, &p->disp, ov, &in, pp, f, &dst, &target, err, err_size);
++    if (ret >= 0) {
++        FFP_REL(ov);
++        hr = p->dev->lpVtbl->CreateRenderTargetView(p->dev, (ID3D11Resource *)bb, NULL, &rtv);
++        if (SUCCEEDED(hr)) {
++            if (ffp_overlay_draw(p, rtv, &dst, p->sc_w, p->sc_h, err, err_size) < 0) {
++                InterlockedIncrement64(&p->overlay_draw_failures);
++                av_log(NULL, AV_LOG_WARNING, "D3D11 bitmap overlay draw failed: %s\n", err ? err : "unknown error");
++            }
++        } else {
++            p->overlay_frame_rects = 0;
++            InterlockedIncrement64(&p->overlay_draw_failures);
++            ffp_set_err(err, err_size, "CreateRenderTargetView(bitmap overlay)", hr);
++        }
++        ffp_overlay_capture_readback(p, bb, p->sc_w, p->sc_h);
++    }
+     ffp_unlock_dev(p);
+     if (ret < 0)
+         goto done;
+     ret = -1;
+     FFP_REL(ov);
++    FFP_REL(rtv);   /* a back-buffer view left alive makes the next ResizeBuffers fail (DXGI_ERROR_INVALID_CALL) */
+     FFP_REL(bb);
+     LeaveCriticalSection(&p->cs);
+ 
+@@ -2967,6 +3491,114 @@ done:
+     return ret;
+ }
+ 
++static void ffp_overlay_sample_rgba(const FFPOverlayRect *r, double sx, double sy, float rgba[4])
++{
++    int x0, y0, x1, y1, k;
++    double fx, fy, alpha = 0.0, premul[3] = { 0, 0, 0 };
++    double weights[4];
++    const uint8_t *px[4];
++    if (sx < 0) sx = 0;
++    if (sy < 0) sy = 0;
++    if (sx > r->width - 1) sx = r->width - 1;
++    if (sy > r->height - 1) sy = r->height - 1;
++    x0 = (int)floor(sx); y0 = (int)floor(sy);
++    x1 = FFMIN(x0 + 1, r->width - 1); y1 = FFMIN(y0 + 1, r->height - 1);
++    fx = sx - x0; fy = sy - y0;
++    weights[0] = (1.0 - fx) * (1.0 - fy);
++    weights[1] = fx * (1.0 - fy);
++    weights[2] = (1.0 - fx) * fy;
++    weights[3] = fx * fy;
++    px[0] = r->rgba + (size_t)y0 * r->stride + (size_t)x0 * 4;
++    px[1] = r->rgba + (size_t)y0 * r->stride + (size_t)x1 * 4;
++    px[2] = r->rgba + (size_t)y1 * r->stride + (size_t)x0 * 4;
++    px[3] = r->rgba + (size_t)y1 * r->stride + (size_t)x1 * 4;
++    for (k = 0; k < 4; k++) {
++        double a = px[k][3] / 255.0;
++        alpha += weights[k] * a;
++        premul[0] += weights[k] * a * px[k][0];
++        premul[1] += weights[k] * a * px[k][1];
++        premul[2] += weights[k] * a * px[k][2];
++    }
++    rgba[3] = (float)alpha;
++    for (k = 0; k < 3; k++)
++        rgba[k] = alpha > 1e-8 ? (float)(premul[k] / alpha) : 0.0f;
++}
++
++static int ffp_snapshot_blend_layer(uint8_t *dst, int dw, int dh, int dstride,
++                                    const FFPOverlayLayer *layer, char *err, size_t n)
++{
++    uint64_t total_bytes = 0;
++    int i;
++    if (!layer || !layer->visible || !layer->rect_count)
++        return 0;
++    if (layer->rect_count < 0 || layer->rect_count > FFP_OVERLAY_MAX_RECTS ||
++        !layer->rects || layer->canvas_width <= 0 || layer->canvas_height <= 0 ||
++        layer->canvas_width > D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION ||
++        layer->canvas_height > D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION) {
++        ffp_set_err(err, n, "invalid snapshot bitmap overlay layer", E_INVALIDARG);
++        return -1;
++    }
++    for (i = 0; i < layer->rect_count; i++) {
++        const FFPOverlayRect *r = &layer->rects[i];
++        double x, y, rw, rh;
++        int x0, y0, x1, y1, py, px;
++        if (!r->rgba || r->width <= 0 || r->height <= 0 || r->stride <= 0 ||
++            (int64_t)r->stride < (int64_t)r->width * 4 ||
++            r->width > D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION ||
++            r->height > D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION ||
++            (uint64_t)r->width * (uint64_t)r->height * 4u > FFP_OVERLAY_MAX_BYTES - total_bytes) {
++            ffp_set_err(err, n, "invalid snapshot RGBA bitmap rect", E_INVALIDARG);
++            return -1;
++        }
++        total_bytes += (uint64_t)r->width * (uint64_t)r->height * 4u;
++        x = (double)r->x * dw / layer->canvas_width;
++        y = (double)r->y * dh / layer->canvas_height;
++        rw = (double)r->width * dw / layer->canvas_width;
++        rh = (double)r->height * dh / layer->canvas_height;
++        if (rw <= 0 || rh <= 0)
++            continue;
++        x0 = (int)FFMIN((double)dw, FFMAX(0.0, floor(x)));
++        y0 = (int)FFMIN((double)dh, FFMAX(0.0, floor(y)));
++        x1 = (int)FFMAX(0.0, FFMIN((double)dw, ceil(x + rw)));
++        y1 = (int)FFMAX(0.0, FFMIN((double)dh, ceil(y + rh)));
++        for (py = y0; py < y1; py++) {
++            double sy = ((py + 0.5 - y) / rh) * r->height - 0.5;
++            for (px = x0; px < x1; px++) {
++                float rgba[4];
++                double sx = ((px + 0.5 - x) / rw) * r->width - 0.5;
++                double a;
++                uint8_t *d = dst + (size_t)py * dstride + (size_t)px * 4;
++                ffp_overlay_sample_rgba(r, sx, sy, rgba);
++                a = rgba[3];
++                if (a <= 0.0) continue;
++                d[0] = (uint8_t)av_clip((int)lrint(rgba[2] * a + d[0] * (1.0 - a)), 0, 255);
++                d[1] = (uint8_t)av_clip((int)lrint(rgba[1] * a + d[1] * (1.0 - a)), 0, 255);
++                d[2] = (uint8_t)av_clip((int)lrint(rgba[0] * a + d[2] * (1.0 - a)), 0, 255);
++                d[3] = 255;
++            }
++        }
++    }
++    return 0;
++}
++
++int ffp_d3d11_snapshot_with_overlays(FFPD3D11 *p, const AVFrame *f, const FFPPresParams *pp,
++                                     const FFPOverlayLayer layers[FFP_OVERLAY_LAYER_COUNT],
++                                     uint8_t **out, int *w, int *h, int *stride,
++                                     char *err, size_t err_size)
++{
++    int ret, i;
++    ret = ffp_d3d11_snapshot(p, f, pp, out, w, h, stride, err, err_size);
++    if (ret < 0)
++        return ret;
++    for (i = 0; layers && i < FFP_OVERLAY_LAYER_COUNT; i++) {
++        if (ffp_snapshot_blend_layer(*out, *w, *h, *stride, &layers[i], err, err_size) < 0) {
++            av_freep(out);
++            return -1;
++        }
++    }
++    return 0;
++}
++
+ #else
+ 
+ int ffp_d3d11_get_limits(FFPD3D11Limits *out)
+@@ -3023,7 +3655,14 @@ int ffp_d3d11_frame_ok(const void *dev,
+ const FFPD3D11Limits *ffp_d3d11_limits(const FFPD3D11 *p) { return NULL; }
+ int ffp_d3d11_display(FFPD3D11 *p, const AVFrame *f, const FFPPresParams *pp, int *d, char *e, size_t n) { return -1; }
+ void ffp_d3d11_clear(FFPD3D11 *p) {}
++int ffp_d3d11_set_overlay(FFPD3D11 *p, int l, const FFPOverlayLayer *o, char *e, size_t n) { return -1; }
++void ffp_d3d11_overlay_stats(const FFPD3D11 *p, FFPD3D11OverlayStats *s) { if (s) memset(s, 0, sizeof(*s)); }
++void ffp_d3d11_readback_test_enable(FFPD3D11 *p, int e) {}
++int ffp_d3d11_readback_last(FFPD3D11 *p, uint8_t **o, int *w, int *h, int *s, char *e, size_t n) { return -1; }
+ int ffp_d3d11_snapshot(FFPD3D11 *p, const AVFrame *f, const FFPPresParams *pp, uint8_t **o, int *w, int *h, int *s,
+                        char *e, size_t n) { return -1; }
++int ffp_d3d11_snapshot_with_overlays(FFPD3D11 *p, const AVFrame *f, const FFPPresParams *pp,
++                                     const FFPOverlayLayer l[FFP_OVERLAY_LAYER_COUNT],
++                                     uint8_t **o, int *w, int *h, int *s, char *e, size_t n) { return -1; }
+ 
+ #endif
+--- a/fftools/ffplay_presenter.h
++++ b/fftools/ffplay_presenter.h
+@@ -144,6 +144,60 @@ void ffp_d3d11_caps_entry(AVBPrint *bp);
+ 
+ typedef struct FFPD3D11 FFPD3D11;
+ 
++/* Bitmap overlays are immutable for a cue generation. RGBA is straight-alpha,
++ * top-to-bottom, four bytes per pixel; x/y are in the layer's canvas pixels.
++ * Live textures are premultiplied while uploading for correct linear filtering.
++ * The presenter copies/uploads the data before this call returns. */
++enum {
++    FFP_OVERLAY_CAPTION = 0,
++    FFP_OVERLAY_SUPERIMPOSE = 1,
++    FFP_OVERLAY_LAYER_COUNT = 2,
++};
++
++typedef struct FFPOverlayRect {
++    const uint8_t *rgba;
++    int x, y;
++    int width, height;
++    int stride;
++} FFPOverlayRect;
++
++typedef struct FFPOverlayLayer {
++    uint64_t generation;
++    int visible;
++    int canvas_width, canvas_height;
++    const FFPOverlayRect *rects;
++    int rect_count;                  /* zero rects clears this generation */
++} FFPOverlayLayer;
++
++typedef struct FFPVideoRect {
++    int x, y, width, height;         /* current letterboxed video area, client pixels */
++} FFPVideoRect;
++
++typedef struct FFPD3D11OverlayStats {
++    FFPVideoRect video_rect;
++    int canvas_width[FFP_OVERLAY_LAYER_COUNT];
++    int canvas_height[FFP_OVERLAY_LAYER_COUNT];
++    uint64_t generation[FFP_OVERLAY_LAYER_COUNT];
++    uint64_t cue_uploads;
++    uint64_t rects_uploaded;
++    uint64_t cues_shown;
++    uint64_t rects_drawn;
++    uint64_t draw_failures;
++    uint64_t readback_failures;
++    uint64_t readback_seq;           /* successful readbacks so far (advances once per captured frame) */
++    uint64_t readback_rects;         /* overlay rects drawn into the latest captured frame; consistent with readback_seq */
++} FFPD3D11OverlayStats;
++
++/* Replaces a layer when its generation or canvas dimensions change; visibility
++ * can change independently while an indefinite cue remains cached. */
++int ffp_d3d11_set_overlay(FFPD3D11 *p, int layer, const FFPOverlayLayer *overlay,
++                          char *err, size_t err_size);
++void ffp_d3d11_overlay_stats(const FFPD3D11 *p, FFPD3D11OverlayStats *out);
++/* Test-only: enabled capture copies each composed back buffer before Present.
++ * Returned bytes from readback_last are BGRA8 allocated with av_malloc. */
++void ffp_d3d11_readback_test_enable(FFPD3D11 *p, int enable);
++int ffp_d3d11_readback_last(FFPD3D11 *p, uint8_t **bgra, int *w, int *h,
++                            int *stride, char *err, size_t err_size);
+ /* host_hwnd: the window the presenter fills with a child window. fail_mode (tests only): 0 none, 1 fail at the
+  * first display, 2 fail at creation, 3 report a device loss at the first display. cfg: the d3d11_* options (NULL = none). */
+ FFPD3D11 *ffp_d3d11_create(void *host_hwnd, int fail_mode, const FFPD3D11Config *cfg, char *err, size_t err_size);
+@@ -179,5 +233,12 @@ void ffp_d3d11_clear(FFPD3D11 *p);
+ /* renders f through the VideoProcessor into a BGRA buffer (av_malloc, ffp_free) of the size documented for ffp_snapshot */
+ int ffp_d3d11_snapshot(FFPD3D11 *p, const AVFrame *f, const FFPPresParams *pp, uint8_t **out, int *w, int *h,
+                        int *stride, char *err, size_t err_size);
++/* CPU-composites the currently visible bitmap cues over the native-size snapshot.
++ * This scales the supplied live cue bitmaps to snapshot size; decoder rerendering is
++ * the caller's responsibility if it needs a snapshot-specific canvas. */
++int ffp_d3d11_snapshot_with_overlays(FFPD3D11 *p, const AVFrame *f, const FFPPresParams *pp,
++                                     const FFPOverlayLayer layers[FFP_OVERLAY_LAYER_COUNT],
++                                     uint8_t **out, int *w, int *h, int *stride,
++                                     char *err, size_t err_size);
+ 
+ #endif /* FFTOOLS_FFPLAY_PRESENTER_H */

@@ -1,0 +1,1839 @@
+--- a/fftools/ffplay.c
++++ b/fftools/ffplay.c
+@@ -69,6 +69,7 @@
+ #include "ffplay.h"
+ #include "ffplay_renderer.h"
+ #include "ffplay_presenter.h"
++#include "ffplay_arib_audio.h"
+ 
+ #ifdef _WIN32
+ #  define WIN32_LEAN_AND_MEAN
+@@ -448,8 +449,22 @@ typedef struct FFPDebugSubtitle {
+     int history_landed;                                              /* cues shown from it at a seek or open */
+ } FFPDebugSubtitle;
+ 
++/* ARIB audio model (ffp_get_debug_info "arib_audio"): written by the selector / read thread under dbg_mutex */
++typedef struct FFPDebugArib {
++    int active;
++    int pref;                       /* FFP_ARIB_PREF_* */
++    int playing;                    /* FFP_ARIB_SRC_* of the sample last rendered, -1 none yet */
++    int stream_index[2], pid[2], tag[2];
++    int removed[2], starved[2];
++    double ring_ms[2];              /* decoded audio buffered ahead of the cursor */
++    int64_t switches;               /* source changes at the cursor */
++    double silence_ms;              /* silence synthesised where no source had samples */
++    int64_t rebinds;
++} FFPDebugArib;
++
+ typedef struct FFPDebug {
+     FFPDebugSubtitle subtitles[FFP_SUBTITLE_LAYER_COUNT];
++    FFPDebugArib arib;
+     AVRational v_avg_fr, v_r_fr;
+     AVRational v_flt_fr, v_flt_tb;
+     int v_flt_valid;
+@@ -557,6 +572,7 @@ typedef struct VideoState {
+     int audio_diff_avg_count;
+     AVStream *audio_st;
+     PacketQueue audioq;
++    struct AribAudio *arib;         /* ARIB audio model (audio 1 / audio 2 sources + selector); NULL = one plain audio stream */
+     int audio_hw_buf_size;
+     uint8_t *audio_buf;
+     uint8_t *audio_buf1;
+@@ -740,6 +756,7 @@ struct FFPlayer {
+     char *vfilter, *afilter;
+     SDL_atomic_t vfilter_gen, afilter_gen;
+     SDL_atomic_t volume, muted;
++    SDL_atomic_t audio_pref;        /* FFP_ARIB_PREF_*, persists across opens (the host resets it) */
+     SDL_atomic_t subtitle_visible[FFP_SUBTITLE_LAYER_COUNT];
+     double position, duration;      /* mirrors for ffp_get_position/duration */
+     char *media_info;
+@@ -3711,6 +3728,9 @@ static void ffp_dbg_stream_closed(VideoS
+     SDL_UnlockMutex(is->dbg_mutex);
+ }
+ 
++static void arib_audio_stop(VideoState *is);
++static void arib_audio_free(VideoState *is);
++
+ static void stream_component_close(VideoState *is, int stream_index, int subtitle_layer)
+ {
+     AVFormatContext *ic = is->ic;
+@@ -3723,7 +3743,9 @@ static void stream_component_close(Video
+ 
+     switch (codecpar->codec_type) {
+     case AVMEDIA_TYPE_AUDIO:
++        arib_audio_stop(is);
+         decoder_abort(&is->auddec, &is->sampq);
++        arib_audio_free(is);
+         if (is->audio_dev)
+             SDL_CloseAudioDevice(is->audio_dev);
+         is->audio_dev = 0;
+@@ -5128,6 +5150,1417 @@ static int decoder_start_routed_subtitle
+     return ret;
+ }
+ 
++/* ARIB audio model (ARIB TS only; every other input keeps the single audio stream and audio_thread above).
++ *
++ * Two roles, audio 1 and audio 2 (tsreadex' rules, ffp_arib_roles), are demuxed and decoded in parallel: one AribSrc per
++ * role with its own packet queue (audio 1 uses is->audioq, so the shared audio serial, the queue statistics and the seek
++ * flush stay what they were), decoder thread and swresample converter. A source writes float PCM in ONE mix format (the
++ * device rate and layout) into a ring of chunks keyed by position (the source PTS in mix samples).
++ *
++ * The selector thread replaces audio_thread: one output cursor advances through the mix timeline; ffp_arib_select()
++ * decides per run of samples which ring supplies it; a short crossfade (or a dip when the leaving source has no more
++ * samples) smooths every change; the result enters the ONE shared audio filter graph and then sampq, the audio callback
++ * and the device are untouched. A source that has neither a sample at the cursor nor a decision makes the cursor wait
++ * (bounded by the starvation rules of ffplay_arib_audio.h); where nothing can supply samples the selector synthesises
++ * silence with advancing pts, so the audio clock never freezes. */
++
++static int stream_has_enough_packets(AVStream *st, int stream_id, PacketQueue *queue);
++
++#define ARIB_BLOCK        1024
++#define ARIB_RING_CHUNKS  256
++#define ARIB_RING_LEAD_S  1.5
++#define ARIB_PLAN_MAX     8
++#define ARIB_PLAN_AHEAD   4096
++#define ARIB_PLAN_STEP    4096
++#define ARIB_DISC_FWD_S   8.0
++#define ARIB_DISC_BACK_S  1.0
++#define ARIB_SNAP         24
++#define ARIB_STALE_CHUNKS 25
++#define ARIB_START_SKEW_S 0.25
++#define ARIB_VIDEO_SLACK_S 0.6
++
++enum { ARIB_KIND_CONT, ARIB_KIND_IN, ARIB_KIND_FWD };
++
++typedef struct AribChunk {
++    int64_t pos;
++    int n;
++    float *d;
++} AribChunk;
++
++typedef struct AribRing {
++    SDL_mutex *mtx;
++    AribChunk c[ARIB_RING_CHUNKS];
++    int head, count;
++    int serial;                     /* serial of the content, -1 none */
++} AribRing;
++
++typedef struct AribIv {
++    int64_t s, e;
++    int src;                        /* FFP_ARIB_SRC_A1 / A2 / SILENCE */
++    int kind;                       /* ARIB_KIND_* at s */
++    int prev;                       /* the source before s, -1 none */
++    int out_dip;                    /* fades out over the last samples (the next interval does not crossfade from it) */
++} AribIv;
++
++typedef struct AribSrc {
++    struct AribAudio *aa;
++    int role;
++    PacketQueue *pq;
++    PacketQueue own_pq;
++    SDL_Thread *tid;
++    AribRing ring;
++    SDL_atomic_t idle;              /* the thread waits for a packet and has none in hand */
++    SDL_atomic_t eof_serial;        /* serial whose EOF packet was decoded to the end, -1 */
++    /* decoder thread only */
++    AVCodecContext *avctx;
++    int cur_stream;
++    int serial;
++    struct SwrContext *swr;
++    AVChannelLayout swr_layout;
++    int swr_rate, swr_fmt;
++    int64_t end_pos;
++    int end_valid;
++    int64_t next_pts;
++    AVRational next_pts_tb;
++    int fade_next;                  /* the next chunk follows a change of decoder / converter: dip */
++    int stale_run;                  /* consecutive chunks that lay entirely behind the cursor */
++    /* guarded by AribAudio.mtx */
++    int stream_index;               /* -1 none */
++    int removed;
++    double end_s;                   /* demux front: end of the latest packet, NAN none since the flush */
++    int pid, tag;
++} AribSrc;
++
++typedef struct AribAudio {
++    VideoState *is;
++    AVProgram *prog;
++    SDL_mutex *mtx;
++    SDL_cond *cond;
++    AribSrc src[2];
++    int rate, nch;
++    AVChannelLayout layout;
++    int fade;                       /* samples */
++    AVCodecParameters **par;        /* per stream index, snapshots taken by the read thread */
++    AVRational *par_tb;
++    int npar;
++    double video_end_s;
++    double floor_s;                 /* first demuxed time since the flush */
++    int threads_started;
++    SDL_atomic_t resync;
++    /* read thread */
++    unsigned last_nb_streams, last_nb_idx, last_hash;
++    int last_pmt_version;
++    int64_t rebinds;
++    /* selector thread (stats under mtx) */
++    int pref;
++    int cursor_valid;
++    int64_t cursor;
++    AribIv plan[ARIB_PLAN_MAX];
++    int nplan;
++    int plan_final;
++    int rend_src;
++    int64_t a2_ok_from;
++    int stat_last;
++    int stat_playing;
++    int64_t stat_switches;
++    int64_t stat_silence;
++    int64_t last_dbg_us;
++    float *tmp[2];
++} AribAudio;
++
++static double arib_nanmax(double a, double b)
++{
++    return isnan(a) ? b : isnan(b) ? a : FFMAX(a, b);
++}
++
++static int64_t arib_s2samp(const AribAudio *aa, double s)
++{
++    if (s >= 9.0e12 / aa->rate)
++        return INT64_MAX;
++    if (s <= -9.0e12 / aa->rate)
++        return INT64_MIN;
++    return llrint(s * aa->rate);
++}
++
++static void arib_ring_init(AribRing *r)
++{
++    memset(r, 0, sizeof(*r));
++    r->mtx = SDL_CreateMutex();
++    r->serial = -1;
++}
++
++static AribChunk *arib_ring_c(AribRing *r, int i)
++{
++    return &r->c[(r->head + i) % ARIB_RING_CHUNKS];
++}
++
++static void arib_ring_pop_l(AribRing *r)
++{
++    av_freep(&r->c[r->head].d);
++    r->head = (r->head + 1) % ARIB_RING_CHUNKS;
++    r->count--;
++}
++
++static void arib_ring_clear_l(AribRing *r)
++{
++    while (r->count)
++        arib_ring_pop_l(r);
++}
++
++static void arib_ring_trim_l(AribRing *r, int64_t p)
++{
++    while (r->count && r->c[r->head].pos + r->c[r->head].n <= p)
++        arib_ring_pop_l(r);
++}
++
++static int64_t arib_ring_end_l(AribRing *r)
++{
++    AribChunk *c;
++    if (!r->count)
++        return INT64_MIN;
++    c = arib_ring_c(r, r->count - 1);
++    return c->pos + c->n;
++}
++
++static int arib_ring_find_l(AribRing *r, int64_t p)
++{
++    int i;
++    for (i = 0; i < r->count; i++) {
++        AribChunk *c = arib_ring_c(r, i);
++        if (p < c->pos)
++            return -1;
++        if (p < c->pos + c->n)
++            return i;
++    }
++    return -1;
++}
++
++static int64_t arib_ring_run_end_l(AribRing *r, int i)
++{
++    int64_t e = arib_ring_c(r, i)->pos + arib_ring_c(r, i)->n;
++    for (i++; i < r->count && arib_ring_c(r, i)->pos == e; i++)
++        e += arib_ring_c(r, i)->n;
++    return e;
++}
++
++static int64_t arib_ring_next_start_l(AribRing *r, int64_t p)
++{
++    int i;
++    for (i = 0; i < r->count; i++)
++        if (arib_ring_c(r, i)->pos > p)
++            return arib_ring_c(r, i)->pos;
++    return INT64_MAX;
++}
++
++/* copies up to n covered samples from p; returns how many */
++static int arib_ring_copy_l(AribRing *r, int64_t p, int n, float *dst, int nch)
++{
++    int i = arib_ring_find_l(r, p), done = 0;
++
++    while (i >= 0 && i < r->count && done < n) {
++        AribChunk *c = arib_ring_c(r, i);
++        int64_t off = p + done - c->pos;
++        int k;
++        if (off < 0 || off >= c->n)
++            break;
++        k = FFMIN(n - done, (int)(c->n - off));
++        memcpy(dst + (size_t)done * nch, c->d + (size_t)off * nch, (size_t)k * nch * sizeof(float));
++        done += k;
++        i++;
++    }
++    return done;
++}
++
++static int arib_pq_packets(PacketQueue *q)
++{
++    int n;
++    SDL_LockMutex(q->mutex);
++    n = q->nb_packets;
++    SDL_UnlockMutex(q->mutex);
++    return n;
++}
++
++/* seek flush of a queue that follows the shared audio serial instead of counting on its own */
++static void arib_pq_flush_to(PacketQueue *q, int serial)
++{
++    MyAVPacketList pkt1;
++
++    SDL_LockMutex(q->mutex);
++    while (av_fifo_read(q->pkt_list, &pkt1, 1) >= 0)
++        av_packet_free(&pkt1.pkt);
++    q->nb_packets = 0;
++    q->size = 0;
++    q->duration = 0;
++    q->serial = serial;
++    q->eof_packet_sent = 0;
++    SDL_UnlockMutex(q->mutex);
++}
++
++static int arib_pq_put_eof(PacketQueue *q)
++{
++    AVPacket *pkt;
++    int ret = 0;
++
++    SDL_LockMutex(q->mutex);
++    if (!q->abort_request && !q->eof_packet_sent) {
++        pkt = av_packet_alloc();
++        if (!pkt) {
++            ret = AVERROR(ENOMEM);
++        } else {
++            ret = packet_queue_put_private(q, pkt);
++            if (ret >= 0)
++                q->eof_packet_sent = 1;
++            else
++                av_packet_free(&pkt);
++        }
++    }
++    SDL_UnlockMutex(q->mutex);
++    return ret;
++}
++
++static void arib_wait(AribAudio *aa, int ms)
++{
++    SDL_LockMutex(aa->mtx);
++    SDL_CondWaitTimeout(aa->cond, aa->mtx, ms);
++    SDL_UnlockMutex(aa->mtx);
++}
++
++static void arib_apply_fade(float *d, int n, int nch, int count, int in)
++{
++    int i, c;
++
++    count = FFMIN(count, n);
++    for (i = 0; i < count; i++) {
++        float g = in ? (i + 1) / (float)(count + 1) : (count - i) / (float)(count + 1);
++        float *s = in ? d + (size_t)i * nch : d + (size_t)(n - count + i) * nch;
++        for (c = 0; c < nch; c++)
++            s[c] *= g;
++    }
++}
++
++/* waits until the ring has room (the decoders run at most ARIB_RING_LEAD_S ahead of the cursor). 0 ok, 1 the queue was
++ * flushed meanwhile (drop the chunk), -1 abort. A chunk far away from the cursor is a timestamp discontinuity: the
++ * selector is asked to resync and the chunk is kept. */
++static int arib_src_room(AribSrc *s, int serial, int64_t pos, int n)
++{
++    AribAudio *aa = s->aa;
++    int64_t lead = arib_s2samp(aa, ARIB_RING_LEAD_S);
++    int waited_disc = 0;
++
++    for (;;) {
++        int64_t cur, end, first;
++        int cv, full, disc, behind;
++
++        if (s->pq->abort_request)
++            return -1;
++        if (s->pq->serial != serial)
++            return 1;
++        SDL_LockMutex(aa->mtx);
++        cv = aa->cursor_valid;
++        cur = aa->cursor;
++        SDL_UnlockMutex(aa->mtx);
++        behind = cv && pos + n + arib_s2samp(aa, ARIB_DISC_BACK_S) < cur;
++        if (behind && s->stale_run < ARIB_STALE_CHUNKS) {
++            /* a straggler (decoded long after its time, e.g. the frame a decoder held back across a gap): nothing is
++             * left to play there. A real jump back of the timeline repeats for every chunk and is handled below. */
++            if (!s->stale_run)
++                av_log(NULL, AV_LOG_INFO, "arib audio %d: dropping a chunk at %.3f s, the cursor is at %.3f s\n",
++                       s->role + 1, (double)pos / aa->rate, (double)cur / aa->rate);
++            s->stale_run++;
++            return 1;
++        }
++        if (!behind)
++            s->stale_run = 0;
++        disc = cv && (behind || pos > cur + arib_s2samp(aa, ARIB_DISC_FWD_S));
++        if (disc && waited_disc < 100) {
++            if (!waited_disc)
++                av_log(NULL, AV_LOG_INFO, "arib audio %d: timestamp discontinuity: chunk at %.3f s, cursor at %.3f s; restarting the cursor\n",
++                       s->role + 1, (double)pos / aa->rate, (double)cur / aa->rate);
++            waited_disc++;
++            SDL_AtomicSet(&aa->resync, 1);
++            SDL_CondBroadcast(aa->cond);
++            arib_wait(aa, 5);
++            continue;
++        }
++        SDL_LockMutex(s->ring.mtx);
++        end = arib_ring_end_l(&s->ring);
++        first = s->ring.count ? s->ring.c[s->ring.head].pos : 0;
++        full = s->ring.count >= ARIB_RING_CHUNKS - 2 ||
++               (s->ring.count && end - (cv ? FFMAX(cur, first) : first) > lead);
++        SDL_UnlockMutex(s->ring.mtx);
++        if (!full)
++            return 0;
++        arib_wait(aa, 5);
++    }
++}
++
++/* takes ownership of d */
++static int arib_src_emit(AribSrc *s, int serial, int64_t pos, int n, float *d)
++{
++    AribAudio *aa = s->aa;
++    int nch = aa->nch, r, fade = s->fade_next;
++    AribRing *ring = &s->ring;
++
++    if (s->end_valid) {
++        if (llabs(pos - s->end_pos) <= ARIB_SNAP) {
++            pos = s->end_pos;
++        } else if (pos < s->end_pos) {
++            int64_t skip = s->end_pos - pos;
++            if (skip >= n) {
++                av_free(d);
++                return 0;
++            }
++            memmove(d, d + (size_t)skip * nch, (size_t)(n - skip) * nch * sizeof(float));
++            n -= (int)skip;
++            pos = s->end_pos;
++        }
++    }
++    r = arib_src_room(s, serial, pos, n);
++    if (r) {
++        av_free(d);
++        return r < 0 ? r : 0;
++    }
++    s->fade_next = 0;
++    SDL_LockMutex(ring->mtx);
++    if (s->pq->serial != serial) {
++        SDL_UnlockMutex(ring->mtx);
++        av_free(d);
++        return 0;
++    }
++    if (ring->serial != serial) {
++        arib_ring_clear_l(ring);
++        ring->serial = serial;
++    }
++    if (fade) {
++        arib_apply_fade(d, n, nch, aa->fade, 1);
++        if (ring->count) {
++            AribChunk *last = arib_ring_c(ring, ring->count - 1);
++            if (last->pos + last->n == pos)
++                arib_apply_fade(last->d, last->n, nch, aa->fade, 0);
++        }
++    }
++    if (ring->count >= ARIB_RING_CHUNKS) {
++        SDL_UnlockMutex(ring->mtx);
++        av_free(d);
++        return 0;
++    }
++    {
++        AribChunk *c = &ring->c[(ring->head + ring->count) % ARIB_RING_CHUNKS];
++        c->pos = pos;
++        c->n = n;
++        c->d = d;
++        ring->count++;
++    }
++    s->end_pos = pos + n;
++    s->end_valid = 1;
++    SDL_UnlockMutex(ring->mtx);
++    SDL_CondBroadcast(aa->cond);
++    return 0;
++}
++
++/* drains the converter (resampling delay) into the ring */
++static void arib_src_swr_flush(AribSrc *s, int serial)
++{
++    AribAudio *aa = s->aa;
++    uint8_t *o[1];
++    float *buf;
++    int cap, n;
++
++    if (!s->swr || !s->end_valid)
++        return;
++    cap = swr_get_out_samples(s->swr, 0) + 64;
++    if (cap <= 0 || !(buf = av_malloc_array(cap, aa->nch * sizeof(float))))
++        return;
++    o[0] = (uint8_t *)buf;
++    n = swr_convert(s->swr, o, cap, NULL, 0);
++    if (n > 0)
++        arib_src_emit(s, serial, s->end_pos, n, buf);
++    else
++        av_free(buf);
++}
++
++static int arib_src_frame(AribSrc *s, AVFrame *frame, int serial)
++{
++    AribAudio *aa = s->aa;
++    AVRational tb_sr = { 1, frame->sample_rate };
++    uint8_t *o[1];
++    float *buf;
++    int cap, n, ret;
++    int64_t pos;
++
++    if (frame->pts != AV_NOPTS_VALUE)
++        frame->pts = av_rescale_q(frame->pts, s->avctx->pkt_timebase, tb_sr);
++    else if (s->next_pts != AV_NOPTS_VALUE)
++        frame->pts = av_rescale_q(s->next_pts, s->next_pts_tb, tb_sr);
++    if (frame->pts != AV_NOPTS_VALUE) {
++        s->next_pts = frame->pts + frame->nb_samples;
++        s->next_pts_tb = tb_sr;
++    }
++
++    if (!s->swr || s->swr_fmt != frame->format || s->swr_rate != frame->sample_rate ||
++        av_channel_layout_compare(&s->swr_layout, &frame->ch_layout)) {
++        if (s->swr) {
++            arib_src_swr_flush(s, serial);
++            s->fade_next = 1;
++        }
++        swr_free(&s->swr);
++        ret = swr_alloc_set_opts2(&s->swr, &aa->layout, AV_SAMPLE_FMT_FLT, aa->rate,
++                                  &frame->ch_layout, frame->format, frame->sample_rate, 0, NULL);
++        if (ret >= 0)
++            ret = swr_init(s->swr);
++        if (ret < 0) {
++            swr_free(&s->swr);
++            return ret;
++        }
++        s->swr_fmt = frame->format;
++        s->swr_rate = frame->sample_rate;
++        av_channel_layout_uninit(&s->swr_layout);
++        av_channel_layout_copy(&s->swr_layout, &frame->ch_layout);
++    }
++
++    cap = swr_get_out_samples(s->swr, frame->nb_samples) + 64;
++    buf = av_malloc_array(cap, aa->nch * sizeof(float));
++    if (!buf)
++        return AVERROR(ENOMEM);
++    o[0] = (uint8_t *)buf;
++    n = swr_convert(s->swr, o, cap, (const uint8_t **)frame->extended_data, frame->nb_samples);
++    if (n <= 0) {
++        av_free(buf);
++        return n;
++    }
++    if (frame->pts != AV_NOPTS_VALUE)
++        pos = av_rescale_q_rnd(frame->pts, tb_sr, (AVRational){ 1, aa->rate }, AV_ROUND_NEAR_INF);
++    else
++        pos = s->end_valid ? s->end_pos : 0;
++    return arib_src_emit(s, serial, pos, n, buf);
++}
++
++static void arib_src_receive(AribSrc *s, AVFrame *frame, int serial)
++{
++    while (s->avctx && avcodec_receive_frame(s->avctx, frame) >= 0) {
++        arib_src_frame(s, frame, serial);
++        av_frame_unref(frame);
++    }
++}
++
++static void arib_src_drain(AribSrc *s, AVFrame *frame, int serial)
++{
++    if (!s->avctx)
++        return;
++    avcodec_send_packet(s->avctx, NULL);
++    arib_src_receive(s, frame, serial);
++    avcodec_flush_buffers(s->avctx);
++    arib_src_swr_flush(s, serial);
++}
++
++static void arib_src_reset(AribSrc *s, int serial)
++{
++    if (s->avctx)
++        avcodec_flush_buffers(s->avctx);
++    swr_free(&s->swr);
++    SDL_LockMutex(s->ring.mtx);
++    arib_ring_clear_l(&s->ring);
++    s->ring.serial = serial;
++    SDL_UnlockMutex(s->ring.mtx);
++    s->end_valid = 0;
++    s->next_pts = AV_NOPTS_VALUE;
++    s->fade_next = 0;
++    s->stale_run = 0;
++    SDL_AtomicSet(&s->eof_serial, -1);
++}
++
++static int arib_src_open(AribSrc *s, int stream_index)
++{
++    AribAudio *aa = s->aa;
++    const FFPOptions *o = aa->is->o;
++    AVCodecParameters *par = NULL;
++    AVRational tb = { 1, 90000 };
++    const AVCodec *codec;
++    AVCodecContext *avctx;
++    int ret;
++
++    SDL_LockMutex(aa->mtx);
++    if (stream_index >= 0 && stream_index < aa->npar && aa->par[stream_index]) {
++        par = avcodec_parameters_alloc();
++        if (par && avcodec_parameters_copy(par, aa->par[stream_index]) < 0)
++            avcodec_parameters_free(&par);
++        tb = aa->par_tb[stream_index];
++    }
++    SDL_UnlockMutex(aa->mtx);
++    if (!par)
++        return AVERROR(EINVAL);
++    codec = o->audio_codec_name ? avcodec_find_decoder_by_name(o->audio_codec_name) : avcodec_find_decoder(par->codec_id);
++    avctx = codec ? avcodec_alloc_context3(codec) : NULL;
++    if (!avctx) {
++        avcodec_parameters_free(&par);
++        return AVERROR(EINVAL);
++    }
++    ret = avcodec_parameters_to_context(avctx, par);
++    avcodec_parameters_free(&par);
++    if (ret >= 0) {
++        avctx->pkt_timebase = tb;
++        ret = avcodec_open2(avctx, codec, NULL);
++    }
++    if (ret < 0) {
++        avcodec_free_context(&avctx);
++        return ret;
++    }
++    avcodec_free_context(&s->avctx);
++    s->avctx = avctx;
++    s->cur_stream = stream_index;
++    s->next_pts = AV_NOPTS_VALUE;
++    return 0;
++}
++
++static int arib_src_thread(void *arg)
++{
++    AribSrc *s = arg;
++    AribAudio *aa = s->aa;
++    AVPacket *pkt = av_packet_alloc();
++    AVFrame *frame = av_frame_alloc();
++    int serial = -1;
++
++    s->cur_stream = -1;
++    s->next_pts = AV_NOPTS_VALUE;
++    if (!pkt || !frame)
++        goto end;
++    for (;;) {
++        int pserial, r;
++
++        r = packet_queue_get(s->pq, pkt, 0, &pserial);
++        if (r == 0) {
++            SDL_AtomicSet(&s->idle, 1);
++            SDL_CondBroadcast(aa->cond);
++            r = packet_queue_get(s->pq, pkt, 1, &pserial);
++            SDL_AtomicSet(&s->idle, 0);
++        }
++        if (r < 0)
++            break;
++        if (pserial != s->pq->serial) {
++            av_packet_unref(pkt);
++            continue;
++        }
++        if (pserial != serial) {
++            serial = pserial;
++            arib_src_reset(s, serial);
++        }
++        if (!pkt->data && !pkt->size) {
++            arib_src_drain(s, frame, serial);
++            SDL_AtomicSet(&s->eof_serial, serial);
++            SDL_CondBroadcast(aa->cond);
++            av_packet_unref(pkt);
++            continue;
++        }
++        if (pkt->stream_index != s->cur_stream) {
++            arib_src_drain(s, frame, serial);
++            if (arib_src_open(s, pkt->stream_index) < 0) {
++                av_packet_unref(pkt);
++                continue;
++            }
++            s->fade_next = 1;
++        }
++        if (s->avctx && avcodec_send_packet(s->avctx, pkt) >= 0)
++            arib_src_receive(s, frame, serial);
++        av_packet_unref(pkt);
++    }
++end:
++    av_packet_free(&pkt);
++    av_frame_free(&frame);
++    avcodec_free_context(&s->avctx);
++    swr_free(&s->swr);
++    return 0;
++}
++
++typedef struct AribView {
++    int cov, dec, finished, starved, has;
++    int64_t run_end, first;
++} AribView;
++
++static void arib_fronts(AribAudio *aa, int i, double *own, double *other, double *video, int *removed)
++{
++    AribSrc *s = &aa->src[i];
++
++    SDL_LockMutex(aa->mtx);
++    *removed = s->removed || s->stream_index < 0;
++    *own = arib_nanmax(s->end_s, aa->floor_s);
++    *other = arib_nanmax(aa->src[!i].end_s, aa->floor_s);
++    *video = aa->video_end_s;
++    SDL_UnlockMutex(aa->mtx);
++}
++
++/* state of source i at sample p. Order matters: the starvation facts are read before the ring, so a chunk pushed in
++ * between can only make the ring answer better, never contradict "drained". */
++static void arib_view(AribAudio *aa, int i, int64_t p, int serial, AribView *v)
++{
++    AribSrc *s = &aa->src[i];
++    double own, oth, vid, ku;
++    int removed, finished, drained, idx;
++
++    memset(v, 0, sizeof(*v));
++    arib_fronts(aa, i, &own, &oth, &vid, &removed);
++    finished = SDL_AtomicGet(&s->eof_serial) == serial;
++    drained = finished || (SDL_AtomicGet(&s->idle) && arib_pq_packets(s->pq) == 0);
++    v->finished = finished;
++    v->starved = ffp_arib_starved(removed, finished, own, oth, vid, &ku);
++
++    SDL_LockMutex(s->ring.mtx);
++    if (s->ring.serial == serial && s->ring.count) {
++        v->has = 1;
++        v->first = s->ring.c[s->ring.head].pos;
++        idx = arib_ring_find_l(&s->ring, p);
++        if (idx >= 0) {
++            v->cov = v->dec = 1;
++            v->run_end = arib_ring_run_end_l(&s->ring, idx);
++        } else {
++            int64_t next = arib_ring_next_start_l(&s->ring, p);
++            if (next != INT64_MAX) {
++                v->dec = 1;
++                v->run_end = next;
++            }
++        }
++    }
++    SDL_UnlockMutex(s->ring.mtx);
++
++    if (!v->dec && v->starved && drained) {
++        int64_t kus = isinf(ku) ? (ku > 0 ? INT64_MAX : INT64_MIN) : arib_s2samp(aa, ku);
++        if (p < kus) {
++            v->dec = 1;
++            v->run_end = kus;
++        }
++    }
++}
++
++static void arib_sel_reset(AribAudio *aa)
++{
++    SDL_LockMutex(aa->mtx);
++    aa->cursor_valid = 0;
++    aa->nplan = 0;
++    aa->plan_final = 0;
++    aa->rend_src = -1;
++    aa->a2_ok_from = 0;
++    SDL_UnlockMutex(aa->mtx);
++    SDL_CondBroadcast(aa->cond);
++}
++
++static void arib_sel_resync(AribAudio *aa)
++{
++    int i;
++
++    for (i = 0; i < 2; i++) {
++        SDL_LockMutex(aa->src[i].ring.mtx);
++        arib_ring_clear_l(&aa->src[i].ring);
++        SDL_UnlockMutex(aa->src[i].ring.mtx);
++        aa->src[i].end_valid = 0;
++    }
++    arib_sel_reset(aa);
++    SDL_AtomicSet(&aa->resync, 0);
++    SDL_CondBroadcast(aa->cond);
++}
++
++/* first sample of the cursor after a (re)start: audio 1's first sample, or the later of the two when audio 2 is
++ * wanted and starts just after it. 0 = not yet (a wanted source has neither data nor a verdict) */
++static int arib_sel_start(AribAudio *aa, int serial)
++{
++    int has[2], nodata[2], need[2], i;
++    int64_t first[2] = { 0, 0 }, start;
++
++    need[0] = 1;
++    need[1] = aa->pref == FFP_ARIB_PREF_COMMENTARY;
++    for (i = 0; i < 2; i++) {
++        AribSrc *s = &aa->src[i];
++        double own, oth, vid, ku;
++        int removed, finished, drained;
++
++        arib_fronts(aa, i, &own, &oth, &vid, &removed);
++        finished = SDL_AtomicGet(&s->eof_serial) == serial;
++        drained = finished || (SDL_AtomicGet(&s->idle) && arib_pq_packets(s->pq) == 0);
++        nodata[i] = ffp_arib_starved(removed, finished, own, oth, vid, &ku) && drained;
++        SDL_LockMutex(s->ring.mtx);
++        has[i] = s->ring.serial == serial && s->ring.count;
++        if (has[i])
++            first[i] = s->ring.c[s->ring.head].pos;
++        SDL_UnlockMutex(s->ring.mtx);
++    }
++    for (i = 0; i < 2; i++)
++        if (need[i] && !has[i] && !nodata[i])
++            return 0;
++    if (!has[0] && !has[1])
++        return 0;
++    start = has[0] ? first[0] : first[1];
++    if (need[1] && has[0] && has[1] && first[1] > first[0] && first[1] - first[0] <= arib_s2samp(aa, ARIB_START_SKEW_S))
++        start = first[1];
++
++    SDL_LockMutex(aa->mtx);
++    aa->cursor = start;
++    aa->cursor_valid = 1;
++    aa->nplan = 0;
++    aa->plan_final = 0;
++    aa->rend_src = -1;
++    aa->a2_ok_from = 0;
++    SDL_UnlockMutex(aa->mtx);
++    return 1;
++}
++
++static void arib_plan(AribAudio *aa, int serial)
++{
++    int64_t hold = arib_s2samp(aa, FFP_ARIB_HOLD_S);
++    int64_t p = aa->nplan ? aa->plan[aa->nplan - 1].e : aa->cursor;
++
++    while (aa->nplan < ARIB_PLAN_MAX && p < aa->cursor + ARIB_PLAN_AHEAD && !aa->plan_final) {
++        AribView v[2];
++        FFPAribSel in;
++        AribIv *last = aa->nplan ? &aa->plan[aa->nplan - 1] : NULL;
++        int prev = last ? last->src : aa->rend_src, sel, i;
++        int64_t e;
++
++        arib_view(aa, 0, p, serial, &v[0]);
++        arib_view(aa, 1, p, serial, &v[1]);
++        in.pref = aa->pref;
++        in.a1_cov = v[0].cov;
++        in.a1_dec = v[0].dec;
++        in.a2_cov = v[1].cov;
++        in.a2_dec = v[1].dec;
++        in.cur_a2 = prev == FFP_ARIB_SRC_A2;
++        in.a2_blocked = p < aa->a2_ok_from;
++        in.silence_ok = 1;
++        in.eof = v[0].finished && v[1].finished;
++        sel = ffp_arib_select(&in);
++        if (sel == FFP_ARIB_SRC_WAIT)
++            break;
++        if (sel == FFP_ARIB_SRC_END) {
++            aa->plan_final = 1;
++            break;
++        }
++        e = p + ARIB_PLAN_STEP;
++        for (i = 0; i < 2; i++)
++            if (v[i].dec && v[i].run_end > p)
++                e = FFMIN(e, v[i].run_end);
++        if (aa->pref == FFP_ARIB_PREF_COMMENTARY && sel != FFP_ARIB_SRC_A2 && p < aa->a2_ok_from)
++            e = FFMIN(e, aa->a2_ok_from);
++        if (e <= p)
++            e = p + 1;
++
++        if (last && last->src == sel) {
++            last->e = e;
++        } else {
++            AribIv *iv = &aa->plan[aa->nplan++];
++            int prev_is_src = prev == FFP_ARIB_SRC_A1 || prev == FFP_ARIB_SRC_A2;
++
++            iv->s = p;
++            iv->e = e;
++            iv->src = sel;
++            iv->prev = prev;
++            iv->out_dip = 0;
++            if (prev == sel) {
++                iv->kind = ARIB_KIND_CONT;
++            } else if (prev_is_src && (sel == FFP_ARIB_SRC_A1 || sel == FFP_ARIB_SRC_A2) &&
++                       v[prev].cov && v[prev].run_end >= p + aa->fade) {
++                iv->kind = ARIB_KIND_FWD;
++            } else {
++                iv->kind = ARIB_KIND_IN;
++                if (prev_is_src && last)
++                    last->out_dip = 1;
++            }
++            if (prev == FFP_ARIB_SRC_A2 && sel != FFP_ARIB_SRC_A2 && aa->pref == FFP_ARIB_PREF_COMMENTARY)
++                aa->a2_ok_from = p + hold;
++        }
++        p = e;
++    }
++}
++
++/* renders the next samples of the plan into out. Returns the sample count, 0 = nothing yet, -1 = the end of the media. */
++static int arib_render(AribAudio *aa, int serial, AVFrame *out)
++{
++    int64_t plan_end = aa->nplan ? aa->plan[aa->nplan - 1].e : aa->cursor;
++    int64_t safe_end = aa->plan_final ? plan_end : plan_end - aa->fade;
++    int64_t n64 = FFMIN((int64_t)ARIB_BLOCK, safe_end - aa->cursor);
++    int n, nch = aa->nch, k, i;
++    float *dst;
++    int64_t c0 = aa->cursor;
++
++    if (n64 <= 0)
++        return aa->plan_final ? -1 : 0;
++    n = (int)n64;
++    if (n < 128 && n < ARIB_BLOCK && !aa->plan_final)
++        return 0;
++
++    av_frame_unref(out);
++    out->format = AV_SAMPLE_FMT_FLT;
++    out->sample_rate = aa->rate;
++    out->nb_samples = n;
++    if (av_channel_layout_copy(&out->ch_layout, &aa->layout) < 0 || av_frame_get_buffer(out, 0) < 0)
++        return 0;
++    dst = (float *)out->data[0];
++    memset(dst, 0, (size_t)n * nch * sizeof(float));
++
++    for (k = 0; k < aa->nplan; k++) {
++        AribIv *iv = &aa->plan[k];
++        int64_t a = FFMAX(c0, iv->s), b = FFMIN(c0 + n, iv->e), t;
++        int nin = (int)FFMIN((int64_t)aa->fade, iv->e - iv->s);
++
++        if (b > a) {
++            int len = (int)(b - a);
++
++            if (iv->src == FFP_ARIB_SRC_SILENCE) {
++                aa->stat_silence += len;
++            } else {
++                AribRing *r = &aa->src[iv->src].ring;
++                int got = 0;
++
++                memset(aa->tmp[0], 0, (size_t)len * nch * sizeof(float));
++                SDL_LockMutex(r->mtx);
++                if (r->serial == serial)
++                    got = arib_ring_copy_l(r, a, len, aa->tmp[0], nch);
++                SDL_UnlockMutex(r->mtx);
++                (void)got;
++                for (t = a; t < b; t++) {
++                    float g = 1.0f;
++                    int64_t off = t - iv->s, rem = iv->e - t;
++                    float *d = dst + (size_t)(t - c0) * nch, *sp = aa->tmp[0] + (size_t)(t - a) * nch;
++
++                    if (iv->kind != ARIB_KIND_CONT && off < nin)
++                        g = (off + 1) / (float)(nin + 1);
++                    if (iv->out_dip && rem <= nin)
++                        g = FFMIN(g, rem / (float)(nin + 1));
++                    for (i = 0; i < nch; i++)
++                        d[i] += g * sp[i];
++                }
++            }
++            if (iv->src != aa->stat_last) {
++                if (aa->stat_last >= 0)
++                    aa->stat_switches++;
++                aa->stat_last = iv->src;
++            }
++            aa->stat_playing = iv->src;
++        }
++        if (iv->kind == ARIB_KIND_FWD) {
++            int64_t ta = FFMAX(c0, iv->s), tb = FFMIN(c0 + n, iv->s + nin);
++
++            if (tb > ta && (iv->prev == FFP_ARIB_SRC_A1 || iv->prev == FFP_ARIB_SRC_A2)) {
++                AribRing *r = &aa->src[iv->prev].ring;
++                int len = (int)(tb - ta), got = 0;
++
++                memset(aa->tmp[1], 0, (size_t)len * nch * sizeof(float));
++                SDL_LockMutex(r->mtx);
++                if (r->serial == serial)
++                    got = arib_ring_copy_l(r, ta, len, aa->tmp[1], nch);
++                SDL_UnlockMutex(r->mtx);
++                (void)got;
++                for (t = ta; t < tb; t++) {
++                    float g = 1.0f - ((t - iv->s) + 1) / (float)(nin + 1);
++                    float *d = dst + (size_t)(t - c0) * nch, *sp = aa->tmp[1] + (size_t)(t - ta) * nch;
++
++                    for (i = 0; i < nch; i++)
++                        d[i] += g * sp[i];
++                }
++            }
++        }
++    }
++
++    out->pts = c0;
++    SDL_LockMutex(aa->mtx);
++    aa->cursor = c0 + n;
++    SDL_UnlockMutex(aa->mtx);
++    while (aa->nplan && aa->plan[0].e <= aa->cursor) {
++        aa->rend_src = aa->plan[0].src;
++        memmove(&aa->plan[0], &aa->plan[1], (size_t)(aa->nplan - 1) * sizeof(aa->plan[0]));
++        aa->nplan--;
++    }
++    for (i = 0; i < 2; i++) {
++        SDL_LockMutex(aa->src[i].ring.mtx);
++        arib_ring_trim_l(&aa->src[i].ring, aa->cursor);
++        SDL_UnlockMutex(aa->src[i].ring.mtx);
++    }
++    SDL_CondBroadcast(aa->cond);
++    return n;
++}
++
++static void arib_dbg_publish(AribAudio *aa)
++{
++    VideoState *is = aa->is;
++    FFPDebugArib t;
++    int i;
++
++    memset(&t, 0, sizeof(t));
++    t.active = 1;
++    SDL_LockMutex(aa->mtx);
++    t.pref = aa->pref;
++    t.playing = aa->stat_playing;
++    t.switches = aa->stat_switches;
++    t.silence_ms = 1000.0 * aa->stat_silence / aa->rate;
++    t.rebinds = aa->rebinds;
++    for (i = 0; i < 2; i++) {
++        AribSrc *s = &aa->src[i];
++        t.stream_index[i] = s->stream_index;
++        t.pid[i] = s->pid;
++        t.tag[i] = s->tag;
++        t.removed[i] = s->removed || s->stream_index < 0;
++    }
++    SDL_UnlockMutex(aa->mtx);
++    for (i = 0; i < 2; i++) {
++        AribSrc *s = &aa->src[i];
++        double own, oth, vid, ku;
++        int removed;
++        int64_t end;
++
++        arib_fronts(aa, i, &own, &oth, &vid, &removed);
++        t.starved[i] = ffp_arib_starved(removed, SDL_AtomicGet(&s->eof_serial) == is->audioq.serial, own, oth, vid, &ku);
++        SDL_LockMutex(s->ring.mtx);
++        end = arib_ring_end_l(&s->ring);
++        SDL_UnlockMutex(s->ring.mtx);
++        t.ring_ms[i] = (aa->cursor_valid && end != INT64_MIN) ? 1000.0 * (end - aa->cursor) / aa->rate : 0.0;
++    }
++    SDL_LockMutex(is->dbg_mutex);
++    is->dbg.arib = t;
++    SDL_UnlockMutex(is->dbg_mutex);
++}
++
++static int arib_selector_thread(void *arg)
++{
++    VideoState *is = arg;
++    AribAudio *aa = is->arib;
++    AVFrame *frame = av_frame_alloc();
++    Frame *af;
++    int last_serial = -1, last_afilter_gen = -1, reconf = 0;
++    int ret = 0;
++
++    if (!frame)
++        return AVERROR(ENOMEM);
++    is->audio_filter_src.fmt  = AV_SAMPLE_FMT_FLT;
++    is->audio_filter_src.freq = aa->rate;
++    av_channel_layout_copy(&is->audio_filter_src.ch_layout, &aa->layout);
++
++    for (;;) {
++        int serial, pref, n;
++
++        if (is->audioq.abort_request)
++            break;
++        serial = is->audioq.serial;
++        if (serial != last_serial) {
++            arib_sel_reset(aa);
++            last_serial = serial;
++            is->auddec.pkt_serial = serial;
++            reconf = 1;
++        }
++        pref = SDL_AtomicGet(&is->ffp->audio_pref);
++        if (pref != aa->pref) {
++            SDL_LockMutex(aa->mtx);
++            aa->pref = pref;
++            aa->a2_ok_from = 0;
++            if (aa->cursor_valid) {         /* re-plan from the cursor: what was planned used the old preference */
++                aa->rend_src = aa->stat_playing;
++                aa->nplan = 0;
++                aa->plan_final = 0;
++            }
++            SDL_UnlockMutex(aa->mtx);
++        }
++        if (SDL_AtomicGet(&aa->resync))
++            arib_sel_resync(aa);
++        if (av_gettime_relative() - aa->last_dbg_us > 100000) {
++            aa->last_dbg_us = av_gettime_relative();
++            arib_dbg_publish(aa);
++        }
++        if (!aa->cursor_valid && !arib_sel_start(aa, serial)) {
++            arib_wait(aa, 5);
++            continue;
++        }
++        arib_plan(aa, serial);
++        n = arib_render(aa, serial, frame);
++        if (n < 0) {
++            is->auddec.finished = serial;
++            arib_wait(aa, 10);
++            continue;
++        }
++        if (n == 0) {
++            arib_wait(aa, 5);
++            continue;
++        }
++
++        if (reconf || last_afilter_gen != SDL_AtomicGet(&is->ffp->afilter_gen)) {
++            reconf = 0;
++            if ((ret = ffp_configure_audio(is, 1, &last_afilter_gen)) < 0)
++                goto the_end;
++        }
++        ffp_apply_filter_cmds(is, 1, is->agraph);
++        if ((ret = av_buffersrc_add_frame(is->in_audio_filter, frame)) < 0)
++            goto the_end;
++        while ((ret = av_buffersink_get_frame_flags(is->out_audio_filter, frame, 0)) >= 0) {
++            FrameData *fd = frame->opaque_ref ? (FrameData *)frame->opaque_ref->data : NULL;
++            AVRational tb = av_buffersink_get_time_base(is->out_audio_filter);
++
++            if (!(af = frame_queue_peek_writable(&is->sampq)))
++                goto the_end;
++            af->pts = (frame->pts == AV_NOPTS_VALUE) ? NAN : frame->pts * av_q2d(tb);
++            af->pos = fd ? fd->pkt_pos : -1;
++            af->serial = serial;
++            af->duration = av_q2d((AVRational){ frame->nb_samples, frame->sample_rate });
++            ffp_dbg_audio_note(is, af->pts, af->serial);
++            av_frame_move_ref(af->frame, frame);
++            frame_queue_push(&is->sampq);
++            if (is->audioq.serial != serial)
++                break;
++        }
++        if (ret < 0 && ret != AVERROR(EAGAIN) && ret != AVERROR_EOF)
++            goto the_end;
++    }
++the_end:
++    avfilter_graph_free(&is->agraph);
++    av_frame_free(&frame);
++    return ret < 0 ? ret : 0;
++}
++
++static void arib_audio_free(VideoState *is)
++{
++    AribAudio *aa = is->arib;
++    int i;
++
++    if (!aa)
++        return;
++    is->arib = NULL;
++    SDL_LockMutex(is->dbg_mutex);
++    memset(&is->dbg.arib, 0, sizeof(is->dbg.arib));
++    SDL_UnlockMutex(is->dbg_mutex);
++    for (i = 0; i < 2; i++) {
++        AribSrc *s = &aa->src[i];
++        if (s->ring.mtx) {
++            arib_ring_clear_l(&s->ring);
++            SDL_DestroyMutex(s->ring.mtx);
++        }
++        if (i == 1 && s->own_pq.mutex)
++            packet_queue_destroy(&s->own_pq);
++        avcodec_free_context(&s->avctx);
++        swr_free(&s->swr);
++        av_channel_layout_uninit(&s->swr_layout);
++        av_freep(&aa->tmp[i]);
++    }
++    for (i = 0; i < aa->npar; i++)
++        avcodec_parameters_free(&aa->par[i]);
++    av_freep(&aa->par);
++    av_freep(&aa->par_tb);
++    av_channel_layout_uninit(&aa->layout);
++    if (aa->cond)
++        SDL_DestroyCond(aa->cond);
++    if (aa->mtx)
++        SDL_DestroyMutex(aa->mtx);
++    av_free(aa);
++}
++
++static void arib_audio_stop(VideoState *is)
++{
++    AribAudio *aa = is->arib;
++    int i;
++
++    if (!aa)
++        return;
++    packet_queue_abort(&is->audioq);
++    if (aa->src[1].own_pq.mutex)
++        packet_queue_abort(&aa->src[1].own_pq);
++    SDL_CondBroadcast(aa->cond);
++    for (i = 0; i < 2; i++) {
++        if (aa->src[i].tid)
++            SDL_WaitThread(aa->src[i].tid, NULL);
++        aa->src[i].tid = NULL;
++    }
++}
++
++static int arib_stream_tag(const AVStream *st)
++{
++    const AVDictionaryEntry *e = av_dict_get(st->metadata, "component_tag", NULL, 0);
++    return e ? atoi(e->value) : -1;
++}
++
++/* recomputes the roles from the video program's current stream list (read thread) */
++static void arib_rebind(VideoState *is)
++{
++    AribAudio *aa = is->arib;
++    AVFormatContext *ic = is->ic;
++    AVProgram *p = aa->prog;
++    FFPAribStream infos[64];
++    int n = 0, k, a1, a2, role;
++
++    for (k = 0; k < (int)p->nb_stream_indexes && n < FF_ARRAY_ELEMS(infos); k++) {
++        unsigned idx = p->stream_index[k];
++        AVStream *st;
++        if (idx >= ic->nb_streams)
++            continue;
++        st = ic->streams[idx];
++        infos[n].index = idx;
++        infos[n].aac = st->codecpar->codec_type == AVMEDIA_TYPE_AUDIO && st->codecpar->codec_id == AV_CODEC_ID_AAC;
++        infos[n].tag = arib_stream_tag(st);
++        n++;
++    }
++    ffp_arib_roles(infos, n, &a1, &a2);
++
++    SDL_LockMutex(aa->mtx);
++    if ((int)ic->nb_streams > aa->npar) {
++        AVCodecParameters **np = av_realloc_array(aa->par, ic->nb_streams, sizeof(*np));
++        AVRational *nt;
++        if (np) {
++            aa->par = np;
++            nt = av_realloc_array(aa->par_tb, ic->nb_streams, sizeof(*nt));
++            if (nt) {
++                aa->par_tb = nt;
++                for (k = aa->npar; k < (int)ic->nb_streams; k++) {
++                    aa->par[k] = NULL;
++                    aa->par_tb[k] = (AVRational){ 1, 90000 };
++                }
++                aa->npar = ic->nb_streams;
++            }
++        }
++    }
++    for (role = 0; role < 2; role++) {
++        AribSrc *s = &aa->src[role];
++        int idx = role ? a2 : a1;
++
++        if (idx >= 0 && idx < aa->npar) {
++            AVStream *st = ic->streams[idx];
++            if (!aa->par[idx])
++                aa->par[idx] = avcodec_parameters_alloc();
++            if (aa->par[idx])
++                avcodec_parameters_copy(aa->par[idx], st->codecpar);
++            aa->par_tb[idx] = st->time_base;
++            st->discard = AVDISCARD_DEFAULT;
++            s->pid = st->id;
++            s->tag = arib_stream_tag(st);
++        } else {
++            idx = -1;
++        }
++        s->stream_index = idx;
++        s->removed = idx < 0;
++        if (idx < 0) {
++            s->pid = -1;
++            s->tag = -1;
++        }
++    }
++    aa->rebinds++;
++    SDL_UnlockMutex(aa->mtx);
++    if (a1 >= 0 && a1 != is->audio_stream) {
++        is->audio_stream = a1;
++        is->audio_st = ic->streams[a1];
++    }
++    SDL_CondBroadcast(aa->cond);
++    arib_dbg_publish(aa);
++}
++
++static void arib_note_hash(VideoState *is, unsigned *nb_streams, unsigned *nb_idx, unsigned *hash, int *version)
++{
++    AVProgram *p = is->arib->prog;
++    unsigned h = 2166136261u, k;
++
++    for (k = 0; k < p->nb_stream_indexes; k++)
++        h = (h ^ p->stream_index[k]) * 16777619u;
++    *nb_streams = is->ic->nb_streams;
++    *nb_idx = p->nb_stream_indexes;
++    *hash = h;
++    *version = p->pmt_version;
++}
++
++/* after every av_read_frame: nb_streams growth, a new pmt_version, a changed stream list re-run the role rules */
++static void arib_check_streams(VideoState *is)
++{
++    AribAudio *aa = is->arib;
++    unsigned nb, nidx, h;
++    int ver;
++
++    arib_note_hash(is, &nb, &nidx, &h, &ver);
++    if (nb == aa->last_nb_streams && nidx == aa->last_nb_idx && h == aa->last_hash && ver == aa->last_pmt_version)
++        return;
++    aa->last_nb_streams = nb;
++    aa->last_nb_idx = nidx;
++    aa->last_hash = h;
++    aa->last_pmt_version = ver;
++    arib_rebind(is);
++}
++
++static void arib_note_packet(VideoState *is, int role, const AVPacket *pkt)
++{
++    AribAudio *aa = is->arib;
++    AVStream *st = is->ic->streams[pkt->stream_index];
++    int64_t ts = pkt->pts != AV_NOPTS_VALUE ? pkt->pts : pkt->dts;
++    double t, end;
++
++    if (ts == AV_NOPTS_VALUE)
++        return;
++    t = ts * av_q2d(st->time_base);
++    end = t + (pkt->duration > 0 ? pkt->duration * av_q2d(st->time_base) : 0);
++    SDL_LockMutex(aa->mtx);
++    if (!isnan(aa->floor_s) && t < aa->floor_s - 5.0) {         /* a timestamp discontinuity: the fronts start over */
++        aa->floor_s = NAN;
++        aa->video_end_s = NAN;
++        aa->src[0].end_s = aa->src[1].end_s = NAN;
++    }
++    if (isnan(aa->floor_s))
++        aa->floor_s = t;
++    if (role < 0) {
++        aa->video_end_s = arib_nanmax(aa->video_end_s, end);
++    } else {
++        aa->src[role].end_s = arib_nanmax(aa->src[role].end_s, end);
++    }
++    SDL_UnlockMutex(aa->mtx);
++}
++
++static int arib_role_of_stream(const AribAudio *aa, int stream_index)
++{
++    if (aa->src[0].stream_index == stream_index)
++        return 0;
++    if (aa->src[1].stream_index == stream_index)
++        return 1;
++    return -1;
++}
++
++static void arib_flush(VideoState *is)
++{
++    AribAudio *aa = is->arib;
++
++    arib_pq_flush_to(&aa->src[1].own_pq, is->audioq.serial);
++    SDL_LockMutex(aa->mtx);
++    aa->floor_s = NAN;
++    aa->video_end_s = NAN;
++    aa->src[0].end_s = aa->src[1].end_s = NAN;
++    SDL_UnlockMutex(aa->mtx);
++    SDL_CondBroadcast(aa->cond);
++}
++
++static void arib_put_eof(VideoState *is)
++{
++    arib_pq_put_eof(&is->audioq);
++    arib_pq_put_eof(&is->arib->src[1].own_pq);
++}
++
++/* the read thread's "enough packets" for the audio candidates; a starved one is not waited for */
++static int arib_audio_enough(VideoState *is)
++{
++    AribAudio *aa = is->arib;
++    int i, behind;
++
++    /* Silence (and an absent role) is only certain up to the video front minus FFP_ARIB_MARGIN_VIDEO_S, so the video
++     * front must stay that margin plus some slack beyond the cursor, else the cursor would wait for a read-ahead that
++     * "enough video" never grants. */
++    SDL_LockMutex(aa->mtx);
++    behind = aa->cursor_valid && !isnan(aa->video_end_s) &&
++             aa->video_end_s - FFP_ARIB_MARGIN_VIDEO_S < (double)aa->cursor / aa->rate + ARIB_VIDEO_SLACK_S;
++    SDL_UnlockMutex(aa->mtx);
++    if (behind)
++        return 0;
++    for (i = 0; i < 2; i++) {
++        AribSrc *s = &aa->src[i];
++        double own, oth, vid, ku;
++        int removed, idx;
++
++        arib_fronts(aa, i, &own, &oth, &vid, &removed);
++        SDL_LockMutex(aa->mtx);
++        idx = s->stream_index;
++        SDL_UnlockMutex(aa->mtx);
++        if (removed || idx < 0 || idx >= (int)is->ic->nb_streams)
++            continue;
++        if (ffp_arib_starved(removed, 0, own, oth, vid, &ku))
++            continue;
++        if (!stream_has_enough_packets(is->ic->streams[idx], idx, s->pq))
++            return 0;
++    }
++    return 1;
++}
++
++static AribAudio *arib_audio_create(VideoState *is, AVProgram *prog)
++{
++    AribAudio *aa = av_mallocz(sizeof(*aa));
++    int i;
++
++    if (!aa)
++        return NULL;
++    aa->is = is;
++    aa->prog = prog;
++    aa->mtx = SDL_CreateMutex();
++    aa->cond = SDL_CreateCond();
++    aa->video_end_s = aa->floor_s = NAN;
++    aa->rend_src = aa->stat_last = aa->stat_playing = -1;
++    aa->last_pmt_version = INT_MIN;
++    SDL_AtomicSet(&aa->resync, 0);
++    for (i = 0; i < 2; i++) {
++        AribSrc *s = &aa->src[i];
++        s->aa = aa;
++        s->role = i;
++        s->stream_index = -1;
++        s->removed = 1;
++        s->pid = s->tag = -1;
++        s->end_s = NAN;
++        SDL_AtomicSet(&s->eof_serial, -1);
++        arib_ring_init(&s->ring);
++    }
++    if (!aa->mtx || !aa->cond || !aa->src[0].ring.mtx || !aa->src[1].ring.mtx) {
++        is->arib = aa;
++        arib_audio_free(is);
++        return NULL;
++    }
++    aa->src[0].pq = &is->audioq;
++    aa->src[1].pq = &aa->src[1].own_pq;
++    if (packet_queue_init(&aa->src[1].own_pq) < 0) {
++        is->arib = aa;
++        arib_audio_free(is);
++        return NULL;
++    }
++    aa->pref = SDL_AtomicGet(&is->ffp->audio_pref);
++    return aa;
++}
++
++/* ARIB TS with an AAC audio 1 or audio 2 in the video's program: switch the open to the audio model. Returns the stream
++ * to open the device from, -1 when the plain audio path stays. */
++static int arib_audio_detect(VideoState *is, int video_index)
++{
++    AVFormatContext *ic = is->ic;
++    AVProgram *prog = av_find_program_from_stream(ic, NULL, video_index);
++    const AVDictionaryEntry *e = prog ? av_dict_get(prog->metadata, "arib", NULL, 0) : NULL;
++    AribAudio *aa;
++
++    if (!e || strcmp(e->value, "1"))
++        return -1;
++    aa = arib_audio_create(is, prog);
++    if (!aa)
++        return -1;
++    is->arib = aa;
++    arib_note_hash(is, &aa->last_nb_streams, &aa->last_nb_idx, &aa->last_hash, &aa->last_pmt_version);
++    arib_rebind(is);
++    if (aa->src[0].stream_index < 0 && aa->src[1].stream_index < 0) {
++        arib_audio_free(is);
++        return -1;
++    }
++    return aa->src[0].stream_index >= 0 ? aa->src[0].stream_index : aa->src[1].stream_index;
++}
++
++/* the device is open (is->audio_tgt): fix the mix format and start the source threads and the selector */
++static int arib_audio_start(VideoState *is, int stream_index)
++{
++    AribAudio *aa = is->arib;
++    int i, ret;
++
++    aa->rate = is->audio_tgt.freq;
++    aa->nch = is->audio_tgt.ch_layout.nb_channels;
++    aa->fade = FFMAX(8, (int)lrint(FFP_ARIB_FADE_S * aa->rate));
++    ret = av_channel_layout_copy(&aa->layout, &is->audio_tgt.ch_layout);
++    if (ret < 0)
++        return ret;
++    for (i = 0; i < 2; i++) {
++        aa->tmp[i] = av_malloc_array(ARIB_BLOCK + 16, aa->nch * sizeof(float));
++        if (!aa->tmp[i])
++            return AVERROR(ENOMEM);
++    }
++    if ((ret = decoder_init(&is->auddec, NULL, &is->audioq, is->continue_read_thread)) < 0)
++        return ret;
++    packet_queue_start(&is->audioq, stream_index);
++    packet_queue_start(&aa->src[1].own_pq, -1);
++    arib_pq_flush_to(&aa->src[1].own_pq, is->audioq.serial);
++    for (i = 0; i < 2; i++) {
++        aa->src[i].tid = SDL_CreateThread(arib_src_thread, i ? "audio2_decoder" : "audio1_decoder", &aa->src[i]);
++        if (!aa->src[i].tid)
++            return AVERROR(ENOMEM);
++    }
++    ret = decoder_start_thread(&is->auddec, arib_selector_thread, "audio_selector", is);
++    if (ret < 0)
++        return ret;
++    aa->threads_started = 1;
++    return 0;
++}
++
+ static int video_thread(void *arg)
+ {
+     VideoState *is = arg;
+@@ -6316,6 +7749,15 @@ static int stream_component_open(VideoSt
+             if (ret < 0)
+                 goto fail;
+             is->audio_filter_src.fmt            = avctx->sample_fmt;
++            if (is->arib) {
++                /* the filter graph gets the mix format; the device follows the stream that opens it */
++                if (avctx->sample_rate <= 0 || !avctx->ch_layout.nb_channels) {
++                    is->audio_filter_src.freq = 48000;
++                    av_channel_layout_uninit(&is->audio_filter_src.ch_layout);
++                    av_channel_layout_default(&is->audio_filter_src.ch_layout, 2);
++                }
++                is->audio_filter_src.fmt = AV_SAMPLE_FMT_FLT;
++            }
+             if ((ret = ffp_configure_audio(is, 0, &gen)) < 0)
+                 goto fail;
+             sink = is->out_audio_filter;
+@@ -6344,6 +7786,19 @@ static int stream_component_open(VideoSt
+         is->audio_stream = stream_index;
+         is->audio_st = ic->streams[stream_index];
+ 
++        if (is->arib) {
++            /* ARIB: the decoders of audio 1 / audio 2 open themselves from the stream snapshots; this one only configured
++             * the device */
++            avcodec_free_context(&avctx);
++            if ((ret = arib_audio_start(is, stream_index)) < 0) {
++                arib_audio_stop(is);
++                decoder_abort(&is->auddec, &is->sampq);
++                arib_audio_free(is);
++                goto out;
++            }
++            SDL_PauseAudioDevice(is->audio_dev, 0);
++            break;
++        }
+         if ((ret = decoder_init(&is->auddec, avctx, &is->audioq, is->continue_read_thread)) < 0)
+             goto fail;
+         if (is->ic->iformat->flags & AVFMT_NOTIMESTAMPS) {
+@@ -6726,7 +8181,13 @@ static void ffp_build_media_info(VideoSt
+         }
+         av_bprintf(bp, "}");
+     }
+-    av_bprintf(bp, "]}");
++    av_bprintf(bp, "]");
++    if (is->arib) {
++        /* roles at the time of the call; audio 2 may appear later (index -1 now) */
++        av_bprintf(bp, ",\"arib_audio\":{\"audio1\":%d,\"audio2\":%d}",
++                   is->arib->src[0].stream_index, is->arib->src[1].stream_index);
++    }
++    av_bprintf(bp, "}");
+ }
+ 
+ static void ffp_update_media_info(VideoState *is)
+@@ -6893,6 +8354,7 @@ static int read_thread(void *arg)
+     int aret = AVERROR_STREAM_NOT_FOUND, vret = AVERROR_STREAM_NOT_FOUND;
+     int st_index[AVMEDIA_TYPE_NB];
+     int super_index = -1;
++    int arib_open_index = -1;
+     int audio_route_index, audio_route_serial;
+     int video_route_index, video_route_serial;
+     int subtitle_route_index[FFP_SUBTITLE_LAYER_COUNT];
+@@ -7023,8 +8485,15 @@ static int read_thread(void *arg)
+         st_index[AVMEDIA_TYPE_VIDEO] =
+             av_find_best_stream(ic, AVMEDIA_TYPE_VIDEO,
+                                 st_index[AVMEDIA_TYPE_VIDEO], -1, NULL, 0);
++    if (!o->audio_disable && !o->wanted_stream_spec[AVMEDIA_TYPE_AUDIO]) {
++        /* the program of the video, also when the video itself is not played (nodisp / vn) */
++        int arib_video = st_index[AVMEDIA_TYPE_VIDEO] >= 0 ? st_index[AVMEDIA_TYPE_VIDEO] :
++                         av_find_best_stream(ic, AVMEDIA_TYPE_VIDEO, -1, -1, NULL, 0);
++        if (arib_video >= 0)
++            arib_open_index = arib_audio_detect(is, arib_video);
++    }
+     if (!o->audio_disable)
+-        st_index[AVMEDIA_TYPE_AUDIO] =
++        st_index[AVMEDIA_TYPE_AUDIO] = arib_open_index >= 0 ? arib_open_index :
+             av_find_best_stream(ic, AVMEDIA_TYPE_AUDIO,
+                                 st_index[AVMEDIA_TYPE_AUDIO],
+                                 st_index[AVMEDIA_TYPE_VIDEO],
+@@ -7061,6 +8530,8 @@ static int read_thread(void *arg)
+     /* open the streams */
+     if (st_index[AVMEDIA_TYPE_AUDIO] >= 0) {
+         aret = stream_component_open(is, st_index[AVMEDIA_TYPE_AUDIO], -1);
++        if (aret < 0 && is->arib)
++            arib_audio_free(is);
+     }
+ 
+     if (st_index[AVMEDIA_TYPE_VIDEO] >= 0) {
+@@ -7205,6 +8676,8 @@ static int read_thread(void *arg)
+             } else {
+                 if (is->audio_stream >= 0)
+                     packet_queue_flush(&is->audioq);
++                if (is->arib)
++                    arib_flush(is);
+                 for (i = 0; i < FFP_SUBTITLE_LAYER_COUNT; i++)
+                     if (SDL_AtomicGet(&is->subtitles[i].routing_stream_index) >= 0)
+                         packet_queue_flush(&is->subtitles[i].packets);
+@@ -7261,9 +8734,11 @@ static int read_thread(void *arg)
+              * run to MAX_QUEUE_SIZE (~11 s / 15 MB of broadcast video) whenever captions were on. Their packets are
+              * interleaved with audio / video in the container, so reading for audio / video delivers them in time. */
+             if (is->infinite_buffer<1 &&
+-                  (is->audioq.size + is->videoq.size + is->subtitles[FFP_SUBTITLE_CAPTION].packets.size +
++                  (is->audioq.size + (is->arib ? is->arib->src[1].own_pq.size : 0) + is->videoq.size +
++                   is->subtitles[FFP_SUBTITLE_CAPTION].packets.size +
+                    is->subtitles[FFP_SUBTITLE_SUPERIMPOSE].packets.size > MAX_QUEUE_SIZE
+-                || (stream_has_enough_packets(is->audio_st, is->audio_stream, &is->audioq) &&
++                || ((is->arib ? arib_audio_enough(is) :
++                     stream_has_enough_packets(is->audio_st, is->audio_stream, &is->audioq)) &&
+                     stream_has_enough_packets(is->video_st, is->video_stream, &is->videoq)))) {
+                 SDL_LockMutex(wait_mutex);
+                 SDL_CondWaitTimeout(is->continue_read_thread, wait_mutex, 10);
+@@ -7295,7 +8770,10 @@ static int read_thread(void *arg)
+         if (ret < 0) {
+             if (ret == AVERROR_EOF || avio_feof(ic->pb)) {
+                 packet_queue_put_av_nullpacket(&is->videoq, video_route_index, video_route_serial);
+-                packet_queue_put_av_nullpacket(&is->audioq, audio_route_index, audio_route_serial);
++                if (is->arib)
++                    arib_put_eof(is);
++                else
++                    packet_queue_put_av_nullpacket(&is->audioq, audio_route_index, audio_route_serial);
+                 for (i = 0; i < FFP_SUBTITLE_LAYER_COUNT; i++)
+                     packet_queue_put_routed_nullpacket(&is->subtitles[i].packets,
+                                                        &is->subtitles[i].routing_stream_index,
+@@ -7315,6 +8793,8 @@ static int read_thread(void *arg)
+         } else {
+             SDL_AtomicSet(&is->eof, 0);
+         }
++        if (is->arib)
++            arib_check_streams(is);
+         if (pkt->stream_index == is->video_stream && (pkt->flags & AV_PKT_FLAG_KEY))
+             ffp_note_key_packet(is, pkt);
+ 
+@@ -7338,10 +8818,17 @@ static int read_thread(void *arg)
+                 av_q2d(ic->streams[pkt->stream_index]->time_base) -
+                 (double)(o->start_time != AV_NOPTS_VALUE ? o->start_time : 0) / 1000000
+                 <= ((double)o->duration / 1000000);
+-        if (pkt->stream_index == is->audio_stream && pkt_in_play_range) {
++        if (is->arib && pkt_in_play_range && pkt->stream_index != is->video_stream &&
++            arib_role_of_stream(is->arib, pkt->stream_index) >= 0) {
++            int role = arib_role_of_stream(is->arib, pkt->stream_index);
++            arib_note_packet(is, role, pkt);
++            packet_queue_put(is->arib->src[role].pq, pkt);
++        } else if (!is->arib && pkt->stream_index == is->audio_stream && pkt_in_play_range) {
+             packet_queue_put(&is->audioq, pkt);
+         } else if (pkt->stream_index == is->video_stream && pkt_in_play_range
+                    && !(is->video_st->disposition & AV_DISPOSITION_ATTACHED_PIC)) {
++            if (is->arib)
++                arib_note_packet(is, -1, pkt);
+             packet_queue_put(&is->videoq, pkt);
+         } else if (pkt->stream_index == subtitle_route_index[FFP_SUBTITLE_CAPTION] && pkt_in_play_range) {
+             packet_queue_put_routed(&is->subtitles[FFP_SUBTITLE_CAPTION].packets,
+@@ -7498,6 +8985,8 @@ static void stream_cycle_channel(VideoSt
+     AVProgram *p = NULL;
+     int nb_streams = is->ic->nb_streams;
+ 
++    if (codec_type == AVMEDIA_TYPE_AUDIO && is->arib)
++        return;                         /* ARIB: audio 1 / audio 2 are a preference (ffp_set_audio_preference) */
+     if (codec_type == AVMEDIA_TYPE_VIDEO) {
+         start_index = is->last_video_stream;
+         old_index = is->video_stream;
+@@ -10449,6 +11938,14 @@ FFP_API int FFP_CALL ffp_set_volume(FFPl
+     return 0;
+ }
+ 
++FFP_API int FFP_CALL ffp_set_audio_preference(FFPlayer *ffp, int pref)
++{
++    if (!ffp || (pref != FFP_ARIB_PREF_MAIN && pref != FFP_ARIB_PREF_COMMENTARY))
++        return FFP_EINVAL;
++    SDL_AtomicSet(&ffp->audio_pref, pref);
++    return 0;
++}
++
+ FFP_API int FFP_CALL ffp_set_mute(FFPlayer *ffp, int mute)
+ {
+     if (!ffp)
+@@ -11232,6 +12729,33 @@ static void ffp_build_debug_info(FFPlaye
+         av_bprintf(bp, ",\"audio\":null");
+     }
+ 
++    if (d->arib.active) {
++        const FFPDebugArib *a = &d->arib;
++        static const char *const role_names[2] = { "audio1", "audio2" };
++        int r;
++
++        av_bprintf(bp, ",\"arib_audio\":{\"preference\":\"%s\",\"playing\":", a->pref ? "audio2" : "audio1");
++        if (a->playing == FFP_ARIB_SRC_A1 || a->playing == FFP_ARIB_SRC_A2)
++            av_bprintf(bp, "\"%s\"", role_names[a->playing]);
++        else if (a->playing == FFP_ARIB_SRC_SILENCE)
++            av_bprintf(bp, "\"silence\"");
++        else
++            av_bprintf(bp, "null");
++        av_bprintf(bp, ",\"roles\":[");
++        for (r = 0; r < 2; r++) {
++            av_bprintf(bp, "%s{\"role\":\"%s\",\"present\":%s,\"stream_index\":%d,\"pid\":%d,\"component_tag\":%d,"
++                       "\"starved\":%s,\"buffered_ms\":", r ? "," : "", role_names[r], a->removed[r] ? "false" : "true",
++                       a->stream_index[r], a->pid[r], a->tag[r], a->starved[r] ? "true" : "false");
++            json_num(bp, a->ring_ms[r], 1);
++            av_bprintf(bp, "}");
++        }
++        av_bprintf(bp, "],\"switches\":%"PRId64",\"silence_ms\":", a->switches);
++        json_num(bp, a->silence_ms, 1);
++        av_bprintf(bp, ",\"rebinds\":%"PRId64"}", a->rebinds);
++    } else {
++        av_bprintf(bp, ",\"arib_audio\":null");
++    }
++
+     if (d->s_open) {
+         av_bprintf(bp, ",\"subtitle\":{\"stream_index\":%d,\"codec\":", d->s_index);
+         json_string(bp, d->s_codec);
+--- a/fftools/ffplay.h
++++ b/fftools/ffplay.h
+@@ -151,6 +151,19 @@ FFP_API double      FFP_CALL ffp_get_dur
+ FFP_API char       *FFP_CALL ffp_get_media_info(FFPlayer *p);     /* JSON (see below) or NULL; ffp_free */
+ 
+ FFP_API int         FFP_CALL ffp_cycle_stream(FFPlayer *p, int type);
++
++/* ARIB audio model. For an ARIB transport stream (media info "arib_audio" present) the video program's audio is
++ * "audio 1" (ADTS AAC with component tag 0x10 / 0x83 / 0x85, else the first untagged AAC) and "audio 2" (tag 0x11),
++ * both decoded in parallel; ffp_cycle_stream(FFP_STREAM_AUDIO) does nothing for such a media. pref:
++ *   FFP_ARIB_AUDIO_1 (0): always audio 1.
++ *   FFP_ARIB_AUDIO_2 (1): audio 2 wherever it has samples, audio 1 otherwise; the change back and forth is gapless
++ *                         (a 5 ms crossfade, the device stays open) and never reported. Audio 2 is entered again only
++ *                         one second after it was left, so a patchy stream does not flap.
++ * The value takes effect within the audio pipeline's latency (~0.2 s), applies to the current and to later opens of this
++ * instance (the host resets it to audio 1 when a new file should start there) and is ignored by media that is not ARIB TS.
++ * Returns 0, FFP_EINVAL for another value. */
++enum { FFP_ARIB_AUDIO_1 = 0, FFP_ARIB_AUDIO_2 = 1 };
++FFP_API int         FFP_CALL ffp_set_audio_preference(FFPlayer *p, int pref);
+ /* Changes only presentation visibility; both decoders continue running, so an indefinite cue
+  * reappears when shown again. Superimpose visibility is independent of caption visibility. */
+ FFP_API int         FFP_CALL ffp_set_subtitle_visible(FFPlayer *p, int layer, int on);
+--- /dev/null
++++ b/fftools/ffplay_arib_audio.h
+@@ -0,0 +1,121 @@
++/*
++ * ARIB audio model of libffplay: the pure decision functions (no I/O, no allocation), kept apart from ffplay.c so
++ * that they can be table-tested on their own (ffmpeg/tests/arib_select_tests.c includes this file).
++ *
++ * Time unit of every position is one sample of the mix timeline (the device rate); the demux fronts of the
++ * starvation rules are seconds.
++ */
++#ifndef FFTOOLS_FFPLAY_ARIB_AUDIO_H
++#define FFTOOLS_FFPLAY_ARIB_AUDIO_H
++
++#include <math.h>
++#include <stdint.h>
++
++/* MAIN: always audio 1; COMMENTARY: audio 2 wherever it has samples, audio 1 otherwise */
++enum { FFP_ARIB_PREF_MAIN = 0, FFP_ARIB_PREF_COMMENTARY = 1 };
++
++enum {
++    FFP_ARIB_SRC_A1      = 0,
++    FFP_ARIB_SRC_A2      = 1,
++    FFP_ARIB_SRC_SILENCE = 2,
++    FFP_ARIB_SRC_WAIT    = 3,   /* a source has not decided yet: do not advance the cursor */
++    FFP_ARIB_SRC_END     = 4,   /* everything is finished and nothing is left at the cursor */
++};
++
++#define FFP_ARIB_T_STARVE_AUDIO_S  0.5    /* a source lags the other audio candidate by more than this */
++#define FFP_ARIB_T_STARVE_VIDEO_S  1.5    /* ... or the video by more than this (audio trails video by up to ~1 s) */
++#define FFP_ARIB_MARGIN_AUDIO_S    0.15   /* interleave lag A2 behind A1 (measured max 0.106 s) */
++#define FFP_ARIB_MARGIN_VIDEO_S    1.2    /* constant offset of audio behind video on CS (measured max 0.955 s) + slack */
++#define FFP_ARIB_HOLD_S            1.0    /* minimum time on audio 1 before returning to audio 2 */
++#define FFP_ARIB_FADE_S            0.005  /* crossfade / dip length at every source change */
++
++typedef struct FFPAribStream {
++    int index;      /* AVStream index */
++    int aac;        /* ADTS AAC */
++    int tag;        /* component_tag, -1 when the stream has none */
++} FFPAribStream;
++
++/* tsreadex CServiceFilter::AddPmt: audio 1 = AAC with component tag 0x10 / 0x83 / 0x85 (the last match wins), else the
++ * first untagged AAC; audio 2 = tag 0x11. s[] is the video program's streams in PMT order. -1 = none. */
++static inline void ffp_arib_roles(const FFPAribStream *s, int n, int *a1, int *a2)
++{
++    int i;
++
++    *a1 = *a2 = -1;
++    for (i = 0; i < n; i++) {
++        if (!s[i].aac)
++            continue;
++        if ((*a1 < 0 && s[i].tag < 0) || s[i].tag == 0x10 || s[i].tag == 0x83 || s[i].tag == 0x85)
++            *a1 = s[i].index;
++        else if (s[i].tag == 0x11)
++            *a2 = s[i].index;
++    }
++}
++
++typedef struct FFPAribSel {
++    int pref;           /* FFP_ARIB_PREF_* */
++    int a1_cov, a1_dec; /* audio 1: has a sample at the cursor / has decided about it (data beyond it, or starved) */
++    int a2_cov, a2_dec;
++    int cur_a2;         /* the sample before the cursor came from audio 2 */
++    int a2_blocked;     /* hold: audio 2 may not be entered from audio 1 yet */
++    int silence_ok;     /* silence is justified here (the video front is beyond the cursor) */
++    int eof;            /* every present source is finished */
++} FFPAribSel;
++
++/* Which source supplies the sample at the cursor.
++ * Audio 2 preference: audio 2 where it covers (the hold only delays the return from audio 1), else audio 1, else silence.
++ * Main: audio 1, else silence. A source that has neither a sample nor a decision makes the cursor wait. */
++static inline int ffp_arib_select(const FFPAribSel *s)
++{
++    if (s->pref == FFP_ARIB_PREF_COMMENTARY) {
++        if (s->a2_cov && (s->cur_a2 || !s->a2_blocked))
++            return FFP_ARIB_SRC_A2;
++        if (!s->a2_cov && !s->a2_dec)
++            return FFP_ARIB_SRC_WAIT;
++    }
++    if (s->a1_cov)
++        return FFP_ARIB_SRC_A1;
++    if (s->pref == FFP_ARIB_PREF_COMMENTARY && s->a2_cov)
++        return FFP_ARIB_SRC_A2;
++    if (!s->a1_dec)
++        return FFP_ARIB_SRC_WAIT;
++    if (s->eof)
++        return FFP_ARIB_SRC_END;
++    return s->silence_ok ? FFP_ARIB_SRC_SILENCE : FFP_ARIB_SRC_WAIT;
++}
++
++/* Starvation of one source from the demux fronts (seconds, NAN = unknown). Returns 1 when the source is starved: a PMT
++ * removed it, it finished, it lags the other audio candidate by more than T_STARVE_AUDIO or the video by more than
++ * T_STARVE_VIDEO. *known_until: the media time up to which the absence of its data is certain (interleave guarantees
++ * that its data before that time would have been demuxed already); -INFINITY when starved only by removal with no
++ * front known, +INFINITY for a finished source. */
++static inline int ffp_arib_starved(int removed, int finished, double own_end, double other_end, double video_end,
++                                   double *known_until)
++{
++    double ku = -INFINITY;
++    int starved = 0;
++
++    if (finished) {
++        *known_until = INFINITY;
++        return 1;
++    }
++    if (!isnan(own_end) && !isnan(other_end) && other_end - own_end > FFP_ARIB_T_STARVE_AUDIO_S) {
++        ku = fmax(ku, other_end - FFP_ARIB_MARGIN_AUDIO_S);
++        starved = 1;
++    }
++    if (!isnan(own_end) && !isnan(video_end) && video_end - own_end > FFP_ARIB_T_STARVE_VIDEO_S) {
++        ku = fmax(ku, video_end - FFP_ARIB_MARGIN_VIDEO_S);
++        starved = 1;
++    }
++    if (removed) {
++        if (!isnan(other_end))
++            ku = fmax(ku, other_end - FFP_ARIB_MARGIN_AUDIO_S);
++        if (!isnan(video_end))
++            ku = fmax(ku, video_end - FFP_ARIB_MARGIN_VIDEO_S);
++        starved = 1;
++    }
++    *known_until = ku;
++    return starved;
++}
++
++#endif

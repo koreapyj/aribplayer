@@ -1,0 +1,7 @@
+# Pinned inputs of the ffplay build (shell-sourceable KEY=VALUE).
+# builder-ffmpeg supplies patches/0001-* (build patch) and the build recipe;
+# FF_REPO/FF_REF is the jellyfin-ffmpeg tag it builds (same as builder's Makefile/CI default).
+BUILDER_REPO=https://github.com/koreapyj/builder-ffmpeg.git
+BUILDER_COMMIT=a4e3b5fcfe07158c35c5ce36c24b8d7af71e0d7f
+FF_REPO=https://github.com/jellyfin/jellyfin-ffmpeg.git
+FF_REF=v8.1.3-1

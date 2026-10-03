@@ -1,0 +1,59 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": { "major": 3, "minor": 25, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "msvc-x64",
+      "hidden": true,
+      "displayName": "MSVC x64 (Ninja)",
+      "description": "Needs a VS 2022 x64 developer environment with Windows SDK 10.0.26100.0 (scripts/build.ps1 sets it up).",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/artifacts/cmake/${presetName}",
+      "cacheVariables": {
+        "CMAKE_CXX_COMPILER": "cl",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
+      },
+      "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Windows" }
+    },
+    {
+      "name": "release",
+      "inherits": "msvc-x64",
+      "displayName": "Release (MSVC x64)",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Release" }
+    },
+    {
+      "name": "debug",
+      "inherits": "msvc-x64",
+      "displayName": "Debug (MSVC x64)",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug" }
+    }
+  ],
+  "buildPresets": [
+    { "name": "release", "configurePreset": "release" },
+    { "name": "debug", "configurePreset": "debug" }
+  ],
+  "testPresets": [
+    {
+      "name": "release",
+      "configurePreset": "release",
+      "output": { "outputOnFailure": true },
+      "execution": { "noTestsAction": "error" }
+    },
+    {
+      "name": "release-unit",
+      "inherits": "release",
+      "filter": { "include": { "label": "unit" } }
+    },
+    {
+      "name": "debug",
+      "configurePreset": "debug",
+      "output": { "outputOnFailure": true },
+      "execution": { "noTestsAction": "error" }
+    },
+    {
+      "name": "debug-unit",
+      "inherits": "debug",
+      "filter": { "include": { "label": "unit" } }
+    }
+  ]
+}

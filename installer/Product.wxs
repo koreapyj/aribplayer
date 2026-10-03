@@ -1,0 +1,78 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  ARIB Player per-user x64 MSI (WiX v7 authoring; the v4 schema namespace is still the current one).
+  The file payload is NOT listed here: build-msi.ps1 stages the payload and generates Payload.wxs
+  (ComponentGroup "PayloadComponents" + sub-directories) next to the build output.
+
+  Per-user rules honoured:
+    * Package Scope="perUser" -> no elevation, ARP entry in HKCU.
+    * ICE38: every component installed under the user profile has an HKCU registry value as its KeyPath.
+    * ICE64: every directory we create under the profile has a (non-recursive) RemoveFolder.
+  Uninstall never touches %LOCALAPPDATA%\aribplayer (settings, playlists, history, logs): no component
+  or action references it, and there is no recursive RemoveFile anywhere.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <?ifndef ProductVersion?>
+  <?error ProductVersion must be passed with -d ProductVersion=x.y.z?>
+  <?endif?>
+  <?ifndef IconFile?>
+  <?error IconFile must be passed with -d IconFile=<path to assets\icon\aribplayer.ico>?>
+  <?endif?>
+
+  <Package Name="ARIB Player"
+           Manufacturer="ARIB Player contributors"
+           Version="$(ProductVersion)"
+           UpgradeCode="B254C43A-9A0B-46A8-A17A-0513B6C077CD"
+           Scope="perUser"
+           Compressed="yes"
+           InstallerVersion="500"
+           Language="1033">
+
+    <!-- Windows Installer compares only the first three version fields.
+         AllowSameVersionUpgrades lets a CI rerun of the same version replace the installed copy (each build gets a
+         fresh ProductCode); downgrades are refused. -->
+    <MajorUpgrade AllowSameVersionUpgrades="yes" Schedule="afterInstallInitialize"
+                  DowngradeErrorMessage="A newer version of [ProductName] is already installed. Uninstall it first to install an older version." />
+
+    <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
+
+    <Launch Condition="VersionNT64" Message="[ProductName] requires 64-bit Windows." />
+
+    <Icon Id="aribplayer.ico" SourceFile="$(IconFile)" />
+    <Property Id="ARPPRODUCTICON" Value="aribplayer.ico" />
+
+    <StandardDirectory Id="LocalAppDataFolder">
+      <Directory Id="ProgramsFolder_User" Name="Programs">
+        <Directory Id="INSTALLFOLDER" Name="aribplayer" />
+      </Directory>
+    </StandardDirectory>
+
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Directory Id="StartMenuAppFolder" Name="ARIB Player" />
+    </StandardDirectory>
+
+    <Component Id="StartMenuShortcutComponent" Directory="StartMenuAppFolder" Guid="33AB4AE7-E879-47E2-83D5-AC4B3501A551">
+      <Shortcut Id="StartMenuShortcut" Name="ARIB Player"
+                Description="ARIB Player"
+                Target="[INSTALLFOLDER]aribplayer.exe"
+                WorkingDirectory="INSTALLFOLDER"
+                Icon="aribplayer.ico" />
+      <RemoveFolder Id="RemoveStartMenuAppFolder" On="uninstall" />
+      <RegistryValue Root="HKCU" Key="Software\aribplayer\Installer" Name="StartMenuShortcut"
+                     Type="integer" Value="1" KeyPath="yes" />
+    </Component>
+
+    <!-- Parent directory of INSTALLFOLDER: removed on uninstall only if empty (never recursive). -->
+    <Component Id="ProgramsFolderCleanup" Directory="ProgramsFolder_User" Guid="9AFAD91F-7685-44CB-923F-A1C8664EFA17">
+      <RemoveFolder Id="RemoveProgramsFolder_User" On="uninstall" />
+      <RegistryValue Root="HKCU" Key="Software\aribplayer\Installer" Name="ProgramsFolderCleanup"
+                     Type="integer" Value="1" KeyPath="yes" />
+    </Component>
+
+    <Feature Id="Main" Title="ARIB Player" Level="1" AllowAbsent="no">
+      <ComponentGroupRef Id="PayloadComponents" />
+      <ComponentRef Id="StartMenuShortcutComponent" />
+      <ComponentRef Id="ProgramsFolderCleanup" />
+    </Feature>
+  </Package>
+</Wix>

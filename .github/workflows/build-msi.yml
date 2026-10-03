@@ -1,0 +1,178 @@
+name: Build MSI
+
+on:
+  push:
+  pull_request:
+
+# Build and PR code receive read-only tokens. Only the release job can write.
+permissions:
+  contents: read
+
+jobs:
+  ffmpeg:
+    name: FFmpeg (Linux, cached)
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Compute the local stamp digest
+        id: digest
+        shell: bash
+        run: |
+          set -euo pipefail
+          digest="$(bash ffmpeg/scripts/build-ffplay.sh --print-digest)"
+          [[ "$digest" =~ ^[0-9a-f]{64}$ ]]
+          echo "key=$digest" >> "$GITHUB_OUTPUT"
+      - name: Restore exact FFmpeg cache
+        id: cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ffmpeg/dist/win64
+          # No prefix or restore-keys: this is exactly dist/win64/.stamp.
+          key: ${{ steps.digest.outputs.key }}
+      - name: Make room on the hosted Linux runner
+        if: steps.cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          df -h /
+          # These preinstalled SDKs are unused by the containerized cross-build.
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          df -h /
+          available_kb=$(df -Pk / | awk 'NR == 2 { print $4 }')
+          if (( available_kb < 35 * 1024 * 1024 )); then
+            echo '::error::FFmpeg cold build needs at least 35 GiB free; use a larger runner if cleanup is insufficient.'
+            exit 1
+          fi
+      - name: Build FFmpeg using the same recipe as local WSL
+        if: steps.cache.outputs.cache-hit != 'true'
+        timeout-minutes: 330
+        shell: bash
+        run: bash ffmpeg/scripts/build-ffplay.sh --work-dir "$RUNNER_TEMP/ffmpeg-work"
+      - name: Check distributable before caching or uploading
+        shell: bash
+        env:
+          EXPECTED_DIGEST: ${{ steps.digest.outputs.key }}
+        run: |
+          set -euo pipefail
+          dist=ffmpeg/dist/win64
+          test "$(cat "$dist/.stamp")" = "$EXPECTED_DIGEST"
+          test ! -e "$dist/.dev-build"
+          for file in libffplay.dll ffplay.h libffplay.dll.a ffcapsdump.exe licenses/ffmpeg/LICENSE.md licenses/ffmpeg/COPYING.GPLv3; do
+            test -s "$dist/$file"
+          done
+          for pattern in 'avcodec-*.dll' 'avformat-*.dll' 'avutil-*.dll' 'avfilter-*.dll' 'swresample-*.dll' 'swscale-*.dll'; do
+            compgen -G "$dist/$pattern" > /dev/null
+          done
+          df -h /
+      - name: Save exact FFmpeg cache
+        if: steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ffmpeg/dist/win64
+          key: ${{ steps.digest.outputs.key }}
+      - name: Pass complete dist to Windows
+        uses: actions/upload-artifact@v4
+        with:
+          name: ffmpeg-win64
+          path: ffmpeg/dist/win64/
+          include-hidden-files: true # .stamp is required by the Windows job.
+          if-no-files-found: error
+          retention-days: 7
+      - name: Preserve FFmpeg build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ffmpeg-build-log
+          path: ffmpeg/.work/build.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+  windows:
+    name: App and per-user MSI
+    needs: ffmpeg
+    runs-on: windows-latest
+    timeout-minutes: 60
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: ffmpeg-win64
+          path: ffmpeg/dist/win64
+      - name: Calculate MSI version
+        id: version
+        shell: pwsh
+        run: ./scripts/ci-version.ps1
+      - name: Build with CMake (Ninja, MSVC x64 from VS 2022, SDK 10.0.26100.0; do not run tests)
+        shell: pwsh
+        env:
+          MSI_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          New-Item -ItemType Directory -Force artifacts/logs | Out-Null
+          # -Version goes into aribplayer.exe's VERSIONINFO (same version as the MSI).
+          ./scripts/build.ps1 -Preset release -Fresh -Version $env:MSI_VERSION *>&1 | Tee-Object -FilePath artifacts/logs/ci-build.log
+      - name: Set up .NET for the pinned WiX tool
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+      - name: Install pinned WiX (CI only)
+        shell: pwsh
+        run: |
+          # Keep this exact version in sync with build-msi.ps1's ExpectedWixVersion.
+          & dotnet tool install wix --version 7.0.0 --tool-path "$env:RUNNER_TEMP/wix"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          "$env:RUNNER_TEMP/wix" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+      - name: Build MSI
+        shell: pwsh
+        env:
+          MSI_VERSION: ${{ steps.version.outputs.version }}
+        run: ./installer/build-msi.ps1 -Version $env:MSI_VERSION -OutputDirectory artifacts/installer
+      - name: Upload MSI on every push and PR
+        uses: actions/upload-artifact@v4
+        with:
+          name: aribplayer-msi
+          path: artifacts/installer/*.msi
+          if-no-files-found: error
+          retention-days: 14
+      - name: Preserve app build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-build-log
+          path: artifacts/logs/ci-*.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+  release:
+    name: Publish release
+    needs: windows
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    runs-on: windows-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    concurrency:
+      # No whole-workflow cancellation: every push must still produce its artifact.
+      # The publish script also skips stale main runs, since this queue is not FIFO.
+      group: windows-video-player-release-${{ github.ref }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: aribplayer-msi
+          path: artifacts/release
+      - name: Publish tag or replace rolling main pre-release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MSI_VERSION: ${{ needs.windows.outputs.version }}
+        run: ./scripts/ci-publish.ps1 -Version $env:MSI_VERSION -ArtifactDirectory artifacts/release

@@ -1,0 +1,784 @@
+--- a/fftools/ffplay.c
++++ b/fftools/ffplay.c
+@@ -9117,6 +9117,27 @@ FFP_API int FFP_CALL ffp_set_presenter_p
+     return 0;
+ }
+ 
++FFP_API int FFP_CALL ffp_set_backdrop_regions(FFPlayer *ffp, const FFPBackdropRegion *regions, int count)
++{
++    char err[200] = "";
++    int ret;
++
++    if (!ffp || count < 0 || count > FFP_BACKDROP_REGION_MAX || (count && !regions))
++        return FFP_EINVAL;
++    SDL_LockMutex(ffp->pres_mutex);
++    if (ffp->d3d)
++        ret = ffp_d3d11_set_backdrop_regions(ffp->d3d, regions, count, err, sizeof(err));
++    else
++        ret = AVERROR(EINVAL);
++    SDL_UnlockMutex(ffp->pres_mutex);
++    if (ret < 0) {
++        av_log(NULL, AV_LOG_WARNING, "ffp_set_backdrop_regions: %s\n", err[0] ? err : "D3D11 presenter unavailable");
++        return FFP_EINVAL;
++    }
++    SDL_AtomicSet(&ffp->pres_dirty, 1);
++    return 0;
++}
++
+ 
+ enum { OT_BOOL, OT_INT, OT_FLOAT, OT_STRING, OT_TIME, OT_MSEC };
+ 
+@@ -10160,7 +10181,8 @@ static void ffp_dbg_queue(AVBPrint *bp,
+  * all of which are only ever held for a few instructions. */
+ static void ffp_build_debug_info(FFPlayer *ffp, VideoState *is, const char *vf, const char *af,
+                                  double position, double duration, const FFPPresParams *pp,
+-                                 const FFPD3D11OverlayStats *ov, const char *pres_extra, AVBPrint *bp)
++                                 const FFPD3D11OverlayStats *ov, const FFPD3D11AcrylicStats *acrylic,
++                                 const char *pres_extra, AVBPrint *bp)
+ {
+     FFPDebug *d = &is->dbg;
+     double now = av_gettime_relative() / 1000000.0;
+@@ -10207,6 +10229,12 @@ static void ffp_build_debug_info(FFPlaye
+                    ",\"readback_seq\":%"PRIu64",\"readback_rects\":%"PRIu64"}",
+                    ov->cue_uploads, ov->rects_uploaded, ov->cues_shown, ov->rects_drawn, ov->draw_failures,
+                    ov->readback_failures, ov->readback_seq, ov->readback_rects);
++    if (acrylic) {
++        av_bprintf(bp, ",\"acrylic\":{\"regions\":%d,\"frames_blurred\":%"PRIu64",\"failures\":%"PRIu64",\"blur_ms\":",
++                   acrylic->regions, acrylic->frames_blurred, acrylic->failures);
++        json_num(bp, acrylic->last_blur_us / 1000.0, 3);
++        av_bprintf(bp, "}");
++    }
+     av_bprintf(bp, "}");
+ 
+     if (d->v_open) {
+@@ -10950,7 +10978,8 @@ FFP_API char *FFP_CALL ffp_get_debug_inf
+     FFPPresParams pp;
+     AVBPrint pres;
+     FFPD3D11OverlayStats ov;
+-    int ok = 0, have_ov = 0;
++    FFPD3D11AcrylicStats acrylic;
++    int ok = 0, have_ov = 0, have_acrylic = 0;
+ 
+     if (!ffp || !ffp->dbg_mutex)
+         return NULL;
+@@ -10967,8 +10996,10 @@ FFP_API char *FFP_CALL ffp_get_debug_inf
+     SDL_LockMutex(ffp->pres_mutex);
+     if (ffp->d3d) {
+         ffp_d3d11_overlay_stats(ffp->d3d, &ov);
++        ffp_d3d11_acrylic_stats(ffp->d3d, &acrylic);
+         ffp_d3d11_debug_json(ffp->d3d, &pres);
+         have_ov = 1;
++        have_acrylic = 1;
+     }
+     SDL_UnlockMutex(ffp->pres_mutex);
+ 
+@@ -10976,7 +11007,7 @@ FFP_API char *FFP_CALL ffp_get_debug_inf
+     SDL_LockMutex(ffp->dbg_mutex);
+     if (ffp->dbg_is && av_bprint_is_complete(&pres)) {
+         ffp_build_debug_info(ffp, ffp->dbg_is, vf ? vf : "", af ? af : "", position, duration, &pp,
+-                             have_ov ? &ov : NULL, pres.str, &bp);
++                             have_ov ? &ov : NULL, have_acrylic ? &acrylic : NULL, pres.str, &bp);
+         ok = 1;
+     }
+     SDL_UnlockMutex(ffp->dbg_mutex);
+--- a/fftools/ffplay.h
++++ b/fftools/ffplay.h
+@@ -45,6 +45,20 @@
+ extern "C" {
+ #endif
+ 
++/* D3D11 Acrylic backdrop region (client pixels, packed 0xAARRGGBB colours; alpha is ignored).
++ * The caller owns the array; ffp_set_backdrop_regions copies it before returning. */
++typedef struct FFPBackdropRegion {
++    int x, y, width, height;
++    float corner_radius;
++    uint32_t tint_color;
++    float tint_opacity;
++    uint32_t luminosity_color;
++    float luminosity_opacity;
++    int noise;
++    int z;
++} FFPBackdropRegion;
++#define FFP_BACKDROP_REGION_MAX 64
++
+ /* return codes: AVERROR(EINVAL) and AVERROR(EAGAIN) */
+ #define FFP_EINVAL (-22)
+ #define FFP_EAGAIN (-11)
+@@ -265,6 +279,15 @@ FFP_API char       *FFP_CALL ffp_probe_c
+  * "In effect" is the presenter of the last ffp_open (SDL before the first one, and after a fallback to SDL). */
+ FFP_API int         FFP_CALL ffp_set_presenter_params(FFPlayer *p, const char *json);
+ 
++/* Client-pixel Acrylic regions for the D3D11 presenter. Each region is a rounded
++ * rectangle composited above the video and bitmap captions. Colours are packed 0xAARRGGBB with
++ * ignored alpha; opacities are 0..1; noise is 0/1. Regions are sorted back-to-front by z.
++ * The region list is copied before return and becomes visible on the next presented frame; a
++ * paused picture is redrawn. count=0 clears all regions. Snapshots never include Acrylic.
++ * Returns FFP_EINVAL for invalid regions, more than FFP_BACKDROP_REGION_MAX entries, or when the
++ * active presenter is not D3D11. */
++FFP_API int         FFP_CALL ffp_set_backdrop_regions(FFPlayer *p, const FFPBackdropRegion *regions, int count);
++
+ /* presenter=d3d11 (hosted window only: ffp_create with an HWND): a flip-model DXGI swap chain on a child window that
+  * fills the host window's client area and follows its size (it never touches the host window itself, the SDL renderer
+  * stays untouched underneath and takes over after a fallback; no top-level window is created or shown). D3D11VA/system
+--- a/fftools/ffplay_d3d11.c
++++ b/fftools/ffplay_d3d11.c
+@@ -218,6 +218,31 @@ typedef struct FFPOverlayRenderer {
+     ID3D11SamplerState *sampler;
+ } FFPOverlayRenderer;
+ 
++typedef struct FFPAcrylicRenderer {
++    ID3D11VertexShader *vs;
++    ID3D11PixelShader *downsample_ps;
++    ID3D11PixelShader *blur_ps;
++    ID3D11PixelShader *composite_ps;
++    ID3D11Buffer *constants;
++    ID3D11RasterizerState *raster;
++    ID3D11RasterizerState *scissor_raster;
++    ID3D11SamplerState *sampler;
++} FFPAcrylicRenderer;
++
++typedef struct FFPAcrylicCB {
++    float target[4];             /* width, height, inverse width, inverse height */
++    float source[4];             /* source width, height, inverse width, inverse height */
++    float region[4];             /* client-pixel x, y, width, height */
++    float tint[4];               /* RGB, opacity */
++    float luminosity[4];         /* RGB, opacity */
++    float params[4];             /* radius, noise enabled, blur axis x, blur axis y */
++} FFPAcrylicCB;
++
++typedef struct FFPAcrylicTimer {
++    ID3D11Query *disjoint, *begin, *end;
++    int pending;
++} FFPAcrylicTimer;
++
+ typedef struct FFPOverlayTexture {
+     ID3D11Texture2D *texture;
+     ID3D11ShaderResourceView *srv;
+@@ -410,6 +435,55 @@ static const char ffp_overlay_ps_source[
+     " return bitmap.Sample(linearClamp,uv);\n"
+     "}\n";
+ 
++static const char ffp_acrylic_vs_source[] =
++    "float4 main(uint id : SV_VertexID) : SV_Position {\n"
++    " float2 p=float2((id<<1)&2,id&2);\n"
++    " return float4(p*float2(2,-2)+float2(-1,1),0,1);\n"
++    "}\n";
++
++static const char ffp_acrylic_downsample_ps_source[] =
++    "Texture2D<float4> image : register(t0); SamplerState linearClamp : register(s0);\n"
++    "cbuffer Acrylic : register(b0) { float4 target; float4 source; float4 region; float4 tint; float4 luminosity; float4 params; };\n"
++    "float4 main(float4 pos : SV_Position) : SV_Target { return image.Sample(linearClamp,pos.xy*target.zw); }\n";
++
++static const char ffp_acrylic_blur_ps_source[] =
++    "Texture2D<float4> image : register(t0); SamplerState linearClamp : register(s0);\n"
++    "cbuffer Acrylic : register(b0) { float4 target; float4 source; float4 region; float4 tint; float4 luminosity; float4 params; };\n"
++    "float4 main(float4 pos : SV_Position) : SV_Target {\n"
++    " float2 uv=pos.xy*target.zw; float2 d=source.zw*params.zw;\n"
++    " float4 c=image.Sample(linearClamp,uv)*0.13460;\n"
++    " c+=(image.Sample(linearClamp,uv+d*1.0)+image.Sample(linearClamp,uv-d*1.0))*0.12730;\n"
++    " c+=(image.Sample(linearClamp,uv+d*2.0)+image.Sample(linearClamp,uv-d*2.0))*0.10780;\n"
++    " c+=(image.Sample(linearClamp,uv+d*3.0)+image.Sample(linearClamp,uv-d*3.0))*0.08160;\n"
++    " c+=(image.Sample(linearClamp,uv+d*4.0)+image.Sample(linearClamp,uv-d*4.0))*0.05530;\n"
++    " c+=(image.Sample(linearClamp,uv+d*5.0)+image.Sample(linearClamp,uv-d*5.0))*0.03360;\n"
++    " c+=(image.Sample(linearClamp,uv+d*6.0)+image.Sample(linearClamp,uv-d*6.0))*0.01820;\n"
++    " c+=(image.Sample(linearClamp,uv+d*7.0)+image.Sample(linearClamp,uv-d*7.0))*0.00885;\n"
++    " return c;\n"
++    "}\n";
++
++static const char ffp_acrylic_composite_ps_source[] =
++    "Texture2D<float4> image : register(t0); Texture2D<float4> noiseTex : register(t1);\n"
++    "SamplerState linearClamp : register(s0);\n"
++    "cbuffer Acrylic : register(b0) { float4 target; float4 source; float4 region; float4 tint; float4 luminosity; float4 params; };\n"
++    "float lum(float3 c) { return dot(c,float3(0.3,0.59,0.11)); }\n"
++    "float3 setLum(float3 c,float l) {\n"
++    " float d=l-lum(c); c+=d; float n=min(c.r,min(c.g,c.b)); float x=max(c.r,max(c.g,c.b));\n"
++    " if(n<0.0) c=l+((c-l)*l)/(l-n);\n"
++    " if(x>1.0) c=l+((c-l)*(1.0-l))/(x-l);\n"
++    " return saturate(c);\n"
++    "}\n"
++    "float4 main(float4 pos : SV_Position) : SV_Target {\n"
++    " float2 halfSize=region.zw*0.5; float radius=clamp(params.x,0.0,min(halfSize.x,halfSize.y));\n"
++    " float2 q=abs(pos.xy-(region.xy+halfSize))-(halfSize-radius);\n"
++    " float distance=length(max(q,0.0))+min(max(q.x,q.y),0.0)-radius; if(distance>0.0) discard;\n"
++    " float3 c=image.Sample(linearClamp,pos.xy*target.zw).rgb;\n"
++    " c=lerp(c,setLum(c,lum(luminosity.rgb)),saturate(luminosity.a));\n"
++    " c=lerp(c,tint.rgb,saturate(tint.a));\n"
++    " if(params.y>0.5) { float n=noiseTex.Sample(linearClamp,frac(pos.xy/256.0)).r-0.5; c=saturate(c+n*0.04); }\n"
++    " return float4(c,1.0);\n"
++    "}\n";
++
+ static void ffp_overlay_renderer_free(FFPOverlayRenderer *r)
+ {
+     if (!r) return;
+@@ -495,6 +569,91 @@ fail:
+     return -1;
+ }
+ 
++static void ffp_acrylic_renderer_free(FFPAcrylicRenderer *r)
++{
++    if (!r) return;
++    CS_REL(r->sampler);
++    CS_REL(r->scissor_raster);
++    CS_REL(r->raster);
++    CS_REL(r->constants);
++    CS_REL(r->composite_ps);
++    CS_REL(r->blur_ps);
++    CS_REL(r->downsample_ps);
++    CS_REL(r->vs);
++    memset(r, 0, sizeof(*r));
++}
++
++static int ffp_acrylic_renderer_create(ID3D11Device *dev, FFPAcrylicRenderer *r,
++                                       char *err, size_t n)
++{
++    static const WCHAR *dlls[] = { L"d3dcompiler_47.dll", L"d3dcompiler_43.dll" };
++    HMODULE module = NULL;
++    CSCompileFn compile = NULL;
++    ID3DBlob *vsb = NULL, *dsb = NULL, *bsb = NULL, *csb = NULL;
++    D3D11_BUFFER_DESC bd;
++    D3D11_RASTERIZER_DESC rd;
++    D3D11_SAMPLER_DESC sm;
++    HRESULT hr;
++    unsigned i;
++
++    for (i = 0; i < sizeof(dlls)/sizeof(dlls[0]); ++i) {
++        module = LoadLibraryW(dlls[i]);
++        if (module) {
++            compile = (CSCompileFn)(void *)GetProcAddress(module, "D3DCompile");
++            if (compile) break;
++            FreeLibrary(module);
++            module = NULL;
++        }
++    }
++    if (!compile) { cs_error(err, n, "D3DCompile unavailable for Acrylic", E_FAIL); goto fail; }
++    if (FAILED(cs_compile(compile, ffp_acrylic_vs_source, "vs_5_0", &vsb, err, n)) ||
++        FAILED(cs_compile(compile, ffp_acrylic_downsample_ps_source, "ps_5_0", &dsb, err, n)) ||
++        FAILED(cs_compile(compile, ffp_acrylic_blur_ps_source, "ps_5_0", &bsb, err, n)) ||
++        FAILED(cs_compile(compile, ffp_acrylic_composite_ps_source, "ps_5_0", &csb, err, n)))
++        goto fail;
++    hr = dev->lpVtbl->CreateVertexShader(dev, vsb->lpVtbl->GetBufferPointer(vsb),
++                                          vsb->lpVtbl->GetBufferSize(vsb), NULL, &r->vs);
++    if (FAILED(hr)) { cs_error(err, n, "CreateVertexShader(Acrylic)", hr); goto fail; }
++    hr = dev->lpVtbl->CreatePixelShader(dev, dsb->lpVtbl->GetBufferPointer(dsb),
++                                         dsb->lpVtbl->GetBufferSize(dsb), NULL, &r->downsample_ps);
++    if (FAILED(hr)) { cs_error(err, n, "CreatePixelShader(Acrylic downsample)", hr); goto fail; }
++    hr = dev->lpVtbl->CreatePixelShader(dev, bsb->lpVtbl->GetBufferPointer(bsb),
++                                         bsb->lpVtbl->GetBufferSize(bsb), NULL, &r->blur_ps);
++    if (FAILED(hr)) { cs_error(err, n, "CreatePixelShader(Acrylic blur)", hr); goto fail; }
++    hr = dev->lpVtbl->CreatePixelShader(dev, csb->lpVtbl->GetBufferPointer(csb),
++                                         csb->lpVtbl->GetBufferSize(csb), NULL, &r->composite_ps);
++    if (FAILED(hr)) { cs_error(err, n, "CreatePixelShader(Acrylic composite)", hr); goto fail; }
++    memset(&bd, 0, sizeof(bd));
++    bd.ByteWidth = sizeof(FFPAcrylicCB);
++    bd.Usage = D3D11_USAGE_DEFAULT;
++    bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
++    hr = dev->lpVtbl->CreateBuffer(dev, &bd, NULL, &r->constants);
++    if (FAILED(hr)) { cs_error(err, n, "CreateBuffer(Acrylic constants)", hr); goto fail; }
++    memset(&rd, 0, sizeof(rd));
++    rd.FillMode = D3D11_FILL_SOLID;
++    rd.CullMode = D3D11_CULL_NONE;
++    rd.DepthClipEnable = TRUE;
++    hr = dev->lpVtbl->CreateRasterizerState(dev, &rd, &r->raster);
++    if (FAILED(hr)) { cs_error(err, n, "CreateRasterizerState(Acrylic)", hr); goto fail; }
++    rd.ScissorEnable = TRUE;
++    hr = dev->lpVtbl->CreateRasterizerState(dev, &rd, &r->scissor_raster);
++    if (FAILED(hr)) { cs_error(err, n, "CreateRasterizerState(Acrylic scissor)", hr); goto fail; }
++    memset(&sm, 0, sizeof(sm));
++    sm.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
++    sm.AddressU = sm.AddressV = sm.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
++    sm.MaxLOD = D3D11_FLOAT32_MAX;
++    hr = dev->lpVtbl->CreateSamplerState(dev, &sm, &r->sampler);
++    if (FAILED(hr)) { cs_error(err, n, "CreateSamplerState(Acrylic)", hr); goto fail; }
++    CS_REL(vsb); CS_REL(dsb); CS_REL(bsb); CS_REL(csb);
++    FreeLibrary(module);
++    return 0;
++fail:
++    CS_REL(vsb); CS_REL(dsb); CS_REL(bsb); CS_REL(csb);
++    if (module) FreeLibrary(module);
++    ffp_acrylic_renderer_free(r);
++    return -1;
++}
++
+ /* Caller owns returned handle; no import library dependency on d3dcompiler.
+  * Not thread-safe against concurrent use of the same immediate context. */
+ static FFPCudaShader *ffp_cuda_shader_create(ID3D11Device *dev, char *err, size_t n)
+@@ -1203,6 +1362,19 @@ struct FFPD3D11 {
+     ID3D11Texture2D *overlay_readback_staging;
+     uint8_t *overlay_readback_data;
+ 
++    FFPAcrylicRenderer acrylic_renderer;
++    int acrylic_renderer_ready, acrylic_renderer_unavailable;
++    int acrylic_w, acrylic_h, acrylic_small_w, acrylic_small_h;
++    ID3D11Texture2D *acrylic_source, *acrylic_small[2], *acrylic_noise;
++    ID3D11ShaderResourceView *acrylic_source_srv, *acrylic_small_srv[2], *acrylic_noise_srv;
++    ID3D11RenderTargetView *acrylic_small_rtv[2];
++    FFPBackdropRegion acrylic_regions[FFP_BACKDROP_REGION_MAX];
++    int acrylic_region_count;
++    FFPAcrylicTimer acrylic_timers[4];
++    unsigned acrylic_timer_next;
++    int acrylic_timer_unavailable;
++    LONG64 acrylic_frames_blurred, acrylic_failures, acrylic_last_blur_us;
++
+     CRITICAL_SECTION cs;            /* display / snapshot */
+     AVBufferRef *up_frames;
+     int up_fmt, up_w, up_h;
+@@ -1856,6 +2028,381 @@ static ID3D11Texture2D *ffp_make_tex(ID3
+     return tx;
+ }
+ 
++static void ffp_acrylic_surface_free(FFPD3D11 *p)
++{
++    int i;
++    FFP_REL(p->acrylic_source_srv);
++    FFP_REL(p->acrylic_source);
++    for (i = 0; i < 2; i++) {
++        FFP_REL(p->acrylic_small_srv[i]);
++        FFP_REL(p->acrylic_small_rtv[i]);
++        FFP_REL(p->acrylic_small[i]);
++    }
++    p->acrylic_w = p->acrylic_h = p->acrylic_small_w = p->acrylic_small_h = 0;
++}
++
++static int ffp_acrylic_surface_ensure(FFPD3D11 *p, int w, int h, char *err, size_t n)
++{
++    D3D11_SHADER_RESOURCE_VIEW_DESC sd;
++    D3D11_RENDER_TARGET_VIEW_DESC rd;
++    uint8_t *noise = NULL;
++    int i;
++    HRESULT hr;
++
++    if (p->acrylic_w == w && p->acrylic_h == h && p->acrylic_source && p->acrylic_source_srv &&
++        p->acrylic_small[0] && p->acrylic_small_srv[0] && p->acrylic_small_rtv[0] &&
++        p->acrylic_small[1] && p->acrylic_small_srv[1] && p->acrylic_small_rtv[1] &&
++        p->acrylic_noise && p->acrylic_noise_srv)
++        return 0;
++    ffp_acrylic_surface_free(p);
++    p->acrylic_small_w = FFMAX(1, (w + 3) / 4);
++    p->acrylic_small_h = FFMAX(1, (h + 3) / 4);
++    p->acrylic_source = ffp_make_tex(p->dev, w, h, DXGI_FORMAT_B8G8R8A8_UNORM,
++                                      D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0, NULL, 0);
++    if (!p->acrylic_source) { ffp_set_err(err, n, "Acrylic source texture creation failed", E_OUTOFMEMORY); goto fail; }
++    memset(&sd, 0, sizeof(sd));
++    sd.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
++    sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
++    sd.Texture2D.MipLevels = 1;
++    hr = p->dev->lpVtbl->CreateShaderResourceView(p->dev, (ID3D11Resource *)p->acrylic_source, &sd,
++                                                   &p->acrylic_source_srv);
++    if (FAILED(hr)) { ffp_set_err(err, n, "CreateShaderResourceView(Acrylic source)", hr); goto fail; }
++    memset(&rd, 0, sizeof(rd));
++    rd.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
++    rd.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
++    for (i = 0; i < 2; i++) {
++        p->acrylic_small[i] = ffp_make_tex(p->dev, p->acrylic_small_w, p->acrylic_small_h,
++                                            DXGI_FORMAT_B8G8R8A8_UNORM, D3D11_USAGE_DEFAULT,
++                                            D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE, 0, NULL, 0);
++        if (!p->acrylic_small[i]) { ffp_set_err(err, n, "Acrylic blur texture creation failed", E_OUTOFMEMORY); goto fail; }
++        hr = p->dev->lpVtbl->CreateRenderTargetView(p->dev, (ID3D11Resource *)p->acrylic_small[i], &rd,
++                                                    &p->acrylic_small_rtv[i]);
++        if (FAILED(hr)) { ffp_set_err(err, n, "CreateRenderTargetView(Acrylic blur)", hr); goto fail; }
++        hr = p->dev->lpVtbl->CreateShaderResourceView(p->dev, (ID3D11Resource *)p->acrylic_small[i], &sd,
++                                                       &p->acrylic_small_srv[i]);
++        if (FAILED(hr)) { ffp_set_err(err, n, "CreateShaderResourceView(Acrylic blur)", hr); goto fail; }
++    }
++    if (!p->acrylic_noise) {
++        uint32_t state = 0x9e3779b9u;
++        noise = av_malloc(256u * 256u);
++        if (!noise) { ffp_set_err(err, n, "Acrylic noise allocation failed", E_OUTOFMEMORY); goto fail; }
++        for (i = 0; i < 256 * 256; i++) {
++            state ^= state << 13;
++            state ^= state >> 17;
++            state ^= state << 5;
++            noise[i] = (uint8_t)(state >> 24);
++        }
++        p->acrylic_noise = ffp_make_tex(p->dev, 256, 256, DXGI_FORMAT_R8_UNORM,
++                                         D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0, noise, 256);
++        av_freep(&noise);
++        if (!p->acrylic_noise) { ffp_set_err(err, n, "Acrylic noise texture creation failed", E_OUTOFMEMORY); goto fail; }
++    }
++    if (!p->acrylic_noise_srv) {
++        memset(&sd, 0, sizeof(sd));
++        sd.Format = DXGI_FORMAT_R8_UNORM;
++        sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
++        sd.Texture2D.MipLevels = 1;
++        hr = p->dev->lpVtbl->CreateShaderResourceView(p->dev, (ID3D11Resource *)p->acrylic_noise, &sd,
++                                                       &p->acrylic_noise_srv);
++        if (FAILED(hr)) { ffp_set_err(err, n, "CreateShaderResourceView(Acrylic noise)", hr); goto fail; }
++    }
++    p->acrylic_w = w;
++    p->acrylic_h = h;
++    return 0;
++fail:
++    av_free(noise);
++    ffp_acrylic_surface_free(p);
++    return -1;
++}
++
++static void ffp_acrylic_draw(FFPD3D11 *p, ID3D11RenderTargetView *rtv, ID3D11PixelShader *ps,
++                             ID3D11ShaderResourceView **srvs, UINT srv_count, int w, int h,
++                             const FFPAcrylicCB *cb, const RECT *scissor)
++{
++    static const FLOAT blend_factor[4] = { 0, 0, 0, 0 };
++    ID3D11ShaderResourceView *null_srvs[2] = { NULL, NULL };
++    ID3D11Buffer *null_cb = NULL;
++    D3D11_VIEWPORT vp;
++
++    vp.TopLeftX = vp.TopLeftY = 0;
++    vp.Width = (FLOAT)w;
++    vp.Height = (FLOAT)h;
++    vp.MinDepth = 0;
++    vp.MaxDepth = 1;
++    p->ctx->lpVtbl->RSSetState(p->ctx, scissor ? p->acrylic_renderer.scissor_raster : p->acrylic_renderer.raster);
++    p->ctx->lpVtbl->RSSetViewports(p->ctx, 1, &vp);
++    if (scissor)
++        p->ctx->lpVtbl->RSSetScissorRects(p->ctx, 1, scissor);
++    p->ctx->lpVtbl->IASetInputLayout(p->ctx, NULL);
++    p->ctx->lpVtbl->IASetPrimitiveTopology(p->ctx, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
++    p->ctx->lpVtbl->VSSetShader(p->ctx, p->acrylic_renderer.vs, NULL, 0);
++    p->ctx->lpVtbl->GSSetShader(p->ctx, NULL, NULL, 0);
++    p->ctx->lpVtbl->HSSetShader(p->ctx, NULL, NULL, 0);
++    p->ctx->lpVtbl->DSSetShader(p->ctx, NULL, NULL, 0);
++    p->ctx->lpVtbl->PSSetShader(p->ctx, ps, NULL, 0);
++    p->ctx->lpVtbl->PSSetSamplers(p->ctx, 0, 1, &p->acrylic_renderer.sampler);
++    p->ctx->lpVtbl->PSSetConstantBuffers(p->ctx, 0, 1, &p->acrylic_renderer.constants);
++    p->ctx->lpVtbl->PSSetShaderResources(p->ctx, 0, srv_count, srvs);
++    p->ctx->lpVtbl->OMSetBlendState(p->ctx, NULL, blend_factor, 0xffffffffu);
++    p->ctx->lpVtbl->OMSetRenderTargets(p->ctx, 1, &rtv, NULL);
++    p->ctx->lpVtbl->UpdateSubresource(p->ctx, (ID3D11Resource *)p->acrylic_renderer.constants, 0, NULL, cb, 0, 0);
++    p->ctx->lpVtbl->Draw(p->ctx, 3, 0);
++    p->ctx->lpVtbl->PSSetShaderResources(p->ctx, 0, 2, null_srvs);
++    p->ctx->lpVtbl->PSSetConstantBuffers(p->ctx, 0, 1, &null_cb);
++    p->ctx->lpVtbl->OMSetRenderTargets(p->ctx, 0, NULL, NULL);
++}
++
++static void ffp_acrylic_timer_free(FFPD3D11 *p)
++{
++    int i;
++    for (i = 0; i < (int)(sizeof(p->acrylic_timers) / sizeof(p->acrylic_timers[0])); i++) {
++        FFP_REL(p->acrylic_timers[i].disjoint);
++        FFP_REL(p->acrylic_timers[i].begin);
++        FFP_REL(p->acrylic_timers[i].end);
++        p->acrylic_timers[i].pending = 0;
++    }
++}
++
++static int ffp_acrylic_timer_ensure(FFPD3D11 *p)
++{
++    D3D11_QUERY_DESC qd;
++    int i;
++    if (p->acrylic_timer_unavailable)
++        return -1;
++    for (i = 0; i < (int)(sizeof(p->acrylic_timers) / sizeof(p->acrylic_timers[0])); i++) {
++        FFPAcrylicTimer *t = &p->acrylic_timers[i];
++        HRESULT hr;
++        if (t->disjoint && t->begin && t->end)
++            continue;
++        memset(&qd, 0, sizeof(qd));
++        qd.Query = D3D11_QUERY_TIMESTAMP_DISJOINT;
++        hr = p->dev->lpVtbl->CreateQuery(p->dev, &qd, &t->disjoint);
++        if (FAILED(hr)) goto fail;
++        qd.Query = D3D11_QUERY_TIMESTAMP;
++        hr = p->dev->lpVtbl->CreateQuery(p->dev, &qd, &t->begin);
++        if (FAILED(hr)) goto fail;
++        hr = p->dev->lpVtbl->CreateQuery(p->dev, &qd, &t->end);
++        if (FAILED(hr)) goto fail;
++    }
++    return 0;
++fail:
++    ffp_acrylic_timer_free(p);
++    p->acrylic_timer_unavailable = 1;
++    return -1;
++}
++
++static void ffp_acrylic_timer_poll(FFPD3D11 *p)
++{
++    int i;
++    for (i = 0; i < (int)(sizeof(p->acrylic_timers) / sizeof(p->acrylic_timers[0])); i++) {
++        FFPAcrylicTimer *t = &p->acrylic_timers[i];
++        D3D11_QUERY_DATA_TIMESTAMP_DISJOINT disjoint;
++        UINT64 begin, end;
++        if (t->pending != 2)
++            continue;
++        if (p->ctx->lpVtbl->GetData(p->ctx, (ID3D11Asynchronous *)t->disjoint, &disjoint, sizeof(disjoint), D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK ||
++            p->ctx->lpVtbl->GetData(p->ctx, (ID3D11Asynchronous *)t->begin, &begin, sizeof(begin), D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK ||
++            p->ctx->lpVtbl->GetData(p->ctx, (ID3D11Asynchronous *)t->end, &end, sizeof(end), D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK)
++            continue;
++        if (!disjoint.Disjoint && disjoint.Frequency) {
++            double us = (double)(end - begin) * 1000000.0 / (double)disjoint.Frequency;
++            InterlockedExchange64(&p->acrylic_last_blur_us, (LONG64)llrint(us));
++        }
++        t->pending = 0;
++    }
++}
++
++static int ffp_acrylic_timer_begin(FFPD3D11 *p)
++{
++    unsigned k, count = (unsigned)(sizeof(p->acrylic_timers) / sizeof(p->acrylic_timers[0]));
++    if (ffp_acrylic_timer_ensure(p) < 0)
++        return -1;
++    ffp_acrylic_timer_poll(p);
++    for (k = 0; k < count; k++) {
++        unsigned i = (p->acrylic_timer_next + k) % count;
++        FFPAcrylicTimer *t = &p->acrylic_timers[i];
++        if (t->pending)
++            continue;
++        p->ctx->lpVtbl->Begin(p->ctx, (ID3D11Asynchronous *)t->disjoint);
++        p->ctx->lpVtbl->End(p->ctx, (ID3D11Asynchronous *)t->begin);
++        t->pending = 1;
++        p->acrylic_timer_next = (i + 1) % count;
++        return (int)i;
++    }
++    return -1;
++}
++
++static void ffp_acrylic_timer_end(FFPD3D11 *p, int index)
++{
++    FFPAcrylicTimer *t;
++    if (index < 0 || index >= (int)(sizeof(p->acrylic_timers) / sizeof(p->acrylic_timers[0])))
++        return;
++    t = &p->acrylic_timers[index];
++    p->ctx->lpVtbl->End(p->ctx, (ID3D11Asynchronous *)t->end);
++    p->ctx->lpVtbl->End(p->ctx, (ID3D11Asynchronous *)t->disjoint);
++    t->pending = 2;
++}
++
++static int ffp_acrylic_apply(FFPD3D11 *p, ID3D11Texture2D *bb, ID3D11RenderTargetView *rtv,
++                             int w, int h, char *err, size_t n)
++{
++    FFPAcrylicCB cb;
++    ID3D11ShaderResourceView *srvs[2];
++    int i, timer = -1;
++
++    if (!p->acrylic_region_count)
++        return 0;
++    if (!p->acrylic_renderer_ready) {
++        if (p->acrylic_renderer_unavailable ||
++            ffp_acrylic_renderer_create(p->dev, &p->acrylic_renderer, err, n) < 0) {
++            p->acrylic_renderer_unavailable = 1;
++            goto fail;
++        }
++        p->acrylic_renderer_ready = 1;
++    }
++    if (ffp_acrylic_surface_ensure(p, w, h, err, n) < 0)
++        goto fail;
++    timer = ffp_acrylic_timer_begin(p);
++    p->ctx->lpVtbl->CopyResource(p->ctx, (ID3D11Resource *)p->acrylic_source, (ID3D11Resource *)bb);
++    memset(&cb, 0, sizeof(cb));
++    cb.target[0] = (float)p->acrylic_small_w;
++    cb.target[1] = (float)p->acrylic_small_h;
++    cb.target[2] = 1.0f / cb.target[0];
++    cb.target[3] = 1.0f / cb.target[1];
++    cb.source[0] = (float)w;
++    cb.source[1] = (float)h;
++    cb.source[2] = 1.0f / (float)w;
++    cb.source[3] = 1.0f / (float)h;
++    srvs[0] = p->acrylic_source_srv;
++    ffp_acrylic_draw(p, p->acrylic_small_rtv[0], p->acrylic_renderer.downsample_ps,
++                     srvs, 1, p->acrylic_small_w, p->acrylic_small_h, &cb, NULL);
++
++    cb.target[0] = cb.source[0] = (float)p->acrylic_small_w;
++    cb.target[1] = cb.source[1] = (float)p->acrylic_small_h;
++    cb.target[2] = cb.source[2] = 1.0f / cb.target[0];
++    cb.target[3] = cb.source[3] = 1.0f / cb.target[1];
++    cb.params[2] = 1.0f;
++    cb.params[3] = 0.0f;
++    srvs[0] = p->acrylic_small_srv[0];
++    ffp_acrylic_draw(p, p->acrylic_small_rtv[1], p->acrylic_renderer.blur_ps,
++                     srvs, 1, p->acrylic_small_w, p->acrylic_small_h, &cb, NULL);
++    cb.params[2] = 0.0f;
++    cb.params[3] = 1.0f;
++    srvs[0] = p->acrylic_small_srv[1];
++    ffp_acrylic_draw(p, p->acrylic_small_rtv[0], p->acrylic_renderer.blur_ps,
++                     srvs, 1, p->acrylic_small_w, p->acrylic_small_h, &cb, NULL);
++
++    cb.target[0] = (float)w;
++    cb.target[1] = (float)h;
++    cb.target[2] = 1.0f / (float)w;
++    cb.target[3] = 1.0f / (float)h;
++    cb.source[0] = (float)p->acrylic_small_w;
++    cb.source[1] = (float)p->acrylic_small_h;
++    cb.source[2] = 1.0f / cb.source[0];
++    cb.source[3] = 1.0f / cb.source[1];
++    srvs[0] = p->acrylic_small_srv[0];
++    srvs[1] = p->acrylic_noise_srv;
++    for (i = 0; i < p->acrylic_region_count; i++) {
++        const FFPBackdropRegion *r = &p->acrylic_regions[i];
++        int64_t right = (int64_t)r->x + r->width;
++        int64_t bottom = (int64_t)r->y + r->height;
++        RECT clip;
++        clip.left = (LONG)av_clip(r->x, 0, w);
++        clip.top = (LONG)av_clip(r->y, 0, h);
++        clip.right = (LONG)FFMIN((int64_t)w, FFMAX((int64_t)0, right));
++        clip.bottom = (LONG)FFMIN((int64_t)h, FFMAX((int64_t)0, bottom));
++        if (clip.right <= clip.left || clip.bottom <= clip.top)
++            continue;
++        cb.region[0] = (float)r->x;
++        cb.region[1] = (float)r->y;
++        cb.region[2] = (float)r->width;
++        cb.region[3] = (float)r->height;
++        cb.tint[0] = ((r->tint_color >> 16) & 255) / 255.0f;
++        cb.tint[1] = ((r->tint_color >> 8) & 255) / 255.0f;
++        cb.tint[2] = (r->tint_color & 255) / 255.0f;
++        cb.tint[3] = r->tint_opacity;
++        cb.luminosity[0] = ((r->luminosity_color >> 16) & 255) / 255.0f;
++        cb.luminosity[1] = ((r->luminosity_color >> 8) & 255) / 255.0f;
++        cb.luminosity[2] = (r->luminosity_color & 255) / 255.0f;
++        cb.luminosity[3] = r->luminosity_opacity;
++        cb.params[0] = r->corner_radius;
++        cb.params[1] = r->noise ? 1.0f : 0.0f;
++        cb.params[2] = cb.params[3] = 0.0f;
++        ffp_acrylic_draw(p, rtv, p->acrylic_renderer.composite_ps,
++                         srvs, 2, w, h, &cb, &clip);
++    }
++    ffp_acrylic_timer_end(p, timer);
++    InterlockedIncrement64(&p->acrylic_frames_blurred);
++    return 0;
++fail:
++    InterlockedIncrement64(&p->acrylic_failures);
++    return -1;
++}
++
++static int ffp_acrylic_region_valid(const FFPBackdropRegion *r)
++{
++    if (!r || r->width <= 0 || r->height <= 0 ||
++        (int64_t)r->x + r->width < INT_MIN || (int64_t)r->x + r->width > INT_MAX ||
++        (int64_t)r->y + r->height < INT_MIN || (int64_t)r->y + r->height > INT_MAX ||
++        !isfinite(r->corner_radius) || r->corner_radius < 0.0f ||
++        !isfinite(r->tint_opacity) || r->tint_opacity < 0.0f || r->tint_opacity > 1.0f ||
++        !isfinite(r->luminosity_opacity) || r->luminosity_opacity < 0.0f || r->luminosity_opacity > 1.0f ||
++        (r->noise != 0 && r->noise != 1))
++        return 0;
++    return 1;
++}
++
++static int ffp_backdrop_compare(const FFPBackdropRegion *a, const FFPBackdropRegion *b)
++{
++    return a->z < b->z ? -1 : a->z > b->z ? 1 : 0;
++}
++
++int ffp_d3d11_set_backdrop_regions(FFPD3D11 *p, const FFPBackdropRegion *regions, int count,
++                                   char *err, size_t err_size)
++{
++    int i, j;
++    FFPBackdropRegion key;
++    if (!p || count < 0 || count > FFP_BACKDROP_REGION_MAX || (count && !regions)) {
++        ffp_set_err(err, err_size, "invalid Acrylic region list", E_INVALIDARG);
++        return -1;
++    }
++    for (i = 0; i < count; i++) {
++        if (!ffp_acrylic_region_valid(&regions[i])) {
++            ffp_set_err(err, err_size, "invalid Acrylic region geometry or opacity", E_INVALIDARG);
++            return -1;
++        }
++    }
++    EnterCriticalSection(&p->cs);
++    for (i = 0; i < count; i++) {
++        key = regions[i];
++        j = i;
++        while (j > 0 && ffp_backdrop_compare(&key, &p->acrylic_regions[j - 1]) < 0) {
++            p->acrylic_regions[j] = p->acrylic_regions[j - 1];
++            j--;
++        }
++        p->acrylic_regions[j] = key;
++    }
++    p->acrylic_region_count = count;
++    LeaveCriticalSection(&p->cs);
++    return 0;
++}
++
++void ffp_d3d11_acrylic_stats(const FFPD3D11 *p, FFPD3D11AcrylicStats *out)
++{
++    if (!out) return;
++    memset(out, 0, sizeof(*out));
++    if (!p) return;
++    EnterCriticalSection((CRITICAL_SECTION *)&p->cs);
++    ffp_lock_dev((FFPD3D11 *)p);
++    ffp_acrylic_timer_poll((FFPD3D11 *)p);  /* harvest completed GPU timing without stalling the immediate context */
++    ffp_unlock_dev((FFPD3D11 *)p);
++    out->regions = p->acrylic_region_count;
++    LeaveCriticalSection((CRITICAL_SECTION *)&p->cs);
++    out->frames_blurred = (uint64_t)InterlockedCompareExchange64((LONG64 *)&p->acrylic_frames_blurred, 0, 0);
++    out->failures = (uint64_t)InterlockedCompareExchange64((LONG64 *)&p->acrylic_failures, 0, 0);
++    out->last_blur_us = (uint64_t)InterlockedCompareExchange64((LONG64 *)&p->acrylic_last_blur_us, 0, 0);
++}
++
+ static int ffp_quadrant_color(uint32_t px)
+ {
+     switch (px & 0xFFFFFF) {
+@@ -2756,6 +3303,11 @@ void ffp_d3d11_destroy(FFPD3D11 *p)
+     ffp_overlay_cache_free(&p->overlay[FFP_OVERLAY_CAPTION]);
+     ffp_overlay_cache_free(&p->overlay[FFP_OVERLAY_SUPERIMPOSE]);
+     ffp_overlay_renderer_free(&p->overlay_renderer);
++    ffp_acrylic_surface_free(p);
++    FFP_REL(p->acrylic_noise_srv);
++    FFP_REL(p->acrylic_noise);
++    ffp_acrylic_renderer_free(&p->acrylic_renderer);
++    ffp_acrylic_timer_free(p);
+     FFP_REL(p->overlay_readback_staging);
+     av_freep(&p->overlay_readback_data);
+     av_frame_free(&p->up_frame);
+@@ -3215,6 +3767,7 @@ int ffp_d3d11_display(FFPD3D11 *p, const
+             InterlockedIncrement64(&p->overlay_draw_failures);
+             av_log(NULL, AV_LOG_WARNING, "D3D11 bitmap overlay draw failed: %s\n", err ? err : "unknown error");
+         }
++        (void)ffp_acrylic_apply(p, bb, rtv, p->sc_w, p->sc_h, err, err_size);
+         ffp_overlay_capture_readback(p, bb, p->sc_w, p->sc_h);
+         ffp_unlock_dev(p);
+         FFP_REL(rtv);
+@@ -3262,7 +3815,10 @@ int ffp_d3d11_display(FFPD3D11 *p, const
+             InterlockedIncrement64(&p->overlay_draw_failures);
+             av_log(NULL, AV_LOG_WARNING, "D3D11 bitmap overlay draw failed: %s\n", err ? err : "unknown error");
+         }
+-        if (ret >= 0) ffp_overlay_capture_readback(p, bb, p->sc_w, p->sc_h);
++        if (ret >= 0) {
++            (void)ffp_acrylic_apply(p, bb, rtv, p->sc_w, p->sc_h, err, err_size);
++            ffp_overlay_capture_readback(p, bb, p->sc_w, p->sc_h);
++        }
+         ffp_unlock_dev(p);
+         if (ret < 0 && p->shader_failed && p010_no_vp && !ffp_shader_route(&p->lim, pp)) {
+             /* no shader after all: P010 without video processor P010 input is downloaded and converted */
+@@ -3316,6 +3872,7 @@ int ffp_d3d11_display(FFPD3D11 *p, const
+                 InterlockedIncrement64(&p->overlay_draw_failures);
+                 av_log(NULL, AV_LOG_WARNING, "D3D11 bitmap overlay draw failed: %s\n", err ? err : "unknown error");
+             }
++            (void)ffp_acrylic_apply(p, bb, rtv, p->sc_w, p->sc_h, err, err_size);
+         } else {
+             p->overlay_frame_rects = 0;
+             InterlockedIncrement64(&p->overlay_draw_failures);
+@@ -3657,6 +4214,8 @@ int ffp_d3d11_display(FFPD3D11 *p, const
+ void ffp_d3d11_clear(FFPD3D11 *p) {}
+ int ffp_d3d11_set_overlay(FFPD3D11 *p, int l, const FFPOverlayLayer *o, char *e, size_t n) { return -1; }
+ void ffp_d3d11_overlay_stats(const FFPD3D11 *p, FFPD3D11OverlayStats *s) { if (s) memset(s, 0, sizeof(*s)); }
++int ffp_d3d11_set_backdrop_regions(FFPD3D11 *p, const FFPBackdropRegion *r, int c, char *e, size_t n) { return -1; }
++void ffp_d3d11_acrylic_stats(const FFPD3D11 *p, FFPD3D11AcrylicStats *s) { if (s) memset(s, 0, sizeof(*s)); }
+ void ffp_d3d11_readback_test_enable(FFPD3D11 *p, int e) {}
+ int ffp_d3d11_readback_last(FFPD3D11 *p, uint8_t **o, int *w, int *h, int *s, char *e, size_t n) { return -1; }
+ int ffp_d3d11_snapshot(FFPD3D11 *p, const AVFrame *f, const FFPPresParams *pp, uint8_t **o, int *w, int *h, int *s,
+--- a/fftools/ffplay_presenter.h
++++ b/fftools/ffplay_presenter.h
+@@ -31,6 +31,7 @@
+ #include "libavutil/bprint.h"
+ #include "libavutil/buffer.h"
+ #include "libavutil/frame.h"
++#include "ffplay.h"
+ 
+ /* Presenter parameters (ffp_set_presenter_params). The same meaning as the filter chain
+  * transpose -> hflip/vflip -> eq: rotation is clockwise, flips are applied after the rotation. */
+@@ -188,6 +189,18 @@ typedef struct FFPD3D11OverlayStats {
+     uint64_t readback_rects;         /* overlay rects drawn into the latest captured frame; consistent with readback_seq */
+ } FFPD3D11OverlayStats;
+ 
++typedef struct FFPD3D11AcrylicStats {
++    int regions;
++    uint64_t frames_blurred;
++    uint64_t failures;
++    uint64_t last_blur_us;
++} FFPD3D11AcrylicStats;
++
++/* Replaces the current rounded backdrop-region set; count=0 disables the blur. */
++int ffp_d3d11_set_backdrop_regions(FFPD3D11 *p, const FFPBackdropRegion *regions, int count,
++                                   char *err, size_t err_size);
++void ffp_d3d11_acrylic_stats(const FFPD3D11 *p, FFPD3D11AcrylicStats *out);
++
+ /* Replaces a layer when its generation or canvas dimensions change; visibility
+  * can change independently while an indefinite cue remains cached. */
+ int ffp_d3d11_set_overlay(FFPD3D11 *p, int layer, const FFPOverlayLayer *overlay,

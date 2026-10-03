@@ -1,0 +1,93 @@
+diff --git a/docker-build-win64.sh b/docker-build-win64.sh
+--- a/docker-build-win64.sh
++++ b/docker-build-win64.sh
+@@ -498,20 +498,34 @@ meson setup dav1d dav1d_build \
+ meson configure dav1d_build
+ ninja -j$(nproc) -C dav1d_build install
+ 
+-# FDK-AAC-STRIPPED
+-git clone -b stripped5 --depth=1 https://gitlab.freedesktop.org/wtaymans/fdk-aac-stripped.git
+-pushd fdk-aac-stripped
+-./autogen.sh
+-./configure \
+-    --prefix=${FF_DEPS_PREFIX} \
+-    --host=${FF_TOOLCHAIN} \
+-    --disable-{silent-rules,shared} \
+-    --enable-static \
+-    CFLAGS="-O3 -DNDEBUG" \
+-    CXXFLAGS="-O3 -DNDEBUG"
++# SDL2 (static; needed by ffplay/libffplay)
++# HAVE_CTYPE_H=OFF: SDL would call msvcrt-missing isblank() (undefined __imp_isblank at link)
++sdl2_ver="2.32.8"
++sdl2_link="https://github.com/libsdl-org/SDL/releases/download/release-${sdl2_ver}/SDL2-${sdl2_ver}.tar.gz"
++mkdir sdl2
++pushd sdl2
++wget ${sdl2_link} -O sdl2.tar.gz
++tar xaf sdl2.tar.gz
++pushd SDL2-${sdl2_ver}
++mkdir build
++pushd build
++cmake \
++    -DCMAKE_TOOLCHAIN_FILE=${FF_CMAKE_TOOLCHAIN} \
++    -DCMAKE_INSTALL_PREFIX=${FF_DEPS_PREFIX} \
++    -DCMAKE_BUILD_TYPE=Release \
++    -DSDL_SHARED=OFF \
++    -DSDL_STATIC=ON \
++    -DSDL_STATIC_PIC=ON \
++    -DSDL_TEST=OFF \
++    -DSDL_TESTS=OFF \
++    -DSDL_INSTALL_TESTS=OFF \
++    -DHAVE_CTYPE_H=OFF \
++    ..
+ make -j$(nproc)
+ make install
+ popd
++popd
++popd
+ 
+ # OpenCL headers
+ git clone -b v2023.04.17 --depth=1 https://github.com/KhronosGroup/OpenCL-Headers.git
+@@ -602,10 +616,10 @@ fi
+     ${FF_TARGET_FLAGS} \
+     --extra-version=Jellyfin \
+     --disable-unstable \
+-    --disable-ffplay \
++    --enable-ffplay \
+     --disable-debug \
+     --disable-doc \
+-    --disable-sdl2 \
++    --enable-sdl2 \
+     --disable-w32threads \
+     --enable-pthreads \
+     --enable-shared \
+@@ -637,7 +651,7 @@ fi
+     --enable-libx265 \
+     --enable-libsvtav1 \
+     --enable-libdav1d \
+-    --enable-libfdk-aac \
++    --disable-libfdk-aac \
+     --enable-opencl \
+     --enable-dxva2 \
+     --enable-d3d11va \
+@@ -659,6 +673,21 @@ mkdir -p ${ARTIFACT_DIR}/zip
+ pushd ${FF_PREFIX}/bin
+ ffpackage="jellyfin-ffmpeg_${ffversion}-portable_win64"
+ zip -9 -r ${ARTIFACT_DIR}/zip/${ffpackage}.zip ./*.{exe,dll}
++popd
++
++# ffplay package: libffplay.dll + import lib + header, ffplay.exe and every
++# av*/sw* dll (consumed by the windows-video-player build).
++ffplay_pkgdir="$(mktemp -d)"
++cp ${FF_PREFIX}/bin/*.exe ${FF_PREFIX}/bin/*.dll "${ffplay_pkgdir}/"
++for f in ${FF_PREFIX}/lib/libffplay.dll.a ${FF_PREFIX}/include/libffplay/ffplay.h; do
++    if [[ -f "${f}" ]]; then
++        cp "${f}" "${ffplay_pkgdir}/"
++    else
++        echo "WARNING: ${f} missing (source patch 1009-libffplay-core-api not applied?)"
++    fi
++done
++pushd "${ffplay_pkgdir}"
++zip -9 -r ${ARTIFACT_DIR}/zip/jellyfin-ffmpeg_${ffversion}-ffplay_win64.zip ./*
+ pushd ${ARTIFACT_DIR}/zip
+ chown -Rc $(stat -c %u:%g ${ARTIFACT_DIR}) ${ARTIFACT_DIR}
+ popd

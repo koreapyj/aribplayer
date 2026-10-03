@@ -1,0 +1,50 @@
+--- a/libavformat/mpegts.c
++++ b/libavformat/mpegts.c
+@@ -2355,24 +2355,32 @@ int ff_parse_mpeg2_descriptor(AVFormatCo
+             // Vol. 3, Section 2, 4.2.8.1
+             int actual_component_tag = sti->stream_identifier - 1;
+             int picked_profile = AV_PROFILE_UNKNOWN;
++            int is_superimpose = 0;
+             int data_component_id = get16(pp, desc_end);
+             if (data_component_id < 0)
+                 return AVERROR_INVALIDDATA;
+ 
+             switch (data_component_id) {
+             case 0x0008:
+-                // [0x30..0x37] are component tags utilized for
+-                // non-mobile captioning service ("profile A").
++                // [0x30..0x37] are caption and [0x38..0x3f] are
++                // superimpose tags for non-mobile service ("profile A").
+                 if (actual_component_tag >= 0x30 &&
+                     actual_component_tag <= 0x37) {
+                     picked_profile = AV_PROFILE_ARIB_PROFILE_A;
++                } else if (actual_component_tag >= 0x38 &&
++                           actual_component_tag <= 0x3f) {
++                    picked_profile = AV_PROFILE_ARIB_PROFILE_A;
++                    is_superimpose = 1;
+                 }
+                 break;
+             case 0x0012:
+-                // component tag 0x87 signifies a mobile/partial reception
+-                // (1seg) captioning service ("profile C").
++                // Component tags 0x87 and 0x88 indicate caption and
++                // superimpose services for mobile/partial reception ("profile C").
+                 if (actual_component_tag == 0x87) {
+                     picked_profile = AV_PROFILE_ARIB_PROFILE_C;
++                } else if (actual_component_tag == 0x88) {
++                    picked_profile = AV_PROFILE_ARIB_PROFILE_C;
++                    is_superimpose = 1;
+                 }
+                 break;
+             default:
+@@ -2390,6 +2398,10 @@ int ff_parse_mpeg2_descriptor(AVFormatCo
+             }
+             sti->request_probe = 0;
+             sti->need_parsing = 0;
++            av_dict_set(&st->metadata, "arib_type",
++                        is_superimpose ? "superimpose" : "caption", 0);
++            av_dict_set_int(&st->metadata, "component_tag",
++                            actual_component_tag, 0);
+         }
+         break;
+     case DOVI_VIDEO_STREAM_DESCRIPTOR:

@@ -1,0 +1,135 @@
+--- a/libavutil/buffer.c
++++ b/libavutil/buffer.c
+@@ -342,15 +342,27 @@ void av_buffer_pool_uninit(AVBufferPool
+         buffer_pool_free(pool);
+ }
+ 
++void ff_buffer_pool_set_recycle(AVBufferPool *pool,
++                                int (*recycle)(void *opaque, uint8_t *data))
++{
++    pool->recycle = recycle;
++}
++
+ static void pool_release_buffer(void *opaque, uint8_t *data)
+ {
+     BufferPoolEntry *buf = opaque;
+     AVBufferPool *pool = buf->pool;
+ 
+-    ff_mutex_lock(&pool->mutex);
+-    buf->next = pool->pool;
+-    pool->pool = buf;
+-    ff_mutex_unlock(&pool->mutex);
++    /* Retired CUDA graphics mappings must never reach the decoder again. */
++    if (pool->recycle && !pool->recycle(pool->opaque, data)) {
++        buf->free(buf->opaque, buf->data);
++        av_free(buf);
++    } else {
++        ff_mutex_lock(&pool->mutex);
++        buf->next = pool->pool;
++        pool->pool = buf;
++        ff_mutex_unlock(&pool->mutex);
++    }
+ 
+     if (atomic_fetch_sub_explicit(&pool->refcount, 1, memory_order_acq_rel) == 1)
+         buffer_pool_free(pool);
+--- a/libavutil/buffer_internal.h
++++ b/libavutil/buffer_internal.h
+@@ -105,6 +105,12 @@ struct AVBufferPool {
+     AVBufferRef* (*alloc)(size_t size);
+     AVBufferRef* (*alloc2)(void *opaque, size_t size);
+     void         (*pool_free)(void *opaque);
++    int          (*recycle)(void *opaque, uint8_t *data);
+ };
+ 
++/* Internal: reject an entry at final release instead of recycling it. Configure
++ * before any buffer is issued; predicate must be thread-safe. */
++void ff_buffer_pool_set_recycle(AVBufferPool *pool,
++                                int (*recycle)(void *opaque, uint8_t *data));
++
+ #endif /* AVUTIL_BUFFER_INTERNAL_H */
+--- a/libavutil/hwcontext_cuda.c
++++ b/libavutil/hwcontext_cuda.c
+@@ -17,6 +17,7 @@
+  */
+ 
+ #include "buffer.h"
++#include "buffer_internal.h"
+ #include "common.h"
+ #include "hwcontext.h"
+ #include "hwcontext_internal.h"
+@@ -140,6 +141,31 @@ fail:
+     return ret;
+ }
+ 
++/* libffplay extension: the optional host pool supplies CUDA-visible linear
++ * memory. av_buffer_pool_init2 passes the original frame context as opaque. */
++static int cuda_host_pool_recycle(void *opaque, uint8_t *data)
++{
++    AVHWFramesContext *ctx = opaque;
++    AVCUDADeviceContext *hwctx = ctx->device_ctx->hwctx;
++    return hwctx->pool_recycle(hwctx->pool_alloc_opaque, data);
++}
++
++static AVBufferRef *cuda_host_pool_alloc(void *opaque, size_t size)
++{
++    AVHWFramesContext *ctx = opaque;
++    AVCUDADeviceContext *hwctx = ctx->device_ctx->hwctx;
++    CUDAFramesContext *priv = ctx->hwctx;
++    AVBufferRef *buf = hwctx->pool_alloc(hwctx->pool_alloc_opaque, ctx, size);
++    /* av_image_fill_arrays() lays out the complete aligned image inside this
++     * buffer. Reject invalid host allocations before a decoder writes to them. */
++    if (buf && (!buf->data || buf->size < size ||
++                (uintptr_t)buf->data % priv->tex_alignment)) {
++        av_log(ctx, AV_LOG_ERROR, "Invalid CUDA host pool allocation (size or texture alignment)\n");
++        av_buffer_unref(&buf);
++    }
++    return buf;
++}
++
+ static int cuda_frames_init(AVHWFramesContext *ctx)
+ {
+     AVHWDeviceContext *device_ctx = ctx->device_ctx;
+@@ -180,9 +206,12 @@ static int cuda_frames_init(AVHWFramesCo
+             return size;
+ 
+         ffhwframesctx(ctx)->pool_internal =
+-            av_buffer_pool_init2(size, ctx, cuda_pool_alloc, NULL);
++            av_buffer_pool_init2(size, ctx, hwctx->pool_alloc ? cuda_host_pool_alloc : cuda_pool_alloc, NULL);
+         if (!ffhwframesctx(ctx)->pool_internal)
+             return AVERROR(ENOMEM);
++        if (hwctx->pool_alloc && hwctx->pool_recycle)
++            ff_buffer_pool_set_recycle(ffhwframesctx(ctx)->pool_internal,
++                                       cuda_host_pool_recycle);
+     }
+ 
+     return 0;
+--- a/libavutil/hwcontext_cuda.h
++++ b/libavutil/hwcontext_cuda.h
+@@ -25,6 +25,10 @@
+ #endif
+ 
+ #include "pixfmt.h"
++#include "buffer.h"
++
++/* Avoid requiring callers to include hwcontext.h before this header. */
++typedef struct AVHWFramesContext AVHWFramesContext;
+ 
+ /**
+  * @file
+@@ -43,6 +47,16 @@ typedef struct AVCUDADeviceContext {
+     CUcontext cuda_ctx;
+     CUstream stream;
+     AVCUDADeviceContextInternal *internal;
++    /** libffplay extension: optional allocator for internally-created CUDA frame
++     * pools. Called with the frames context and the allocation size (including
++     * FFmpeg's pitch/alignment padding). The returned AVBufferRef must contain a
++     * linear CUdeviceptr in data and remain valid until its free callback runs.
++     * NULL keeps the upstream cuMemAlloc behaviour; user-supplied pools win. */
++    AVBufferRef *(*pool_alloc)(void *opaque, AVHWFramesContext *fc, size_t size);
++    void *pool_alloc_opaque;
++    /** Optional libffplay internal pool recycling predicate. Return zero to
++     * release a retired allocation instead of returning it to the pool. */
++    int (*pool_recycle)(void *opaque, uint8_t *data);
+ } AVCUDADeviceContext;
+ 
+ /**

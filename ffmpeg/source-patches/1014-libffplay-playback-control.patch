@@ -1,0 +1,2031 @@
+--- a/fftools/ffplay.c
++++ b/fftools/ffplay.c
+@@ -109,8 +109,9 @@
+ 
+ /* Minimum SDL audio buffer size, in samples. */
+ #define SDL_AUDIO_MIN_BUFFER_SIZE 512
+-/* Calculate actual buffer size keeping in mind not cause too frequent audio callbacks */
+-#define SDL_AUDIO_MAX_CALLBACKS_PER_SEC 30
++/* Calculate actual buffer size keeping in mind not cause too frequent audio callbacks. About 10 ms (512 samples at 48 kHz):
++ * every buffered callback is audio that still plays after a pause and delays a resume. */
++#define SDL_AUDIO_MAX_CALLBACKS_PER_SEC 100
+ 
+ /* Step size for volume control in dB */
+ #define SDL_VOLUME_STEP (0.75)
+@@ -189,6 +190,7 @@ typedef struct Clock {
+ 
+ typedef struct FrameData {
+     int64_t pkt_pos;
++    int64_t source_pts; /* decoder PTS before IVTC or another output-timing filter */
+ } FrameData;
+ 
+ /* Common struct for handling all types of decoded data and allocated render buffers. */
+@@ -364,6 +366,7 @@ typedef struct FFPOptions {
+     int display_disable, borderless, alwaysontop;
+     int fullscreen;
+     int show_status;
++    int frame_trace;
+     int av_sync_type;
+     int64_t start_time, duration;
+     int fast, genpts, lowres, decoder_reorder_pts;
+@@ -388,6 +391,7 @@ typedef struct FFPOptions {
+     char *presenter_debug_cuda_copy; /* tests only: disable CUDA pool hook, retain GPU plane-copy fallback */
+     char *presenter_debug_cuda_readdress; /* tests only: retire every Nth direct buffer after remap */
+     int presenter_debug_srv_fail;   /* tests only: the first N decoder pools with SHADER_RESOURCE fail to be created */
++    int start_paused;               /* open paused: present the landing frame, start audio and the clocks only on play */
+     char *presenter_debug_fail;     /* tests only: "1"/"display": the d3d11 presenter fails at its first display, "init": at creation */
+     AVDictionary *format_opts, *codec_opts, *sws_dict, *swr_opts;
+ } FFPOptions;
+@@ -413,6 +417,23 @@ typedef struct FFPFpsMeter {
+     int64_t total;
+ } FFPFpsMeter;
+ 
++typedef struct FFPDebugFrameMark {
++    double pts;
++    int serial;
++    int64_t at_us;
++} FFPDebugFrameMark;
++
++#define FFP_FRAME_TRACE_RING 512
++typedef struct FFPDebugFrameEvent {
++    int type, serial;
++    int64_t count, at_us;
++    double pts;
++    int dxgi_valid;
++    uint32_t dxgi_present_count, dxgi_sync_refresh_count;
++    uint64_t dxgi_sync_qpc_time, dxgi_sync_gpu_time;
++    uint64_t d3d_gpu_total_us, d3d_gpu_frames, d3d_gpu_last_us;
++} FFPDebugFrameEvent;
++
+ typedef struct FFPDebugSubtitle {
+     int open, stream_index, is_arib;
+     int ignore_background, force_outline;
+@@ -433,6 +454,20 @@ typedef struct FFPDebug {
+     AVRational v_flt_fr, v_flt_tb;
+     int v_flt_valid;
+     FFPFpsMeter fps_dec, fps_flt, fps_disp;
++    FFPDebugFrameMark decoded, filtered, presented, early_drop, late_drop, presenter_drop;
++    int dxgi_valid;
++    uint32_t dxgi_present_count, dxgi_present_refresh_count, dxgi_sync_refresh_count;
++    uint64_t dxgi_sync_qpc_time, dxgi_sync_gpu_time;
++    uint64_t d3d_gpu_total_us, d3d_gpu_frames, d3d_gpu_last_us;
++    int64_t presenter_drop_count, audio_frames_total;
++    int seek_debug_valid, seek_direction;
++    int seek_intent_valid;           /* the latest seek was a user seek (not the bounded reverse-step scan) */
++    int seek_debug_pending, seek_debug_serial;
++    double seek_requested_s, seek_keyframe_s, seek_gop_s;
++    double source_keyframe_s;
++    int source_keyframe_serial;
++    FFPDebugFrameEvent frame_trace[FFP_FRAME_TRACE_RING];
++    int frame_trace_head, frame_trace_count;
+     int v_open, v_index;
+     char v_codec[64], v_decoder[64];
+     char v_hw_requested[32], v_hw_device[32], v_hw_error[256];
+@@ -482,6 +517,13 @@ typedef struct VideoState {
+     int seek_flags;
+     int64_t seek_pos;
+     int64_t seek_rel;
++    int seek_bounds_set;
++    int64_t seek_min, seek_max;
++    int64_t last_user_seek_at_us;  /* preserve requested, not snapped, origin during key repeat */
++    double seek_key_lead_s;         /* read thread: pts - dts of recent video key packets */
++    double seek_gop_est_s;          /* read thread: recent key packet pts interval */
++    double seek_prev_key_pts_s;
++    int seek_prev_key_valid;
+     int read_pause_return;
+     AVFormatContext *ic;
+     int realtime;
+@@ -489,6 +531,12 @@ typedef struct VideoState {
+     Clock audclk;
+     Clock vidclk;
+     Clock extclk;
++    SDL_atomic_t seek_audio_align_pending;
++    SDL_atomic_t seek_audio_video_serial;
++    SDL_atomic_t seek_audio_offset_ms;      /* audio dropped to reach the first post-seek video keyframe */
++    SDL_atomic_t seek_audio_keyframe_ready;
++    volatile int64_t seek_audio_align_since_us;
++    SDL_atomic_t seek_audio_video_pts_ms;
+ 
+     FrameQueue pictq;
+     FrameQueue sampq;
+@@ -516,6 +564,19 @@ typedef struct VideoState {
+     unsigned int audio_buf1_size;
+     int audio_buf_index; /* in bytes */
+     int audio_write_buf_size;
++    int aout_gain;                  /* pause / resume fade position in frames: 0 silent .. 5 ms full (audio callback only) */
++    /* pause / resume latency of the last ffp_pause / ffp_play / ffp_toggle_pause (debug info "pause_timing"), all
++     * av_gettime_relative() us, 0 = not yet. Written by the loop thread (command, frames) and the audio callback. */
++    int pt_want;                    /* 1 pause, 0 resume, -1 none yet */
++    int64_t pt_api_us;
++    int64_t pt_apply_us;
++    int64_t pt_state_us;
++    int64_t pt_last_frame_us;
++    int pt_frames_after;
++    int64_t pt_first_frame_us;
++    volatile int64_t pt_audio_last_end_us;   /* end of the last real (decoded) audio handed to the device */
++    volatile int64_t pt_audio_first_us;      /* start of the first real audio handed to the device after the apply */
++    volatile int64_t pt_audio_after_bytes;   /* real audio bytes handed to the device after the apply */
+     struct AudioParams audio_src;
+     struct AudioParams audio_filter_src;
+     struct AudioParams audio_tgt;
+@@ -553,6 +614,20 @@ typedef struct VideoState {
+     char *filename;
+     int width, height, xleft, ytop;
+     int step;
++    int api_step_pending;             /* loop thread: wait for the stepped output frame to be presented */
++    int step_position_pending;        /* loop thread: emit an immediate final position event */
++    int api_step_dir;                 /* loop thread: direction of the API step in flight */
++    SDL_atomic_t api_step_active;     /* suppress input-frame drops during an API step */
++    SDL_atomic_t step_silence;        /* mute audio while video is internally unpaused for stepping */
++    int start_paused_frame;           /* start_paused: the landing frame is still to be presented (loop thread) */
++    double displayed_video_pts;      /* last output PTS successfully presented, in the filter sink time base */
++    double displayed_source_pts;     /* source PTS carried through the filter for GOP-local reverse seeks */
++    double first_video_pts;
++    int reverse_step_state;          /* guarded by ffp->mutex; FFP_REVERSE_STEP_* */
++    int reverse_step_attempt;        /* zero-based retry count; each retry seeks four times further before the displayed frame (0.6, 2.4, 9.6, 38.4 s) */
++    double reverse_step_target;      /* last displayed output PTS; compared after the filter graph */
++    int64_t reverse_step_seek_ts;    /* source keyframe timestamp for bounded previous-frame decode */
++    int reverse_step_source_seen;
+ 
+     AVFilterContext *in_video_filter;   // the first filter in the video chain
+     AVFilterContext *out_video_filter;  // the last filter in the video chain
+@@ -602,6 +677,14 @@ typedef struct VideoState {
+ #define FFP_CMD_CYCLE    6   /* i: media type */
+ #define FFP_CMD_SUB_VISIBLE 7  /* i: subtitle layer, d: visible */
+ #define FFP_CMD_REFRESH_CAPTION_STYLE 8 /* i: ignore_background | (force_outline << 1) */
++#define FFP_CMD_STEP_FRAME 9 /* i: +1 next output frame, -1 previous output frame */
++
++#define FFP_REVERSE_STEP_NONE 0
++#define FFP_REVERSE_STEP_SEEKING 1
++#define FFP_REVERSE_STEP_SCANNING 2
++#define FFP_REVERSE_STEP_RETRY 3
++#define FFP_REVERSE_STEP_FAILED 4
++#define FFP_REVERSE_STEP_QUEUED 5
+ 
+ typedef struct FFPCmd {
+     struct FFPCmd *next;
+@@ -684,6 +767,8 @@ struct FFPlayer {
+     int64_t cursor_last_shown;
+     int cursor_hidden;
+     int64_t last_position_event;
++    SDL_atomic_t step_busy;         /* an ffp_step_frame is accepted and its FFP_EVENT_STEP_DONE is not yet emitted */
++    int step_done_pending, step_done_dir, step_done_moved;   /* loop thread: STEP_DONE to emit after the final position event */
+     int mouse_x, mouse_y;
+     int64_t last_left_click;
+     int starving, buffering;
+@@ -2147,6 +2232,7 @@ static int decoder_decode_frame(Decoder
+                     return AVERROR(ENOMEM);
+                 fd = (FrameData*)d->pkt->opaque_ref->data;
+                 fd->pkt_pos = d->pkt->pos;
++                fd->source_pts = AV_NOPTS_VALUE;
+             }
+ 
+             if (avcodec_send_packet(d->avctx, d->pkt) == AVERROR(EAGAIN)) {
+@@ -3411,20 +3497,134 @@ static void ffp_dbg_audio_out(VideoState
+     SDL_free(name);
+ }
+ 
++/* Caller holds dbg_mutex. type: 0 decoded, 1 filtered, 2 presented, 3 early-drop, 4 late-drop, 5 presenter-rejected, 6 audio. */
++static void ffp_dbg_trace_event_locked(FFPDebug *d, int type, int64_t count, double pts, int serial, int64_t at_us,
++                                      int dxgi_valid, uint32_t present_count, uint32_t sync_refresh_count,
++                                      uint64_t sync_qpc_time, uint64_t sync_gpu_time,
++                                      uint64_t gpu_total_us, uint64_t gpu_frames, uint64_t gpu_last_us)
++{
++    FFPDebugFrameEvent *e = &d->frame_trace[d->frame_trace_head];
++    e->type = type;
++    e->count = count;
++    e->pts = pts;
++    e->serial = serial;
++    e->at_us = at_us;
++    e->dxgi_valid = dxgi_valid;
++    e->dxgi_present_count = present_count;
++    e->dxgi_sync_refresh_count = sync_refresh_count;
++    e->dxgi_sync_qpc_time = sync_qpc_time;
++    e->dxgi_sync_gpu_time = sync_gpu_time;
++    e->d3d_gpu_total_us = gpu_total_us;
++    e->d3d_gpu_frames = gpu_frames;
++    e->d3d_gpu_last_us = gpu_last_us;
++    d->frame_trace_head = (d->frame_trace_head + 1) % FFP_FRAME_TRACE_RING;
++    if (d->frame_trace_count < FFP_FRAME_TRACE_RING)
++        d->frame_trace_count++;
++}
++
+ /* one frame passed a stage (0 decoded, 1 left the filter graph, 2 presented); called by the owning thread */
+-static void ffp_dbg_fps_note(VideoState *is, int stage)
++static void ffp_dbg_fps_note(VideoState *is, int stage, double pts, int serial)
+ {
+     FFPDebug *d = &is->dbg;
+     FFPFpsMeter *m = stage == 0 ? &d->fps_dec : stage == 1 ? &d->fps_flt : &d->fps_disp;
++    FFPDebugFrameMark *mark = stage == 0 ? &d->decoded : stage == 1 ? &d->filtered : &d->presented;
++    int dxgi_valid = 0;
++    uint32_t present_count = 0, present_refresh_count = 0, sync_refresh_count = 0;
++    uint64_t sync_qpc_time = 0, sync_gpu_time = 0;
++    uint64_t gpu_total_us = 0, gpu_frames = 0, gpu_last_us = 0;
++    int64_t now_us;
+ 
+     if (!is->dbg_mutex)
+         return;
++    if (stage == 2 && is->ffp->d3d)
++        dxgi_valid = ffp_d3d11_frame_stats(is->ffp->d3d, &present_count, &present_refresh_count,
++                                           &sync_refresh_count, &sync_qpc_time, &sync_gpu_time,
++                                           &gpu_total_us, &gpu_frames, &gpu_last_us);
++    now_us = av_gettime_relative();
+     SDL_LockMutex(is->dbg_mutex);
+-    m->ts[m->head] = av_gettime_relative();
++    m->ts[m->head] = now_us;
+     m->head = (m->head + 1) % FFP_FPS_RING;
+     if (m->count < FFP_FPS_RING)
+         m->count++;
+     m->total++;
++    mark->pts = pts;
++    mark->serial = serial;
++    mark->at_us = now_us;
++    if (stage == 2) {
++        d->dxgi_valid = dxgi_valid;
++        d->dxgi_present_count = present_count;
++        d->dxgi_present_refresh_count = present_refresh_count;
++        d->dxgi_sync_refresh_count = sync_refresh_count;
++        d->dxgi_sync_qpc_time = sync_qpc_time;
++        d->dxgi_sync_gpu_time = sync_gpu_time;
++        d->d3d_gpu_total_us = gpu_total_us;
++        d->d3d_gpu_frames = gpu_frames;
++        d->d3d_gpu_last_us = gpu_last_us;
++    }
++    ffp_dbg_trace_event_locked(d, stage, m->total, pts, serial, now_us,
++                               stage == 2 ? dxgi_valid : 0, present_count, sync_refresh_count,
++                               sync_qpc_time, sync_gpu_time, gpu_total_us, gpu_frames, gpu_last_us);
++    SDL_UnlockMutex(is->dbg_mutex);
++}
++
++static void ffp_dbg_drop_note(VideoState *is, int stage, double pts, int serial)
++{
++    FFPDebug *d = &is->dbg;
++    FFPDebugFrameMark *mark = stage == 0 ? &d->early_drop : stage == 1 ? &d->late_drop : &d->presenter_drop;
++    int64_t count;
++    int64_t now_us;
++    SDL_LockMutex(is->dbg_mutex);
++    if (stage == 2)
++        d->presenter_drop_count++;
++    count = stage == 0 ? is->frame_drops_early : stage == 1 ? is->frame_drops_late : d->presenter_drop_count;
++    now_us = av_gettime_relative();
++    mark->pts = pts;
++    mark->serial = serial;
++    mark->at_us = now_us;
++    ffp_dbg_trace_event_locked(d, stage + 3, count, pts, serial, now_us, 0, 0, 0, 0, 0, 0, 0, 0);
++    SDL_UnlockMutex(is->dbg_mutex);
++}
++
++static void ffp_dbg_audio_note(VideoState *is, double pts, int serial)
++{
++    FFPDebug *d = &is->dbg;
++    int64_t now_us;
++    SDL_LockMutex(is->dbg_mutex);
++    d->audio_frames_total++;
++    now_us = av_gettime_relative();
++    ffp_dbg_trace_event_locked(d, 6, d->audio_frames_total, pts, serial, now_us, 0, 0, 0, 0, 0, 0, 0, 0);
++    SDL_UnlockMutex(is->dbg_mutex);
++}
++
++static void ffp_dbg_seek_frame(VideoState *is, double pts, int serial, int key_frame)
++{
++    FFPDebug *d = &is->dbg;
++    int reverse_state;
++    if (!is->dbg_mutex)
++        return;
++    SDL_LockMutex(is->ffp->mutex);
++    reverse_state = is->reverse_step_state;
++    SDL_UnlockMutex(is->ffp->mutex);
++    SDL_LockMutex(is->dbg_mutex);
++    if (d->seek_debug_pending && (d->seek_debug_serial < 0 || d->seek_debug_serial == serial)) {
++        d->seek_keyframe_s = pts;
++        d->seek_debug_pending = 0;
++    }
++    /* the audio trim's keyframe: only the first frame of the flushed (post-seek) serial, never a late pre-seek frame */
++    if (isfinite(pts) && SDL_AtomicGet(&is->seek_audio_align_pending) && !SDL_AtomicGet(&is->seek_audio_keyframe_ready) &&
++        serial == SDL_AtomicGet(&is->seek_audio_video_serial)) {
++        SDL_AtomicSet(&is->seek_audio_video_pts_ms, (int)lrint(pts * 1000.0));
++        SDL_AtomicSet(&is->seek_audio_keyframe_ready, 1);
++    }
++    if (key_frame && isfinite(pts)) {
++        if (d->source_keyframe_serial == serial && isfinite(d->source_keyframe_s)) {
++            double interval = pts - d->source_keyframe_s;
++            if (interval > 0.0 && interval < 10.0)
++                d->seek_gop_s = interval;
++        }
++        d->source_keyframe_s = pts;
++        d->source_keyframe_serial = serial;
++    }
+     SDL_UnlockMutex(is->dbg_mutex);
+ }
+ 
+@@ -3746,9 +3946,24 @@ static int video_display(VideoState *is)
+ 
+     /* Positive means a stale CUDA frame was skipped, not displayed. */
+     ret = ffp->pres_ops->display(is);
++    if (ret > 0 && is->show_mode == SHOW_MODE_VIDEO && is->video_st) {
++        Frame *vp = frame_queue_peek_last(&is->pictq);
++        ffp_dbg_drop_note(is, 2, vp->pts, vp->serial);
++    }
+     /* a presenter that fails has already switched the player to SDL: draw this picture with SDL */
+     if (ret < 0)
+         ret = g_pres_sdl.display(is);
++    if (ret == 0 && is->show_mode == SHOW_MODE_VIDEO && is->video_st) {
++        Frame *vp = frame_queue_peek_last(&is->pictq);
++        if (vp->serial == is->videoq.serial && !isnan(vp->pts)) {
++            FrameData *fd = vp->frame->opaque_ref ? (FrameData *)vp->frame->opaque_ref->data : NULL;
++            is->displayed_video_pts = vp->pts;
++            is->displayed_source_pts = fd && fd->source_pts != AV_NOPTS_VALUE
++                ? fd->source_pts * av_q2d(is->video_st->time_base) : vp->pts;
++            if (isnan(is->first_video_pts))
++                is->first_video_pts = vp->pts;
++        }
++    }
+     return ret == 0;
+ }
+ 
+@@ -3855,9 +4070,8 @@ static void stream_seek(VideoState *is,
+     if (!is->seek_req) {
+         is->seek_pos = pos;
+         is->seek_rel = rel;
+-        is->seek_flags &= ~AVSEEK_FLAG_BYTE;
+-        if (by_bytes)
+-            is->seek_flags |= AVSEEK_FLAG_BYTE;
++        is->seek_flags = by_bytes ? AVSEEK_FLAG_BYTE : 0;
++        is->seek_bounds_set = 0;
+         is->seek_req = 1;
+         SDL_CondSignal(is->continue_read_thread);
+     }
+@@ -3953,6 +4167,36 @@ static void update_video_pts(VideoState
+     sync_clock_to_slave(&is->extclk, &is->vidclk);
+ }
+ 
++static int ffp_reverse_step_holding(VideoState *is)
++{
++    int state;
++    SDL_LockMutex(is->ffp->mutex);
++    state = is->reverse_step_state;
++    SDL_UnlockMutex(is->ffp->mutex);
++    return state == FFP_REVERSE_STEP_SEEKING || state == FFP_REVERSE_STEP_SCANNING ||
++           state == FFP_REVERSE_STEP_RETRY;
++}
++
++/* Ends the API step in flight (loop thread). ffp_tick emits the final position event and then FFP_EVENT_STEP_DONE. */
++static void ffp_api_step_end(VideoState *is, int moved)
++{
++    FFPlayer *ffp = is->ffp;
++    is->api_step_pending = 0;
++    SDL_AtomicSet(&is->api_step_active, 0);
++    is->step_position_pending = 1;
++    ffp->step_done_dir = is->api_step_dir;
++    ffp->step_done_moved = moved;
++    ffp->step_done_pending = 1;
++}
++
++static void ffp_emit_step_done(FFPlayer *ffp, int direction, int moved)
++{
++    char json[64];
++    snprintf(json, sizeof(json), "{\"direction\":%d,\"moved\":%d}", direction, moved);
++    SDL_AtomicSet(&ffp->step_busy, 0);
++    ffp_emit(ffp, FFP_EVENT_STEP_DONE, json);
++}
++
+ /* master clock difference audio vs video in seconds, exactly as the -stats status line shows it */
+ static double ffp_av_diff(VideoState *is)
+ {
+@@ -4004,9 +4248,27 @@ retry:
+                 goto retry;
+             }
+ 
++            /* Reverse stepping must demux/decode while the public state is paused, but not
++             * consume newly queued pictures until its filtered predecessor is ready. */
++            if (ffp_reverse_step_holding(is))
++                goto display;
++
+             if (lastvp->serial != vp->serial)
+                 is->frame_timer = av_gettime_relative() / 1000000.0;
+ 
++            if (is->paused && is->start_paused_frame) {
++                is->start_paused_frame = 0;
++                is->frame_timer = av_gettime_relative() / 1000000.0;
++                SDL_LockMutex(is->pictq.mutex);
++                if (!isnan(vp->pts))
++                    update_video_pts(is, vp->pts, vp->serial);
++                SDL_UnlockMutex(is->pictq.mutex);
++                frame_queue_next(&is->pictq);
++                is->force_refresh = 1;
++                new_frame = 1;
++                is->step_position_pending = 1;
++                goto display;
++            }
+             if (is->paused)
+                 goto display;
+ 
+@@ -4034,6 +4296,7 @@ retry:
+                 duration = vp_duration(is, vp, nextvp);
+                 if(!is->step && (o->framedrop>0 || (o->framedrop && get_master_sync_type(is) != AV_SYNC_VIDEO_MASTER)) && time > is->frame_timer + duration){
+                     is->frame_drops_late++;
++                    ffp_dbg_drop_note(is, 1, vp->pts, vp->serial);
+                     frame_queue_next(&is->pictq);
+                     goto retry;
+                 }
+@@ -4051,8 +4314,21 @@ display:
+         /* display picture */
+         if (!o->display_disable && is->force_refresh && is->show_mode == SHOW_MODE_VIDEO && is->pictq.rindex_shown) {
+             int displayed = video_display(is);
+-            if (new_frame && displayed)
+-                ffp_dbg_fps_note(is, 2);
++            if (new_frame && displayed) {
++                Frame *presented = frame_queue_peek_last(&is->pictq);
++                ffp_dbg_fps_note(is, 2, presented->pts, presented->serial);
++                is->pt_last_frame_us = av_gettime_relative();
++                if (is->pt_want >= 0 && is->pt_frames_after++ == 0)
++                    is->pt_first_frame_us = is->pt_last_frame_us;
++                if (is->api_step_pending && is->paused) {
++                    ffp_api_step_end(is, 1);
++                    ffp_set_state(is->ffp, FFP_ST_PAUSED, 0);
++                }
++            } else if (new_frame && is->api_step_pending && is->paused && is->step) {
++                /* A presenter may reject a stale frame (notably a retired CUDA import); keep
++                 * stepping until a frame is actually presented. */
++                stream_toggle_pause(is);
++            }
+         }
+     }
+     is->force_refresh = 0;
+@@ -4220,7 +4496,18 @@ static int get_video_frame(VideoState *i
+                 path = FFP_PATH_HW_DOWNLOAD;
+         }
+         ffp_dbg_note_frame(is, path, dec_fmt, sw_fmt, path == FFP_PATH_HW_DOWNLOAD ? sw_fmt : AV_PIX_FMT_NONE);
+-        ffp_dbg_fps_note(is, 0);
++        /* Keep the decoder timeline alongside the output PTS: IVTC rewrites frame timestamps,
++         * but copies opaque_ref from the source frame to each filtered output. Make it private
++         * because one packet may produce several decoded frames. */
++        if (frame->opaque_ref && frame->opaque_ref->size >= sizeof(FrameData) &&
++            av_buffer_make_writable(&frame->opaque_ref) >= 0)
++            ((FrameData *)frame->opaque_ref->data)->source_pts = frame->pts;
++        ffp_dbg_seek_frame(is,
++                           frame->pts == AV_NOPTS_VALUE ? NAN : av_q2d(is->video_st->time_base) * frame->pts,
++                           is->viddec.pkt_serial, !!(frame->flags & AV_FRAME_FLAG_KEY));
++        ffp_dbg_fps_note(is, 0,
++                         frame->pts == AV_NOPTS_VALUE ? NAN : av_q2d(is->video_st->time_base) * frame->pts,
++                         is->viddec.pkt_serial);
+     }
+ 
+     if (got_picture && frame->hw_frames_ctx && !is->ffp->vk_renderer && !ffp_keep_hw_frame(is, frame)) {
+@@ -4238,7 +4525,8 @@ static int get_video_frame(VideoState *i
+ 
+         frame->sample_aspect_ratio = av_guess_sample_aspect_ratio(is->ic, is->video_st, frame);
+ 
+-        if (o->framedrop>0 || (o->framedrop && get_master_sync_type(is) != AV_SYNC_VIDEO_MASTER)) {
++        if (!SDL_AtomicGet(&is->api_step_active) &&
++            (o->framedrop>0 || (o->framedrop && get_master_sync_type(is) != AV_SYNC_VIDEO_MASTER))) {
+             if (frame->pts != AV_NOPTS_VALUE) {
+                 double diff = dpts - get_master_clock(is);
+                 if (!isnan(diff) && fabs(diff) < AV_NOSYNC_THRESHOLD &&
+@@ -4246,6 +4534,7 @@ static int get_video_frame(VideoState *i
+                     is->viddec.pkt_serial == is->vidclk.serial &&
+                     is->videoq.nb_packets) {
+                     is->frame_drops_early++;
++                    ffp_dbg_drop_note(is, 0, dpts, is->viddec.pkt_serial);
+                     av_frame_unref(frame);
+                     got_picture = 0;
+                 }
+@@ -4782,6 +5071,7 @@ static int audio_thread(void *arg)
+                 af->pos = fd ? fd->pkt_pos : -1;
+                 af->serial = is->auddec.pkt_serial;
+                 af->duration = av_q2d((AVRational){frame->nb_samples, frame->sample_rate});
++                ffp_dbg_audio_note(is, af->pts, af->serial);
+ 
+                 av_frame_move_ref(af->frame, frame);
+                 frame_queue_push(&is->sampq);
+@@ -4842,8 +5132,14 @@ static int video_thread(void *arg)
+ {
+     VideoState *is = arg;
+     AVFrame *frame = av_frame_alloc();
++    AVFrame *step_candidate = av_frame_alloc();
+     double pts;
+     double duration;
++    double step_candidate_pts = NAN;
++    double step_candidate_duration = 0;
++    int64_t step_candidate_pos = -1;
++    int step_candidate_serial = -1;
++    int step_candidate_valid = 0;
+     int ret;
+     AVRational tb = is->video_st->time_base;
+     AVRational frame_rate = av_guess_frame_rate(is->ic, is->video_st, NULL);
+@@ -4856,8 +5152,11 @@ static int video_thread(void *arg)
+     int last_serial = -1;
+     int last_vfilter_gen = -1;
+ 
+-    if (!frame)
++    if (!frame || !step_candidate) {
++        av_frame_free(&frame);
++        av_frame_free(&step_candidate);
+         return AVERROR(ENOMEM);
++    }
+ 
+     for (;;) {
+         ret = get_video_frame(is, frame);
+@@ -4866,6 +5165,12 @@ static int video_thread(void *arg)
+         if (!ret)
+             continue;
+ 
++        if (step_candidate_serial != is->viddec.pkt_serial) {
++            av_frame_unref(step_candidate);
++            step_candidate_valid = 0;
++            step_candidate_serial = is->viddec.pkt_serial;
++        }
++
+         if (   last_w != frame->width
+             || last_h != frame->height
+             || last_format != frame->format
+@@ -4928,15 +5233,81 @@ static int video_thread(void *arg)
+             }
+ 
+             fd = frame->opaque_ref ? (FrameData*)frame->opaque_ref->data : NULL;
+-            ffp_dbg_fps_note(is, 1);
++            tb = av_buffersink_get_time_base(filt_out);
++            pts = (frame->pts == AV_NOPTS_VALUE) ? NAN : frame->pts * av_q2d(tb);
++            ffp_dbg_fps_note(is, 1, pts, is->viddec.pkt_serial);
+ 
+             is->frame_last_filter_delay = av_gettime_relative() / 1000000.0 - is->frame_last_returned_time;
+             if (fabs(is->frame_last_filter_delay) > AV_NOSYNC_THRESHOLD / 10.0)
+                 is->frame_last_filter_delay = 0;
+-            tb = av_buffersink_get_time_base(filt_out);
+             duration = (frame_rate.num && frame_rate.den ? av_q2d((AVRational){frame_rate.den, frame_rate.num}) : 0);
+-            pts = (frame->pts == AV_NOPTS_VALUE) ? NAN : frame->pts * av_q2d(tb);
+-            ret = queue_picture(is, frame, pts, duration, fd ? fd->pkt_pos : -1, is->viddec.pkt_serial);
++
++            {
++                int reverse_state, reverse_attempt;
++                double reverse_target;
++                int64_t frame_pos = fd ? fd->pkt_pos : -1;
++
++                SDL_LockMutex(is->ffp->mutex);
++                reverse_state = is->reverse_step_state;
++                reverse_attempt = is->reverse_step_attempt;
++                reverse_target = is->reverse_step_target;
++                SDL_UnlockMutex(is->ffp->mutex);
++
++                if (reverse_state == FFP_REVERSE_STEP_SCANNING) {
++                    if (isnan(pts)) {
++                        av_frame_unref(frame);
++                        ret = 0;
++                        continue;
++                    }
++                    if (pts < reverse_target) {
++                        av_frame_unref(step_candidate);
++                        ret = av_frame_ref(step_candidate, frame);
++                        if (ret < 0) {
++                            SDL_LockMutex(is->ffp->mutex);
++                            is->reverse_step_state = FFP_REVERSE_STEP_FAILED;
++                            SDL_UnlockMutex(is->ffp->mutex);
++                            av_frame_unref(frame);
++                            ret = 0;
++                            break;
++                        }
++                        step_candidate_pts = pts;
++                        step_candidate_duration = duration;
++                        step_candidate_pos = frame_pos;
++                        step_candidate_serial = is->viddec.pkt_serial;
++                        step_candidate_valid = 1;
++                        av_frame_unref(frame);
++                        ret = 0;
++                        continue;
++                    }
++                    if (!step_candidate_valid) {
++                        SDL_LockMutex(is->ffp->mutex);
++                        is->reverse_step_state = reverse_attempt < 3 ? FFP_REVERSE_STEP_RETRY : FFP_REVERSE_STEP_FAILED;
++                        SDL_UnlockMutex(is->ffp->mutex);
++                        av_frame_unref(frame);
++                        ret = 0;
++                        break;
++                    }
++
++                    ret = queue_picture(is, step_candidate, step_candidate_pts,
++                                        step_candidate_duration, step_candidate_pos,
++                                        step_candidate_serial);
++                    av_frame_unref(step_candidate);
++                    step_candidate_valid = 0;
++                    if (ret < 0) {
++                        SDL_LockMutex(is->ffp->mutex);
++                        is->reverse_step_state = FFP_REVERSE_STEP_FAILED;
++                        SDL_UnlockMutex(is->ffp->mutex);
++                        av_frame_unref(frame);
++                        goto the_end;
++                    }
++                    SDL_LockMutex(is->ffp->mutex);
++                    if (is->reverse_step_state == FFP_REVERSE_STEP_SCANNING)
++                        is->reverse_step_state = FFP_REVERSE_STEP_QUEUED;
++                    SDL_UnlockMutex(is->ffp->mutex);
++                }
++
++                ret = queue_picture(is, frame, pts, duration, frame_pos, is->viddec.pkt_serial);
++            }
+             av_frame_unref(frame);
+             if (is->videoq.serial != is->viddec.pkt_serial)
+                 break;
+@@ -4948,6 +5319,7 @@ static int video_thread(void *arg)
+  the_end:
+     avfilter_graph_free(&graph);
+     av_frame_free(&frame);
++    av_frame_free(&step_candidate);
+     return 0;
+ }
+ 
+@@ -5180,6 +5552,31 @@ static int synchronize_audio(VideoState
+  * stored in is->audio_buf, with size in bytes given by the return
+  * value.
+  */
++/* After a seek the demuxer starts audio at a packet position while the first decodable video frame is a later
++ * keyframe. Instead of shifting the audio clock (which would leave the sound permanently offset from the picture)
++ * or holding audio back, drop the whole audio frames that end before that keyframe so audio content and video
++ * timestamps agree and the video master never has to skip frames to catch up. Returns 1 if `af` is dropped. */
++static int ffp_audio_seek_trim(VideoState *is, const Frame *af)
++{
++    double key, end;
++    int trimmed_ms, frame_ms;
++
++    if (!SDL_AtomicGet(&is->seek_audio_align_pending))
++        return 0;
++    if (!SDL_AtomicGet(&is->seek_audio_keyframe_ready))
++        return 0;                       /* video keyframe not decoded yet: never hold audio */
++    key = SDL_AtomicGet(&is->seek_audio_video_pts_ms) / 1000.0;
++    end = af->pts + af->duration;
++    trimmed_ms = SDL_AtomicGet(&is->seek_audio_offset_ms);
++    frame_ms = (int)lrint(af->duration * 1000.0);
++    if (isnan(af->pts) || end > key + 0.0005 || trimmed_ms + frame_ms > 10000) {
++        SDL_AtomicSet(&is->seek_audio_align_pending, 0);
++        return 0;
++    }
++    SDL_AtomicSet(&is->seek_audio_offset_ms, trimmed_ms + frame_ms);
++    return 1;
++}
++
+ static int audio_decode_frame(VideoState *is)
+ {
+     int data_size, resampled_data_size;
+@@ -5189,6 +5586,12 @@ static int audio_decode_frame(VideoState
+ 
+     if (is->paused)
+         return -1;
++    /* The device asks every ~10 ms: right after a seek, wait for the first video keyframe, which decides
++     * the trim in ffp_audio_seek_trim, with silence instead of starting the untrimmed audio (it then stayed behind the
++     * picture). Bounded, so a stream whose keyframe never comes is not held. */
++    if (SDL_AtomicGet(&is->seek_audio_align_pending) && !SDL_AtomicGet(&is->seek_audio_keyframe_ready) &&
++        av_gettime_relative() - is->seek_audio_align_since_us < 300000)
++        return -1;
+ 
+     do {
+ #if defined(_WIN32)
+@@ -5201,7 +5604,7 @@ static int audio_decode_frame(VideoState
+         if (!(af = frame_queue_peek_readable(&is->sampq)))
+             return -1;
+         frame_queue_next(&is->sampq);
+-    } while (af->serial != is->audioq.serial);
++    } while (af->serial != is->audioq.serial || ffp_audio_seek_trim(is, af));
+ 
+     data_size = av_samples_get_buffer_size(NULL, af->frame->ch_layout.nb_channels,
+                                            af->frame->nb_samples,
+@@ -5289,17 +5692,63 @@ static int audio_decode_frame(VideoState
+     return resampled_data_size;
+ }
+ 
++/* pause_timing: `bytes` of decoded audio were handed to the device at byte `off` of this callback's buffer */
++static void ffp_pt_audio_note(VideoState *is, int off, int bytes)
++{
++    const int bps = is->audio_tgt.bytes_per_sec;
++    if (bps <= 0 || bytes <= 0)
++        return;
++    is->pt_audio_last_end_us = is->audio_callback_time + (int64_t)(off + bytes) * 1000000 / bps;
++    if (is->pt_want < 0)
++        return;
++    if (!is->pt_audio_after_bytes && !is->pt_want)
++        is->pt_audio_first_us = is->audio_callback_time + (int64_t)off * 1000000 / bps;
++    is->pt_audio_after_bytes += bytes;
++}
++
++/* pause / resume fade: scales the S16 frames in `buf` by aout_gain / fade and moves the gain one step per frame in `dir`
++ * (-1 fade-out, +1 fade-in); stops early once fully faded in */
++static void ffp_aout_ramp(VideoState *is, uint8_t *buf, int bytes, int fade, int dir)
++{
++    const int ch = is->audio_tgt.ch_layout.nb_channels;
++    const int frames = bytes / is->audio_tgt.frame_size;
++    int16_t *s = (int16_t *)buf;
++    int f, c;
++
++    for (f = 0; f < frames; f++) {
++        if (dir > 0 && is->aout_gain >= fade)
++            break;
++        for (c = 0; c < ch; c++)
++            s[f * ch + c] = (int16_t)((int)s[f * ch + c] * is->aout_gain / fade);
++        is->aout_gain = av_clip(is->aout_gain + dir, 0, fade);
++    }
++}
++
+ /* prepare a new audio buffer */
+ static void sdl_audio_callback(void *opaque, Uint8 *stream, int len)
+ {
+     VideoState *is = opaque;
+     int audio_size, len1;
+     int volume = SDL_AtomicGet(&is->ffp->volume);
+-    int muted  = SDL_AtomicGet(&is->ffp->muted);
++    int muted  = SDL_AtomicGet(&is->ffp->muted) || SDL_AtomicGet(&is->step_silence);
++    /* Pause takes effect in this callback, not after the decoded frame in progress: a 5 ms fade-out from the buffer, then
++     * silence; the rest of the frame is kept and continues (faded in) on resume, so the clock and A/V sync are untouched. */
++    const int paused = is->paused;
++    const int fade = FFMAX(1, is->audio_tgt.freq / 200);
++    const int len0 = len;
+ 
+     is->audio_callback_time = av_gettime_relative();
++    if (is->aout_gain < 0 || is->aout_gain > fade)
++        is->aout_gain = fade;
+ 
+     while (len > 0) {
++        if (paused && is->aout_gain == 0) {
++            memset(stream, 0, len);
++            break;
++        }
++        /* a flush (seek) since this frame was decoded: its rest is stale (it was kept across a pause) */
++        if (is->audio_buf && is->audio_clock_serial != is->audioq.serial)
++            is->audio_buf_index = is->audio_buf_size;
+         if (is->audio_buf_index >= is->audio_buf_size) {
+            audio_size = audio_decode_frame(is);
+            if (audio_size < 0) {
+@@ -5316,6 +5765,8 @@ static void sdl_audio_callback(void *opa
+         len1 = is->audio_buf_size - is->audio_buf_index;
+         if (len1 > len)
+             len1 = len;
++        if (paused)                 /* only the fade-out still comes from the buffer */
++            len1 = FFMIN(len1, is->aout_gain * is->audio_tgt.frame_size);
+         if (!muted && is->audio_buf && volume == SDL_MIX_MAXVOLUME)
+             memcpy(stream, (uint8_t *)is->audio_buf + is->audio_buf_index, len1);
+         else {
+@@ -5323,6 +5774,10 @@ static void sdl_audio_callback(void *opa
+             if (!muted && is->audio_buf)
+                 SDL_MixAudioFormat(stream, (uint8_t *)is->audio_buf + is->audio_buf_index, AUDIO_S16SYS, len1, volume);
+         }
++        if (paused || is->aout_gain < fade)
++            ffp_aout_ramp(is, stream, len1, fade, paused ? -1 : 1);
++        if (is->audio_buf)
++            ffp_pt_audio_note(is, len0 - len, len1);
+         len -= len1;
+         stream += len1;
+         is->audio_buf_index += len1;
+@@ -5330,7 +5785,8 @@ static void sdl_audio_callback(void *opa
+     is->audio_write_buf_size = is->audio_buf_size - is->audio_buf_index;
+     /* Let's assume the audio driver that is used by SDL has two periods. */
+     if (!isnan(is->audio_clock)) {
+-        set_clock_at(&is->audclk, is->audio_clock - (double)(2 * is->audio_hw_buf_size + is->audio_write_buf_size) / is->audio_tgt.bytes_per_sec, is->audio_clock_serial, is->audio_callback_time / 1000000.0);
++        set_clock_at(&is->audclk, is->audio_clock - (double)(2 * is->audio_hw_buf_size + is->audio_write_buf_size) / is->audio_tgt.bytes_per_sec,
++                     is->audio_clock_serial, is->audio_callback_time / 1000000.0);
+         sync_clock_to_slave(&is->extclk, &is->audclk);
+     }
+ }
+@@ -5344,6 +5800,7 @@ static int audio_open_dev(void *opaque,
+     static const int next_sample_rates[] = {0, 44100, 48000, 96000, 192000};
+     int next_sample_rate_idx = FF_ARRAY_ELEMS(next_sample_rates) - 1;
+     int wanted_nb_channels = wanted_channel_layout->nb_channels;
++    int sleep_paced;
+ 
+     env = SDL_getenv("SDL_AUDIO_CHANNELS");
+     if (env) {
+@@ -5366,10 +5823,20 @@ static int audio_open_dev(void *opaque,
+         next_sample_rate_idx--;
+     wanted_spec.format = AUDIO_S16SYS;
+     wanted_spec.silence = 0;
+-    wanted_spec.samples = FFMAX(SDL_AUDIO_MIN_BUFFER_SIZE, 2 << av_log2(wanted_spec.freq / SDL_AUDIO_MAX_CALLBACKS_PER_SEC));
++    /* SDL's dummy / disk drivers pace themselves with SDL_Delay(buffer ms, truncated): with 10 ms buffers they run up to
++     * ~1.07x fast or, at the default 15.6 ms timer resolution, ~0.68x slow (the audio master clock with them). They are
++     * not heard, so they keep a ~43 ms buffer (30 callbacks/s), which bounds that error. */
++    sleep_paced = SDL_GetCurrentAudioDriver() && (!strcmp(SDL_GetCurrentAudioDriver(), "dummy") ||
++                                                  !strcmp(SDL_GetCurrentAudioDriver(), "disk"));
++    wanted_spec.samples = FFMAX(SDL_AUDIO_MIN_BUFFER_SIZE, 2 << av_log2(wanted_spec.freq / (sleep_paced ? 30 : SDL_AUDIO_MAX_CALLBACKS_PER_SEC)));
+     wanted_spec.callback = sdl_audio_callback;
+     wanted_spec.userdata = opaque;
+-    while (!(is->audio_dev = SDL_OpenAudioDevice(NULL, 0, &wanted_spec, &spec, SDL_AUDIO_ALLOW_FREQUENCY_CHANGE | SDL_AUDIO_ALLOW_CHANNELS_CHANGE))) {
++    while (!(is->audio_dev = SDL_OpenAudioDevice(NULL, 0, &wanted_spec, &spec,
++                                                 /* samples: the device's own period (WASAPI: 10 ms) instead of an
++                                                  * SDL_AudioStream between our callback and the device, which held
++                                                  * up to one more callback of audio that a pause cannot flush */
++                                                 SDL_AUDIO_ALLOW_FREQUENCY_CHANGE | SDL_AUDIO_ALLOW_CHANNELS_CHANGE |
++                                                 (sleep_paced ? 0 : SDL_AUDIO_ALLOW_SAMPLES_CHANGE)))) {
+         av_log(NULL, AV_LOG_WARNING, "SDL_OpenAudio (%d channels, %d Hz): %s\n",
+                wanted_spec.channels, wanted_spec.freq, SDL_GetError());
+         wanted_spec.channels = next_nb_channels[FFMIN(7, wanted_spec.channels)];
+@@ -6327,6 +6794,94 @@ static void ffp_notify_prepared(VideoSta
+ }
+ 
+ /* this thread gets the stream from the disk or the network */
++static void ffp_note_key_packet(VideoState *is, const AVPacket *pkt)
++{
++    double tb = av_q2d(is->video_st->time_base);
++    double pts_s;
++
++    if (pkt->pts == AV_NOPTS_VALUE)
++        return;
++    pts_s = pkt->pts * tb;
++    if (pkt->dts != AV_NOPTS_VALUE) {
++        double lead = (pkt->pts - pkt->dts) * tb;
++        if (lead >= 0.0 && lead <= 5.0)
++            is->seek_key_lead_s = lead;
++    }
++    if (is->seek_prev_key_valid) {
++        double interval = pts_s - is->seek_prev_key_pts_s;
++        if (interval > 0.02 && interval < 30.0)
++            is->seek_gop_est_s = is->seek_gop_est_s > 0.0 ? 0.5 * (is->seek_gop_est_s + interval) : interval;
++    }
++    is->seek_prev_key_pts_s = pts_s;
++    is->seek_prev_key_valid = 1;
++}
++
++/* Timestamp seeks must land on the video keyframe closest to the requested time, never on the one after it.
++ * avformat_seek_file() cannot do that by itself: it ignores AVSEEK_FLAG_BACKWARD, and its fallback derives the
++ * direction from the min/max window. MPEG-TS/PS positions on the packet nearest the timestamp (not a keyframe)
++ * and the decoder then waits for the next I frame, so a plain seek lands up to one GOP late. Keyframe aware
++ * indexed demuxers (MP4, MKV, ...) need an explicit pick of the nearer of the two surrounding keyframes.
++ * All computation here is in the video DTS domain: key pts = key dts + lead.
++ * direction: >0 landing must be after origin_us, <0 before it, 0 unconstrained.
++ * Returns 1 and rewrites the avformat_seek_file() arguments when a plan was made. */
++static int ffp_plan_seek(VideoState *is, int direction, int64_t origin_us,
++                         int64_t *target, int64_t *min_ts, int64_t *max_ts)
++{
++    AVStream *st = is->video_st;
++    const char *fmt = is->ic->iformat ? is->ic->iformat->name : "";
++    int64_t lead_us = (int64_t)llrint(is->seek_key_lead_s * AV_TIME_BASE);
++    int64_t want = *target - lead_us;
++
++    if (!st || (st->disposition & AV_DISPOSITION_ATTACHED_PIC))
++        return 0;
++    if (!strcmp(fmt, "mpegts") || !strcmp(fmt, "mpegtsraw") || !strcmp(fmt, "mpeg")) {
++        int64_t half_gop_us = (int64_t)llrint(is->seek_gop_est_s * 0.5 * AV_TIME_BASE);
++        int64_t x;
++        if (half_gop_us <= 0)
++            return 0;
++        /* the first keyframe at or after x (in dts) has pts in [target - G/2, target + G/2) */
++        x = want - half_gop_us;
++        if (direction > 0 && x < origin_us - lead_us + 1000)
++            x = origin_us - lead_us + 1000;
++        if (is->ic->start_time != AV_NOPTS_VALUE && x < is->ic->start_time)
++            x = is->ic->start_time;
++        *target = x;
++        *min_ts = INT64_MIN;
++        *max_ts = x;
++        return 1;
++    } else {
++        int count = avformat_index_get_entries_count(st);
++        int64_t ts, cand_us[2];
++        int idx[2], i, best = -1;
++
++        if (count <= 0)
++            return 0;
++        ts = av_rescale_q(want, AV_TIME_BASE_Q, st->time_base);
++        idx[0] = av_index_search_timestamp(st, ts, AVSEEK_FLAG_BACKWARD);
++        idx[1] = av_index_search_timestamp(st, ts, 0);
++        if (idx[0] < 0 || idx[1] < 0)
++            return 0;               /* target not bracketed by the (possibly partial) index */
++        for (i = 0; i < 2; i++) {
++            const AVIndexEntry *e = avformat_index_get_entry(st, idx[i]);
++            int64_t land;
++            if (!e)
++                return 0;
++            cand_us[i] = av_rescale_q_rnd(e->timestamp, st->time_base, AV_TIME_BASE_Q, AV_ROUND_UP);
++            land = cand_us[i] + lead_us;
++            if ((direction > 0 && land <= origin_us) || (direction < 0 && land >= origin_us))
++                continue;
++            if (best < 0 || llabs(land - *target) < llabs(cand_us[best] + lead_us - *target))
++                best = i;
++        }
++        if (best < 0)
++            return 0;
++        *target = cand_us[best];
++        *min_ts = cand_us[best] - 2;
++        *max_ts = cand_us[best] + 1;
++        return 1;
++    }
++}
++
+ static int read_thread(void *arg)
+ {
+     VideoState *is = arg;
+@@ -6437,21 +6992,8 @@ static int read_thread(void *arg)
+     if (!o->window_title && (t = av_dict_get(ic->metadata, "title", NULL, 0)))
+         is->window_title = av_asprintf("%s - %s", t->value, is->filename);
+ 
+-    /* if seeking requested, we execute it */
+-    if (o->start_time != AV_NOPTS_VALUE) {
+-        int64_t timestamp;
+-
+-        timestamp = o->start_time;
+-        /* add the stream start time */
+-        if (ic->start_time != AV_NOPTS_VALUE)
+-            timestamp += ic->start_time;
+-        ret = avformat_seek_file(ic, -1, INT64_MIN, timestamp, INT64_MAX, 0);
+-        if (ret < 0) {
+-            av_log(NULL, AV_LOG_WARNING, "%s: could not seek to position %0.3f\n",
+-                    is->filename, (double)timestamp / AV_TIME_BASE);
+-        }
+-    }
+-
++    /* Resolve saved/open positions after stream selection, using the same
++     * nearest-keyframe policy as runtime seeks. */
+     is->realtime = is_realtime(ic);
+ 
+     if (o->show_status) {
+@@ -6542,6 +7084,54 @@ static int read_thread(void *arg)
+         goto fail;
+     }
+ 
++    if (o->start_time != AV_NOPTS_VALUE) {
++        int64_t timestamp = o->start_time, planned_ts, seek_min = INT64_MIN, seek_max = INT64_MAX;
++        int planned = 0;
++        const char *fmt = ic->iformat ? ic->iformat->name : "";
++        if (ic->start_time != AV_NOPTS_VALUE)
++            timestamp += ic->start_time;
++        /* MPEG-TS has no keyframe index. Sample only demuxed packets at open to
++         * learn the GOP spacing; neither video decoding nor audio preroll occurs.
++         * Limit the probe to local/seekable media and a bounded packet count. */
++        if (is->video_st && ic->pb && (ic->pb->seekable & AVIO_SEEKABLE_NORMAL) &&
++            (!strcmp(fmt, "mpegts") || !strcmp(fmt, "mpegtsraw") || !strcmp(fmt, "mpeg"))) {
++            for (i = 0; i < 256 && is->seek_gop_est_s <= 0.0; i++) {
++                int probe_rc = av_read_frame(ic, pkt);
++                if (probe_rc < 0)
++                    break;
++                if (pkt->stream_index == is->video_stream && (pkt->flags & AV_PKT_FLAG_KEY))
++                    ffp_note_key_packet(is, pkt);
++                av_packet_unref(pkt);
++            }
++        }
++        planned_ts = timestamp;
++        if (is->video_st)
++            planned = ffp_plan_seek(is, 0, 0, &planned_ts, &seek_min, &seek_max);
++        ret = avformat_seek_file(ic, -1, seek_min, planned_ts, seek_max, 0);
++        if (ret < 0 && planned)
++            ret = avformat_seek_file(ic, -1, INT64_MIN, timestamp, INT64_MAX, 0);
++        SDL_LockMutex(is->dbg_mutex);
++        is->dbg.seek_debug_valid = ret >= 0;
++        is->dbg.seek_direction = 0;
++        is->dbg.seek_requested_s = timestamp / (double)AV_TIME_BASE;
++        is->dbg.seek_keyframe_s = NAN;
++        is->dbg.seek_gop_s = NAN;
++        is->dbg.seek_debug_pending = ret >= 0 && is->video_stream >= 0;
++        is->dbg.seek_debug_serial = -1;
++        is->dbg.seek_intent_valid = ret >= 0;
++        SDL_UnlockMutex(is->dbg_mutex);
++        if (ret >= 0 && is->video_stream >= 0 && is->audio_stream >= 0) {
++            SDL_AtomicSet(&is->seek_audio_offset_ms, 0);
++            SDL_AtomicSet(&is->seek_audio_video_serial, is->videoq.serial);
++            SDL_AtomicSet(&is->seek_audio_align_pending, 1);
++            SDL_AtomicSet(&is->seek_audio_keyframe_ready, 0);
++            is->seek_audio_align_since_us = av_gettime_relative();
++        }
++        if (ret < 0)
++            av_log(NULL, AV_LOG_WARNING, "%s: could not seek to position %0.3f\n",
++                   is->filename, (double)timestamp / AV_TIME_BASE);
++    }
++
+     is->infinite_buffer = o->infinite_buffer;
+     if (is->infinite_buffer < 0 && is->realtime)
+         is->infinite_buffer = 1;
+@@ -6570,34 +7160,89 @@ static int read_thread(void *arg)
+ #endif
+         if (is->seek_req) {
+             int64_t seek_target = is->seek_pos;
+-            int64_t seek_min    = is->seek_rel > 0 ? seek_target - is->seek_rel + 2: INT64_MIN;
+-            int64_t seek_max    = is->seek_rel < 0 ? seek_target - is->seek_rel - 2: INT64_MAX;
+-// FIXME the +-2 is due to rounding being not done in the correct direction in generation
+-//      of the seek_pos/seek_rel variables
+-
+-            ret = avformat_seek_file(is->ic, -1, seek_min, seek_target, seek_max, is->seek_flags);
++            int64_t seek_requested = seek_target;
++            int64_t seek_min = is->seek_bounds_set ? is->seek_min :
++                               is->seek_rel > 0 ? seek_target - is->seek_rel + 2 : INT64_MIN;
++            int64_t seek_max = is->seek_bounds_set ? is->seek_max :
++                               is->seek_rel < 0 ? seek_target - is->seek_rel - 2 : INT64_MAX;
++            int direction = is->seek_rel > 0 ? 1 : is->seek_rel < 0 ? -1 : 0;
++            int reverse_step_seek = 0;
++            int planned = 0;
++            int64_t plan_target = seek_target, plan_min = seek_min, plan_max = seek_max;
++
++            if (!(is->seek_flags & AVSEEK_FLAG_BYTE)) {
++                if (!direction && (is->seek_flags & AVSEEK_FLAG_BACKWARD))
++                    direction = -1;
++                /* The seek_min/seek_max window bounds a relative skip to its own direction (avformat_seek_file
++                 * ignores AVSEEK_FLAG_BACKWARD). The bounded-GOP step seeks keep their own window. */
++                if (!is->seek_bounds_set && is->video_st)
++                    planned = ffp_plan_seek(is, direction, seek_target - is->seek_rel,
++                                            &plan_target, &plan_min, &plan_max);
++            }
++            ret = avformat_seek_file(is->ic, -1, plan_min, plan_target, plan_max, is->seek_flags);
++            if (ret < 0 && planned)
++                ret = avformat_seek_file(is->ic, -1, seek_min, seek_target, seek_max, is->seek_flags);
++            SDL_LockMutex(is->dbg_mutex);
++            is->dbg.seek_debug_valid = ret >= 0 && !(is->seek_flags & AVSEEK_FLAG_BYTE);
++            is->dbg.seek_direction = direction;
++            is->dbg.seek_requested_s = seek_requested / (double)AV_TIME_BASE;
++            is->dbg.seek_keyframe_s = NAN;
++            is->dbg.seek_gop_s = NAN;
++            is->dbg.seek_debug_pending = ret >= 0 && is->video_stream >= 0;
++            is->dbg.seek_debug_serial = -1;
++            is->dbg.seek_intent_valid = ret >= 0 && !is->seek_bounds_set && !(is->seek_flags & AVSEEK_FLAG_BYTE);
++            SDL_UnlockMutex(is->dbg_mutex);
++            is->seek_prev_key_valid = 0;
+             if (ret < 0) {
+                 av_log(NULL, AV_LOG_ERROR,
+                        "%s: error while seeking\n", is->ic->url);
++                SDL_LockMutex(is->ffp->mutex);
++                if (is->reverse_step_state == FFP_REVERSE_STEP_SEEKING) {
++                    is->reverse_step_state = FFP_REVERSE_STEP_FAILED;
++                    reverse_step_seek = 1;
++                }
++                SDL_UnlockMutex(is->ffp->mutex);
+             } else {
+                 if (is->audio_stream >= 0)
+                     packet_queue_flush(&is->audioq);
+                 for (i = 0; i < FFP_SUBTITLE_LAYER_COUNT; i++)
+                     if (SDL_AtomicGet(&is->subtitles[i].routing_stream_index) >= 0)
+                         packet_queue_flush(&is->subtitles[i].packets);
+-                if (is->video_stream >= 0)
++                if (is->video_stream >= 0) {
+                     packet_queue_flush(&is->videoq);
++                    SDL_AtomicSet(&is->seek_audio_offset_ms, 0);
++                    SDL_AtomicSet(&is->seek_audio_video_serial, is->videoq.serial);
++                    SDL_AtomicSet(&is->seek_audio_align_pending, is->audio_stream >= 0);
++                    SDL_AtomicSet(&is->seek_audio_keyframe_ready, 0);
++                    is->seek_audio_align_since_us = av_gettime_relative();
++                    SDL_AtomicSet(&is->seek_audio_video_pts_ms, 0);
++                    SDL_LockMutex(is->dbg_mutex);
++                    /* re-arm for the flushed serial: a late pre-seek frame may already have taken the capture
++                     * armed with the seek request (serial -1) */
++                    if (is->dbg.seek_debug_pending || is->dbg.seek_debug_valid) {
++                        is->dbg.seek_debug_pending = 1;
++                        is->dbg.seek_debug_serial = is->videoq.serial;
++                    }
++                    SDL_UnlockMutex(is->dbg_mutex);
++                }
+                 if (is->seek_flags & AVSEEK_FLAG_BYTE) {
+                    set_clock(&is->extclk, NAN, 0);
+                 } else {
+                    set_clock(&is->extclk, seek_target / (double)AV_TIME_BASE, 0);
+                 }
++                SDL_LockMutex(is->ffp->mutex);
++                if (is->reverse_step_state == FFP_REVERSE_STEP_SEEKING) {
++                    is->reverse_step_state = FFP_REVERSE_STEP_SCANNING;
++                    reverse_step_seek = 1;
++                }
++                SDL_UnlockMutex(is->ffp->mutex);
+             }
+             is->seek_req = 0;
++            is->seek_bounds_set = 0;
+             is->queue_attachments_req = 1;
+             SDL_AtomicSet(&is->eof, 0);
+             SDL_AtomicSet(&is->eof_notified, 0);
+-            if (is->paused)
++            if (is->paused && !reverse_step_seek)
+                 step_to_next_frame(is);
+         }
+         if (is->queue_attachments_req) {
+@@ -6630,7 +7275,8 @@ static int read_thread(void *arg)
+             (!is->audio_st || (is->auddec.finished == is->audioq.serial && frame_queue_nb_remaining(&is->sampq) == 0)) &&
+             (!is->video_st || (is->viddec.finished == is->videoq.serial && frame_queue_nb_remaining(&is->pictq) == 0))) {
+             if (is->loop_left != 1 && (!is->loop_left || --is->loop_left)) {
+-                stream_seek(is, o->start_time != AV_NOPTS_VALUE ? o->start_time : 0, 0, 0);
++                stream_seek(is, (o->start_time != AV_NOPTS_VALUE ? o->start_time : 0) +
++                                (ic->start_time != AV_NOPTS_VALUE ? ic->start_time : 0), 0, 0);
+             } else if (!SDL_AtomicGet(&is->eof_notified)) {
+                 /* end of media: the library keeps the media open (the host decides
+                  * what to do next; "autoexit" is implemented by ffplay.exe itself) */
+@@ -6669,6 +7315,8 @@ static int read_thread(void *arg)
+         } else {
+             SDL_AtomicSet(&is->eof, 0);
+         }
++        if (pkt->stream_index == is->video_stream && (pkt->flags & AV_PKT_FLAG_KEY))
++            ffp_note_key_packet(is, pkt);
+ 
+         if (o->show_status && ic->streams[pkt->stream_index]->event_flags &
+             AVSTREAM_EVENT_FLAG_METADATA_UPDATED) {
+@@ -6742,6 +7390,10 @@ static VideoState *stream_open(FFPlayer
+     is->last_audio_stream = is->audio_stream = -1;
+     is->last_subtitle_stream = -1;
+     is->last_seek_pos = NAN;
++    is->pt_want = -1;
++    is->displayed_video_pts = NAN;
++    is->displayed_source_pts = NAN;
++    is->first_video_pts = NAN;
+     for (i = 0; i < FFP_SUBTITLE_LAYER_COUNT; i++) {
+         is->subtitles[i].is = is;
+         is->subtitles[i].id = i;
+@@ -6806,6 +7458,13 @@ static VideoState *stream_open(FFPlayer
+     init_clock(&is->vidclk, &is->videoq.serial);
+     init_clock(&is->audclk, &is->audioq.serial);
+     init_clock(&is->extclk, &is->extclk.serial);
++    if (o->start_paused) {
++        /* No audio is output before play: the audio clock starts with the first real sample, so video does not
++         * resume behind a clock that ran during the wait for the first frame. */
++        is->paused = is->audclk.paused = is->vidclk.paused = is->extclk.paused = 1;
++        is->start_paused_frame = 1;
++        is->aout_gain = 0;
++    }
+     is->audio_clock_serial = -1;
+     if (o->video_background) {
+         if (!strcmp(o->video_background, "none")) {
+@@ -6934,6 +7593,9 @@ static void toggle_audio_display(VideoSt
+     }
+ }
+ 
++static void ffp_queue_seek(VideoState *is, double seconds, int flags);
++static void ffp_seek_to_ts(VideoState *is, int64_t ts_us);
++
+ static void seek_chapter(VideoState *is, int incr)
+ {
+     int64_t pos = get_master_clock(is) * AV_TIME_BASE;
+@@ -6957,18 +7619,27 @@ static void seek_chapter(VideoState *is,
+         return;
+ 
+     av_log(NULL, AV_LOG_VERBOSE, "Seeking to chapter %d.\n", i);
+-    stream_seek(is, av_rescale_q(is->ic->chapters[i]->start, is->ic->chapters[i]->time_base,
+-                                 AV_TIME_BASE_Q), 0, 0);
++    ffp_seek_to_ts(is, av_rescale_q(is->ic->chapters[i]->start, is->ic->chapters[i]->time_base,
++                                    AV_TIME_BASE_Q));
+ }
+ 
+ 
+-static void ffp_seek_relative(VideoState *is, double incr)
++/* API callers pass seconds,
++ * so timed media must use timestamps even when ffplay's auto setting prefers byte seeks
++ * (notably MPEG-TS); otherwise bitrate estimates turn a requested time delta into drift. */
++static void ffp_seek_relative(VideoState *is, double incr, int force_time_seek)
+ {
+     double pos;
++    double origin;
+ 
+     if (!is->ic)
+         return;
+-    if (is->seek_by_bytes) {
++    /* A seek is still in flight or waiting: fold this one into it. Its origin would otherwise be a stale clock. */
++    if (is->seek_req || is->pending_seek) {
++        ffp_queue_seek(is, incr, FFP_SEEK_RELATIVE);
++        return;
++    }
++    if (is->seek_by_bytes && !force_time_seek && is->ic->duration <= 0) {
+         pos = -1;
+         if (pos < 0 && is->video_stream >= 0)
+             pos = frame_queue_last_pos(&is->pictq);
+@@ -6984,14 +7655,34 @@ static void ffp_seek_relative(VideoState
+         stream_seek(is, pos, incr, 1);
+         is->last_seek_pos = NAN;
+     } else {
+-        pos = get_master_clock(is);
++        /* Repeated arrow presses must accumulate from the requested timeline, even while the
++         * previous serial has no valid master clock. The absolute request timestamp, not a
++         * snapped keyframe nor a transient decoder clock, is the authoritative origin. */
++        if (is->last_user_seek_at_us && av_gettime_relative() - is->last_user_seek_at_us < 750000 &&
++            isfinite(is->last_seek_pos))
++            pos = is->last_seek_pos;
++        else
++            pos = get_master_clock(is);
++        /* Outside a burst, compensate the preceding keyframe landing without carrying that
++         * correction across every key-repeat request. */
++        if ((!is->last_user_seek_at_us || av_gettime_relative() - is->last_user_seek_at_us >= 750000) &&
++            !isnan(pos) && is->dbg_mutex) {
++            SDL_LockMutex(is->dbg_mutex);
++            if (is->dbg.seek_intent_valid && is->dbg.seek_debug_valid &&
++                isfinite(is->dbg.seek_keyframe_s) && isfinite(is->dbg.seek_requested_s) &&
++                pos - is->dbg.seek_keyframe_s >= -0.25 && pos - is->dbg.seek_keyframe_s <= 2.0)
++                pos += is->dbg.seek_requested_s - is->dbg.seek_keyframe_s;
++            SDL_UnlockMutex(is->dbg_mutex);
++        }
+         if (isnan(pos))
+             pos = !isnan(is->last_seek_pos) ? is->last_seek_pos : (double)is->seek_pos / AV_TIME_BASE;
++        origin = pos;
+         pos += incr;
+         if (is->ic->start_time != AV_NOPTS_VALUE && pos < is->ic->start_time / (double)AV_TIME_BASE)
+             pos = is->ic->start_time / (double)AV_TIME_BASE;
+-        stream_seek(is, (int64_t)(pos * AV_TIME_BASE), (int64_t)(incr * AV_TIME_BASE), 0);
++        stream_seek(is, (int64_t)(pos * AV_TIME_BASE), (int64_t)((pos - origin) * AV_TIME_BASE), 0);
+         is->last_seek_pos = pos;
++        is->last_user_seek_at_us = av_gettime_relative();
+     }
+ }
+ 
+@@ -7001,7 +7692,7 @@ static void ffp_seek_fraction(VideoState
+ 
+     if (!is->ic || !is->width)
+         return;
+-    if (is->seek_by_bytes || is->ic->duration <= 0) {
++    if (is->ic->duration <= 0) {
+         uint64_t size = avio_size(is->ic->pb);
+         stream_seek(is, size * x / is->width, 0, 1);
+     } else {
+@@ -7023,7 +7714,7 @@ static void ffp_seek_fraction(VideoState
+         ts = frac * is->ic->duration;
+         if (is->ic->start_time != AV_NOPTS_VALUE)
+             ts += is->ic->start_time;
+-        stream_seek(is, ts, 0, 0);
++        ffp_seek_to_ts(is, ts);
+     }
+ }
+ 
+@@ -7041,9 +7732,20 @@ static void ffp_queue_seek(VideoState *i
+     }
+ }
+ 
++/* absolute timestamp seek (AV_TIME_BASE units, includes the stream start time); latest request wins while busy */
++static void ffp_seek_to_ts(VideoState *is, int64_t ts_us)
++{
++    if (is->seek_req || is->pending_seek) {
++        ffp_queue_seek(is, ts_us / (double)AV_TIME_BASE - is->start_off_s, FFP_SEEK_ABSOLUTE);
++        return;
++    }
++    stream_seek(is, ts_us, 0, 0);
++    is->last_seek_pos = ts_us / (double)AV_TIME_BASE;
++    is->last_user_seek_at_us = av_gettime_relative();
++}
++
+ static void ffp_apply_pending_seek(FFPlayer *ffp, VideoState *is)
+ {
+-    const FFPOptions *o = is->o;
+     double s;
+ 
+     if (!is->pending_seek || is->seek_req || !SDL_AtomicGet(&is->prepared) || !is->ic)
+@@ -7052,22 +7754,12 @@ static void ffp_apply_pending_seek(FFPla
+     is->pending_seek = 0;
+ 
+     if (is->pending_seek_flags == FFP_SEEK_RELATIVE) {
+-        ffp_seek_relative(is, s);
++        ffp_seek_relative(is, s, is->ic->duration > 0);
+     } else {
+-        int done = 0;
+-        if (o->seek_by_bytes == 1 && is->duration_s > 0 && is->ic->pb) {
+-            int64_t size = avio_size(is->ic->pb);
+-            if (size > 0) {
+-                stream_seek(is, (int64_t)(size * (FFMAX(s, 0) / is->duration_s)), 0, 1);
+-                is->last_seek_pos = NAN;
+-                done = 1;
+-            }
+-        }
+-        if (!done) {
+-            s = FFMAX(s, 0) + is->start_off_s;
+-            stream_seek(is, (int64_t)(s * AV_TIME_BASE), 0, 0);
+-            is->last_seek_pos = s;
+-        }
++        s = FFMAX(s, 0) + is->start_off_s;
++        stream_seek(is, (int64_t)(s * AV_TIME_BASE), 0, 0);
++        is->last_seek_pos = s;
++        is->last_user_seek_at_us = av_gettime_relative();
+     }
+     SDL_AtomicSet(&is->eof_notified, 0);
+     if (ffp_get_state(ffp) == FFP_ST_ENDED)
+@@ -7081,7 +7773,10 @@ static double ffp_position(VideoState *i
+ 
+     if (!SDL_AtomicGet(&is->prepared))
+         return NAN;
+-    p = get_master_clock(is);
++    if ((is->paused || SDL_AtomicGet(&is->api_step_active)) && !isnan(is->displayed_video_pts))
++        p = is->displayed_video_pts;
++    else
++        p = get_master_clock(is);
+     if (isnan(p))
+         p = is->last_seek_pos;
+     if (isnan(p))
+@@ -7832,7 +8527,7 @@ static void ffp_cmd_open(FFPlayer *ffp,
+     SDL_UnlockMutex(ffp->dbg_mutex);
+ }
+ 
+-static void ffp_cmd_pause(FFPlayer *ffp, int want)
++static void ffp_cmd_pause(FFPlayer *ffp, int want, int64_t api_us)
+ {
+     VideoState *is = ffp->is;
+     int st;
+@@ -7842,12 +8537,102 @@ static void ffp_cmd_pause(FFPlayer *ffp,
+     st = ffp_get_state(ffp);
+     if (want < 0)
+         want = (st == FFP_ST_ENDED) ? 0 : !is->paused;
++    if (!want)
++        SDL_AtomicSet(&is->step_silence, 0);
+     if (!want && st == FFP_ST_ENDED)
+         ffp_queue_seek(is, 0.0, FFP_SEEK_ABSOLUTE);
+-    if (want != !!is->paused)
++    if (want != !!is->paused) {
++        is->pt_want = want;
++        is->pt_api_us = api_us > 0 ? api_us : av_gettime_relative();
++        is->pt_frames_after = 0;
++        is->pt_first_frame_us = 0;
++        is->pt_audio_first_us = 0;
++        is->pt_audio_after_bytes = 0;
++        is->pt_apply_us = av_gettime_relative();
++        is->pt_state_us = 0;
+         toggle_pause(is);
+-    if (SDL_AtomicGet(&is->prepared))
++    }
++    if (SDL_AtomicGet(&is->prepared)) {
+         ffp_set_state(ffp, is->paused ? FFP_ST_PAUSED : FFP_ST_PLAYING, 0);
++        if (!is->pt_state_us)
++            is->pt_state_us = av_gettime_relative();
++    }
++}
++
++static void ffp_cmd_step_frame(FFPlayer *ffp, int direction)
++{
++    VideoState *is = ffp->is;
++    double current_pts;
++    int64_t target_us;
++
++    if (!is || !SDL_AtomicGet(&is->prepared) || !is->video_st) {
++        ffp_emit_step_done(ffp, direction > 0 ? 1 : -1, 0);
++        return;
++    }
++    if (is->api_step_pending || ffp_reverse_step_holding(is))
++        return;     /* ffp_step_frame rejects with FFP_EBUSY before posting; nothing is ever buffered */
++    is->api_step_dir = direction > 0 ? 1 : -1;
++
++    /* The public operation is paused-at-a-frame even though the decoder must run briefly. */
++    if (!is->paused)
++        toggle_pause(is);
++    else
++        is->step = 0;
++    ffp_set_state(ffp, FFP_ST_PAUSED, 0);
++    is->api_step_pending = 1;
++    is->step_position_pending = 0;
++    SDL_AtomicSet(&is->step_silence, 1);
++    SDL_AtomicSet(&is->api_step_active, 1);
++
++    if (direction > 0) {
++        if (SDL_AtomicGet(&is->eof) && is->viddec.finished == is->videoq.serial &&
++            frame_queue_nb_remaining(&is->pictq) == 0) {
++            ffp_api_step_end(is, 0);
++            return;
++        }
++        step_to_next_frame(is);
++        /* A paused API step is an explicit frame request, not timed playback. Keep
++         * ffplay's one-frame stepping, but do not add a frame-duration wait at
++         * video_refresh for every repeated F keypress. */
++        is->frame_timer = av_gettime_relative() / 1000000.0 - AV_SYNC_THRESHOLD_MAX;
++        return;
++    }
++
++    current_pts = is->displayed_video_pts;
++    if (isnan(current_pts) || (!isnan(is->first_video_pts) && current_pts <= is->first_video_pts + 0.000001) ||
++        is->seek_req || is->pending_seek) {
++        /* No displayed predecessor yet, at the first output frame, or another seek is underway. */
++        ffp_api_step_end(is, 0);
++        return;
++    }
++
++    /* Locate the preceding SOURCE keyframe, not the IVTC-adjusted output PTS.
++     * The predecessor comparison below still uses FILTER OUTPUT PTS. */
++    target_us = (int64_t)((isfinite(is->displayed_source_pts) ?
++                           is->displayed_source_pts : current_pts) * AV_TIME_BASE);
++    SDL_LockMutex(ffp->mutex);
++    is->reverse_step_target = current_pts;
++    is->reverse_step_attempt = 0;
++    is->reverse_step_seek_ts = target_us;
++    is->reverse_step_source_seen = 0;
++    is->reverse_step_state = FFP_REVERSE_STEP_SEEKING;
++    SDL_UnlockMutex(ffp->mutex);
++
++    /* Bound the decode to the preceding GOP. avformat_seek_file resolves this timestamp window
++     * to its closest earlier keyframe; the filter-output scanner keeps the adjacent output PTS. */
++    /* MPEG-TS seeks to a packet, not an I-frame. Leave one short GOP plus the
++     * MPEG-2 PTS/DTS lead before this source frame, or the decoder can start at
++     * the NEXT keyframe and never encounter the predecessor. */
++    is->seek_pos = target_us - 3 * AV_TIME_BASE / 5;
++    is->seek_rel = 0;
++    is->seek_flags = AVSEEK_FLAG_BACKWARD;
++    is->seek_bounds_set = 1;
++    is->seek_min = INT64_MIN;       /* the keyframe before a GOP longer than the margin must stay reachable */
++    is->seek_max = is->seek_pos;
++    is->seek_req = 1;
++    SDL_CondSignal(is->continue_read_thread);
++    is->step = 1;
++    stream_toggle_pause(is);          /* run demux/decode; video_refresh holds presentation until the scan completes */
+ }
+ 
+ static void ffp_cmd_refresh_caption_style(FFPlayer *ffp, int flags)
+@@ -7899,7 +8684,10 @@ static int ffp_exec_cmd(FFPlayer *ffp, F
+         break;
+     }
+     case FFP_CMD_PAUSE:
+-        ffp_cmd_pause(ffp, c->i);
++        ffp_cmd_pause(ffp, c->i, (int64_t)c->d);
++        break;
++    case FFP_CMD_STEP_FRAME:
++        ffp_cmd_step_frame(ffp, c->i);
+         break;
+     case FFP_CMD_SEEK:
+         if (is)
+@@ -8117,31 +8905,31 @@ static void ffp_stock_key(FFPlayer *ffp,
+         break;
+     case SDLK_PAGEUP:
+         if (is->ic->nb_chapters <= 1) {
+-            ffp_seek_relative(is, 600.0);
++            ffp_seek_relative(is, 600.0, 0);
+             break;
+         }
+         seek_chapter(is, 1);
+         break;
+     case SDLK_PAGEDOWN:
+         if (is->ic->nb_chapters <= 1) {
+-            ffp_seek_relative(is, -600.0);
++            ffp_seek_relative(is, -600.0, 0);
+             break;
+         }
+         seek_chapter(is, -1);
+         break;
+     case SDLK_LEFT:
+         incr = o->seek_interval ? -o->seek_interval : -10.0;
+-        ffp_seek_relative(is, incr);
++        ffp_seek_relative(is, incr, 0);
+         break;
+     case SDLK_RIGHT:
+         incr = o->seek_interval ? o->seek_interval : 10.0;
+-        ffp_seek_relative(is, incr);
++        ffp_seek_relative(is, incr, 0);
+         break;
+     case SDLK_UP:
+-        ffp_seek_relative(is, 60.0);
++        ffp_seek_relative(is, 60.0, 0);
+         break;
+     case SDLK_DOWN:
+-        ffp_seek_relative(is, -60.0);
++        ffp_seek_relative(is, -60.0, 0);
+         break;
+     default:
+         break;
+@@ -8392,6 +9180,44 @@ static void ffp_tick(FFPlayer *ffp, doub
+ {
+     VideoState *is = ffp->is;
+     int64_t now = av_gettime_relative();
++    int reverse_state;
++
++    SDL_LockMutex(ffp->mutex);
++    reverse_state = is->reverse_step_state;
++    if (reverse_state == FFP_REVERSE_STEP_RETRY) {
++        is->reverse_step_attempt++;
++        is->reverse_step_state = FFP_REVERSE_STEP_SEEKING;
++    } else if (reverse_state == FFP_REVERSE_STEP_QUEUED || reverse_state == FFP_REVERSE_STEP_FAILED) {
++        is->reverse_step_state = FFP_REVERSE_STEP_NONE;
++    }
++    SDL_UnlockMutex(ffp->mutex);
++
++    if (reverse_state == FFP_REVERSE_STEP_RETRY) {
++        /* The demuxer lands on the first key packet at or after the seek point, so a retry has to seek before the key packet
++         * preceding the displayed frame, however long the GOP is: widen the margin fourfold per attempt. */
++        const int64_t previous_max_us = is->reverse_step_seek_ts - ((3 * AV_TIME_BASE / 5) << (2 * is->reverse_step_attempt));
++        av_log(NULL, AV_LOG_DEBUG, "reverse step retry %d before source frame %.3f s\n",
++               is->reverse_step_attempt, is->reverse_step_seek_ts / (double)AV_TIME_BASE);
++        is->reverse_step_source_seen = 0;
++        is->seek_pos = previous_max_us;
++        is->seek_rel = 0;
++        is->seek_flags = AVSEEK_FLAG_BACKWARD;
++        is->seek_bounds_set = 1;
++        is->seek_min = INT64_MIN;
++        is->seek_max = previous_max_us;
++        is->seek_req = 1;
++        SDL_AtomicSet(&is->eof, 0);
++        SDL_AtomicSet(&is->eof_notified, 0);
++        SDL_CondSignal(is->continue_read_thread);
++    } else if (reverse_state == FFP_REVERSE_STEP_QUEUED) {
++        step_to_next_frame(is);
++    } else if (reverse_state == FFP_REVERSE_STEP_FAILED) {
++        if (!is->paused)
++            stream_toggle_pause(is);
++        is->step = 0;
++        ffp_api_step_end(is, 0);
++        ffp_set_state(ffp, FFP_ST_PAUSED, 0);
++    }
+ 
+     ffp_apply_pending_seek(ffp, is);
+     ffp_sync_hosted_size(ffp, is);
+@@ -8416,12 +9242,21 @@ static void ffp_tick(FFPlayer *ffp, doub
+         ffp->cursor_hidden = 1;
+     }
+ 
+-    if (is->show_mode != SHOW_MODE_NONE && (!is->paused || is->force_refresh)) {
++    if (is->show_mode != SHOW_MODE_NONE && (!is->paused || is->force_refresh || is->start_paused_frame)) {
+         double rt = REFRESH_RATE;
+         video_refresh(is, &rt);
+         *remaining = FFMIN(*remaining, rt);
+     }
+ 
++    if (is->api_step_pending && is->step && SDL_AtomicGet(&is->eof) &&
++        is->viddec.finished == is->videoq.serial && frame_queue_nb_remaining(&is->pictq) == 0) {
++        if (!is->paused)
++            stream_toggle_pause(is);
++        is->step = 0;
++        ffp_api_step_end(is, 0);
++        ffp_set_state(ffp, FFP_ST_PAUSED, 0);
++    }
++
+     if (SDL_AtomicGet(&is->prepared)) {
+         double pos = ffp_position(is);
+ 
+@@ -8429,7 +9264,7 @@ static void ffp_tick(FFPlayer *ffp, doub
+         ffp->position = pos;
+         SDL_UnlockMutex(ffp->mutex);
+ 
+-        if (now - ffp->last_position_event >= FFP_POSITION_INTERVAL) {
++        if (is->step_position_pending || now - ffp->last_position_event >= FFP_POSITION_INTERVAL) {
+             ffp->last_position_event = now;
+             if (!isnan(pos)) {
+                 AVBPrint bp;
+@@ -8442,6 +9277,12 @@ static void ffp_tick(FFPlayer *ffp, doub
+                 ffp_emit(ffp, FFP_EVENT_POSITION, bp.str);
+                 av_bprint_finalize(&bp, NULL);
+             }
++            is->step_position_pending = 0;
++        }
++
++        if (ffp->step_done_pending) {
++            ffp->step_done_pending = 0;
++            ffp_emit_step_done(ffp, ffp->step_done_dir, ffp->step_done_moved);
+         }
+ 
+         if (ffp_starved(is)) {
+@@ -8765,6 +9606,8 @@ static void ffp_close_media(FFPlayer *ff
+     SDL_DestroySemaphore(c.done);
+     if (c.is_out)
+         stream_close(c.is_out);
++    ffp->step_done_pending = 0;
++    SDL_AtomicSet(&ffp->step_busy, 0);
+ }
+ 
+ FFP_API void FFP_CALL ffp_destroy(FFPlayer *ffp)
+@@ -9167,6 +10010,7 @@ static const FFPOptDef ffp_optdefs[] = {
+     { "noborder",         OT_BOOL,   OO(borderless) },
+     { "alwaysontop",      OT_BOOL,   OO(alwaysontop) },
+     { "stats",            OT_INT,    OO(show_status) },
++    { "frame_trace",      OT_BOOL,   OO(frame_trace) },
+     { "fast",             OT_BOOL,   OO(fast) },
+     { "genpts",           OT_BOOL,   OO(genpts) },
+     { "drp",              OT_INT,    OO(decoder_reorder_pts) },
+@@ -9206,6 +10050,7 @@ static const FFPOptDef ffp_optdefs[] = {
+     { "presenter_debug_cuda_copy", OT_STRING, OO(presenter_debug_cuda_copy) },
+     { "presenter_debug_cuda_readdress", OT_STRING, OO(presenter_debug_cuda_readdress) },
+     { "presenter_debug_srv_fail", OT_INT, OO(presenter_debug_srv_fail) },
++    { "start_paused",     OT_BOOL,   OO(start_paused) },
+     { NULL }
+ };
+ 
+@@ -9561,17 +10406,17 @@ FFP_API int FFP_CALL ffp_stop(FFPlayer *
+ 
+ FFP_API int FFP_CALL ffp_play(FFPlayer *ffp)
+ {
+-    return ffp ? ffp_post_simple(ffp, FFP_CMD_PAUSE, 0, 0) : FFP_EINVAL;
++    return ffp ? ffp_post_simple(ffp, FFP_CMD_PAUSE, (double)av_gettime_relative(), 0) : FFP_EINVAL;
+ }
+ 
+ FFP_API int FFP_CALL ffp_pause(FFPlayer *ffp)
+ {
+-    return ffp ? ffp_post_simple(ffp, FFP_CMD_PAUSE, 0, 1) : FFP_EINVAL;
++    return ffp ? ffp_post_simple(ffp, FFP_CMD_PAUSE, (double)av_gettime_relative(), 1) : FFP_EINVAL;
+ }
+ 
+ FFP_API int FFP_CALL ffp_toggle_pause(FFPlayer *ffp)
+ {
+-    return ffp ? ffp_post_simple(ffp, FFP_CMD_PAUSE, 0, -1) : FFP_EINVAL;
++    return ffp ? ffp_post_simple(ffp, FFP_CMD_PAUSE, (double)av_gettime_relative(), -1) : FFP_EINVAL;
+ }
+ 
+ FFP_API int FFP_CALL ffp_seek(FFPlayer *ffp, double seconds, int flags)
+@@ -9582,6 +10427,19 @@ FFP_API int FFP_CALL ffp_seek(FFPlayer *
+     return ffp_post_simple(ffp, FFP_CMD_SEEK, seconds, flags);
+ }
+ 
++FFP_API int FFP_CALL ffp_step_frame(FFPlayer *ffp, int direction)
++{
++    int ret;
++    if (!ffp || (direction != 1 && direction != -1))
++        return FFP_EINVAL;
++    if (!SDL_AtomicCAS(&ffp->step_busy, 0, 1))
++        return FFP_EBUSY;
++    ret = ffp_post_simple(ffp, FFP_CMD_STEP_FRAME, 0, direction);
++    if (ret)
++        SDL_AtomicSet(&ffp->step_busy, 0);
++    return ret;
++}
++
+ FFP_API int FFP_CALL ffp_set_volume(FFPlayer *ffp, int volume_0_100)
+ {
+     if (!ffp)
+@@ -10177,6 +11035,43 @@ static void ffp_dbg_queue(AVBPrint *bp,
+     av_bprintf(bp, "}");
+ }
+ 
++static void ffp_dbg_frame_mark_json(AVBPrint *bp, const char *name, const FFPDebugFrameMark *mark, int64_t count)
++{
++    av_bprintf(bp, "\"%s\":{\"count\":%"PRId64",\"pts\":", name, count);
++    json_num(bp, count > 0 ? mark->pts : NAN, 6);
++    av_bprintf(bp, ",\"serial\":");
++    if (count > 0) av_bprintf(bp, "%d", mark->serial); else av_bprintf(bp, "null");
++    av_bprintf(bp, ",\"at_us\":");
++    if (count > 0) av_bprintf(bp, "%"PRId64, mark->at_us); else av_bprintf(bp, "null");
++    av_bprintf(bp, "}");
++}
++
++static void ffp_dbg_frame_events_json(AVBPrint *bp, const FFPDebug *d)
++{
++    static const char *const names[] = { "decoded", "filtered", "presented", "early_drop", "late_drop", "presenter_drop", "audio" };
++    int i;
++    av_bprintf(bp, "[");
++    for (i = 0; i < d->frame_trace_count; i++) {
++        const FFPDebugFrameEvent *e = &d->frame_trace[(d->frame_trace_head - d->frame_trace_count + i + FFP_FRAME_TRACE_RING) % FFP_FRAME_TRACE_RING];
++        if (i) av_bprintf(bp, ",");
++        av_bprintf(bp, "{\"kind\":\"%s\",\"count\":%"PRId64",\"pts\":", names[e->type], e->count);
++        json_num(bp, e->pts, 6);
++        av_bprintf(bp, ",\"serial\":%d,\"at_us\":%"PRId64",\"dxgi_valid\":%s,\"dxgi_present_count\":",
++                   e->serial, e->at_us, e->dxgi_valid ? "true" : "false");
++        if (e->dxgi_valid) av_bprintf(bp, "%u", e->dxgi_present_count); else av_bprintf(bp, "null");
++        av_bprintf(bp, ",\"dxgi_sync_refresh_count\":");
++        if (e->dxgi_valid) av_bprintf(bp, "%u", e->dxgi_sync_refresh_count); else av_bprintf(bp, "null");
++        av_bprintf(bp, ",\"dxgi_sync_qpc_time\":");
++        if (e->dxgi_valid) av_bprintf(bp, "%"PRIu64, e->dxgi_sync_qpc_time); else av_bprintf(bp, "null");
++        av_bprintf(bp, ",\"dxgi_sync_gpu_time\":");
++        if (e->dxgi_valid) av_bprintf(bp, "%"PRIu64, e->dxgi_sync_gpu_time); else av_bprintf(bp, "null");
++        av_bprintf(bp, ",\"gpu_total_us\":%"PRIu64",\"gpu_frames\":%"PRIu64",\"gpu_last_us\":%"PRIu64,
++                   e->d3d_gpu_total_us, e->d3d_gpu_frames, e->d3d_gpu_last_us);
++        av_bprintf(bp, "}");
++    }
++    av_bprintf(bp, "]");
++}
++
+ /* Caller holds ffp->dbg_mutex and `is` is ffp->dbg_is. Takes is->dbg_mutex and the packet queue mutexes,
+  * all of which are only ever held for a few instructions. */
+ static void ffp_build_debug_info(FFPlayer *ffp, VideoState *is, const char *vf, const char *af,
+@@ -10185,7 +11080,8 @@ static void ffp_build_debug_info(FFPlaye
+                                  const char *pres_extra, AVBPrint *bp)
+ {
+     FFPDebug *d = &is->dbg;
+-    double now = av_gettime_relative() / 1000000.0;
++    int64_t now_us = av_gettime_relative();
++    double now = now_us / 1000000.0;
+     double av_diff = ffp_av_diff(is);
+     const char *master;
+     int lp;
+@@ -10201,6 +11097,7 @@ static void ffp_build_debug_info(FFPlaye
+ 
+     av_bprintf(bp, "{\"position\":");
+     json_num(bp, position, 3);
++    av_bprintf(bp, ",\"clock_us\":%"PRId64, now_us);
+     av_bprintf(bp, ",\"duration\":");
+     json_num(bp, duration > 0 ? duration : NAN, 3);
+     av_bprintf(bp, ",\"paused\":%s,\"speed\":", is->paused ? "true" : "false");
+@@ -10366,6 +11263,47 @@ static void ffp_build_debug_info(FFPlaye
+     av_bprintf(bp, ",\"vf_nodes\":%s,\"af_nodes\":%s}", d->vf_nodes ? d->vf_nodes : "[]",
+                d->af_nodes ? d->af_nodes : "[]");
+ 
++    av_bprintf(bp, ",\"seek\":{\"valid\":%s,\"requested\":", d->seek_debug_valid ? "true" : "false");
++    json_num(bp, d->seek_debug_valid ? d->seek_requested_s : NAN, 6);
++    av_bprintf(bp, ",\"keyframe\":");
++    json_num(bp, d->seek_debug_valid ? d->seek_keyframe_s : NAN, 6);
++    av_bprintf(bp, ",\"distance_ms\":");
++    json_num(bp, d->seek_debug_valid ? (d->seek_keyframe_s - d->seek_requested_s) * 1000.0 : NAN, 2);
++    av_bprintf(bp, ",\"gop_ms\":");
++    json_num(bp, d->seek_debug_valid ? d->seek_gop_s * 1000.0 : NAN, 2);
++    av_bprintf(bp, ",\"direction\":\"%s\"}",
++               d->seek_direction > 0 ? "forward" : d->seek_direction < 0 ? "backward" : "absolute");
++
++    av_bprintf(bp, ",\"frame_trace\":{");
++    ffp_dbg_frame_mark_json(bp, "decoded", &d->decoded, d->fps_dec.total);
++    av_bprintf(bp, ",");
++    ffp_dbg_frame_mark_json(bp, "filtered", &d->filtered, d->fps_flt.total);
++    av_bprintf(bp, ",");
++    ffp_dbg_frame_mark_json(bp, "presented", &d->presented, d->fps_disp.total);
++    av_bprintf(bp, ",");
++    ffp_dbg_frame_mark_json(bp, "early_drop", &d->early_drop, is->frame_drops_early);
++    av_bprintf(bp, ",");
++    ffp_dbg_frame_mark_json(bp, "late_drop", &d->late_drop, is->frame_drops_late);
++    av_bprintf(bp, ",");
++    ffp_dbg_frame_mark_json(bp, "presenter_drop", &d->presenter_drop, d->presenter_drop_count);
++    av_bprintf(bp, ",\"dxgi_valid\":%s,\"dxgi_present_count\":", d->dxgi_valid ? "true" : "false");
++    if (d->dxgi_valid) av_bprintf(bp, "%u", d->dxgi_present_count); else av_bprintf(bp, "null");
++    av_bprintf(bp, ",\"dxgi_present_refresh_count\":");
++    if (d->dxgi_valid) av_bprintf(bp, "%u", d->dxgi_present_refresh_count); else av_bprintf(bp, "null");
++    av_bprintf(bp, ",\"dxgi_sync_refresh_count\":");
++    if (d->dxgi_valid) av_bprintf(bp, "%u", d->dxgi_sync_refresh_count); else av_bprintf(bp, "null");
++    av_bprintf(bp, ",\"dxgi_sync_qpc_time\":");
++    if (d->dxgi_valid) av_bprintf(bp, "%"PRIu64, d->dxgi_sync_qpc_time); else av_bprintf(bp, "null");
++    av_bprintf(bp, ",\"dxgi_sync_gpu_time\":");
++    if (d->dxgi_valid) av_bprintf(bp, "%"PRIu64, d->dxgi_sync_gpu_time); else av_bprintf(bp, "null");
++    av_bprintf(bp, ",\"gpu_total_us\":%"PRIu64",\"gpu_frames\":%"PRIu64",\"gpu_last_us\":%"PRIu64,
++               d->d3d_gpu_total_us, d->d3d_gpu_frames, d->d3d_gpu_last_us);
++    if (is->o->frame_trace) {
++        av_bprintf(bp, ",\"events\":");
++        ffp_dbg_frame_events_json(bp, d);
++    }
++    av_bprintf(bp, "}");
++
+     av_bprintf(bp, ",\"sync\":{\"master\":\"%s\",\"audio_clock\":", master);
+     json_num(bp, is->audio_st ? get_clock(&is->audclk) : NAN, 3);
+     av_bprintf(bp, ",\"video_clock\":");
+@@ -10414,6 +11352,17 @@ static void ffp_build_debug_info(FFPlaye
+         av_bprintf(bp, ",\"drops_early\":%d,\"drops_late\":%d}", is->frame_drops_early, is->frame_drops_late);
+     }
+ 
++    /* pause / resume latency of the last pause command (av_gettime_relative() us, 0 = not yet) */
++    av_bprintf(bp, ",\"pause_timing\":{\"want\":%d,\"now_us\":%"PRId64",\"api_us\":%"PRId64",\"apply_us\":%"PRId64",\"state_us\":%"PRId64
++               ",\"last_frame_us\":%"PRId64",\"frames_after\":%d,\"first_frame_us\":%"PRId64
++               ",\"audio_last_end_us\":%"PRId64",\"audio_first_us\":%"PRId64",\"audio_after_ms\":",
++               is->pt_want, av_gettime_relative(), is->pt_api_us, is->pt_apply_us, is->pt_state_us, is->pt_last_frame_us,
++               is->pt_frames_after, is->pt_first_frame_us, is->pt_audio_last_end_us, is->pt_audio_first_us);
++    json_num(bp, is->audio_tgt.bytes_per_sec > 0 ? 1000.0 * is->pt_audio_after_bytes / is->audio_tgt.bytes_per_sec : NAN, 2);
++    av_bprintf(bp, ",\"audio_device_ms\":");
++    json_num(bp, is->audio_tgt.bytes_per_sec > 0 ? 1000.0 * 2.0 * is->audio_hw_buf_size / is->audio_tgt.bytes_per_sec : NAN, 2);
++    av_bprintf(bp, "}");
++
+     av_bprintf(bp, ",\"queues\":{");
+     ffp_dbg_queue(bp, "audio", &is->audioq, d->a_tb);
+     av_bprintf(bp, ",");
+--- a/fftools/ffplay.h
++++ b/fftools/ffplay.h
+@@ -62,6 +62,7 @@ typedef struct FFPBackdropRegion {
+ /* return codes: AVERROR(EINVAL) and AVERROR(EAGAIN) */
+ #define FFP_EINVAL (-22)
+ #define FFP_EAGAIN (-11)
++#define FFP_EBUSY (-16)   /* ffp_step_frame: a step is already in flight; the request was dropped, not queued */
+ 
+ typedef struct FFPlayer FFPlayer;
+ 
+@@ -75,6 +76,7 @@ enum {
+     FFP_EVENT_INPUT        = 7,
+     FFP_EVENT_FILTER_ERROR = 8,
+     FFP_EVENT_PRESENTER_ERROR = 9,   /* json: {"presenter":"d3d11","error":"...","fallback":"sdl"} (see "presenters" below) */
++    FFP_EVENT_STEP_DONE    = 10,     /* json: {"direction":1|-1,"moved":0|1}; see ffp_step_frame */
+ };
+ 
+ enum { FFP_SEEK_ABSOLUTE = 0, FFP_SEEK_RELATIVE = 1 };
+@@ -126,6 +128,21 @@ FFP_API int         FFP_CALL ffp_play(FF
+ FFP_API int         FFP_CALL ffp_pause(FFPlayer *p);
+ FFP_API int         FFP_CALL ffp_toggle_pause(FFPlayer *p);
+ FFP_API int         FFP_CALL ffp_seek(FFPlayer *p, double seconds, int flags);
++/* Asynchronously advances to one output video frame (+1) or the preceding
++ * output video frame (-1), counting frames after the complete video filter graph. Both
++ * directions pause playback and remain paused. One step is in flight at a time and requests are
++ * never buffered: returns 0 when accepted, FFP_EBUSY when a step is still in flight (the request is
++ * dropped; retry after FFP_EVENT_STEP_DONE), FFP_EINVAL for invalid arguments. Completion
++ * (including no previous frame at the start, no next frame at EOF, or no video) emits
++ * FFP_EVENT_POSITION immediately and then FFP_EVENT_STEP_DONE {"direction":+1|-1,"moved":0|1}
++ * ("moved":0: no frame was presented); ffp_get_position then reports the displayed output-frame
++ * position. A new step is accepted from the moment STEP_DONE is raised. Calls should be made after
++ * PREPARED. */
++FFP_API int         FFP_CALL ffp_step_frame(FFPlayer *p, int direction); /* +1 next, -1 previous */
++/* Open option start_paused=1: the open ends PAUSED with the first frame at the start position presented and a valid
++ * position; no audio is output and the clocks do not run until ffp_play, so playback then starts in sync from that
++ * frame. (A paused ffp_open + ffp_step_frame would output nothing either, but its audio clock runs while the first
++ * frame is decoded, so the first frames after ffp_play are late.) */
+ FFP_API int         FFP_CALL ffp_set_volume(FFPlayer *p, int volume_0_100);   /* persists across opens */
+ FFP_API int         FFP_CALL ffp_set_mute(FFPlayer *p, int mute);             /* persists across opens */
+ 
+--- a/fftools/ffplay_d3d11.c
++++ b/fftools/ffplay_d3d11.c
+@@ -243,6 +243,11 @@ typedef struct FFPAcrylicTimer {
+     int pending;
+ } FFPAcrylicTimer;
+ 
++typedef struct FFPFrameGpuTimer {
++    ID3D11Query *disjoint, *begin, *end;
++    int pending;
++} FFPFrameGpuTimer;
++
+ typedef struct FFPOverlayTexture {
+     ID3D11Texture2D *texture;
+     ID3D11ShaderResourceView *srv;
+@@ -1374,6 +1379,10 @@ struct FFPD3D11 {
+     unsigned acrylic_timer_next;
+     int acrylic_timer_unavailable;
+     LONG64 acrylic_frames_blurred, acrylic_failures, acrylic_last_blur_us;
++    FFPFrameGpuTimer frame_gpu_timers[4];
++    unsigned frame_gpu_timer_next;
++    int frame_gpu_timer_unavailable;
++    LONG64 frame_gpu_total_us, frame_gpu_count, frame_gpu_last_us;
+ 
+     CRITICAL_SECTION cs;            /* display / snapshot */
+     AVBufferRef *up_frames;
+@@ -2243,6 +2252,102 @@ static void ffp_acrylic_timer_end(FFPD3D
+     t->pending = 2;
+ }
+ 
++static void ffp_frame_gpu_timer_free(FFPD3D11 *p)
++{
++    int i;
++    for (i = 0; i < (int)(sizeof(p->frame_gpu_timers) / sizeof(p->frame_gpu_timers[0])); i++) {
++        FFP_REL(p->frame_gpu_timers[i].disjoint);
++        FFP_REL(p->frame_gpu_timers[i].begin);
++        FFP_REL(p->frame_gpu_timers[i].end);
++        p->frame_gpu_timers[i].pending = 0;
++    }
++}
++
++static int ffp_frame_gpu_timer_ensure(FFPD3D11 *p)
++{
++    D3D11_QUERY_DESC qd;
++    int i;
++    if (p->frame_gpu_timer_unavailable)
++        return -1;
++    for (i = 0; i < (int)(sizeof(p->frame_gpu_timers) / sizeof(p->frame_gpu_timers[0])); i++) {
++        FFPFrameGpuTimer *t = &p->frame_gpu_timers[i];
++        HRESULT hr;
++        if (t->disjoint && t->begin && t->end)
++            continue;
++        memset(&qd, 0, sizeof(qd));
++        qd.Query = D3D11_QUERY_TIMESTAMP_DISJOINT;
++        hr = p->dev->lpVtbl->CreateQuery(p->dev, &qd, &t->disjoint);
++        if (FAILED(hr)) goto fail;
++        qd.Query = D3D11_QUERY_TIMESTAMP;
++        hr = p->dev->lpVtbl->CreateQuery(p->dev, &qd, &t->begin);
++        if (FAILED(hr)) goto fail;
++        hr = p->dev->lpVtbl->CreateQuery(p->dev, &qd, &t->end);
++        if (FAILED(hr)) goto fail;
++    }
++    return 0;
++fail:
++    ffp_frame_gpu_timer_free(p);
++    p->frame_gpu_timer_unavailable = 1;
++    return -1;
++}
++
++static void ffp_frame_gpu_timer_poll(FFPD3D11 *p)
++{
++    int i;
++    for (i = 0; i < (int)(sizeof(p->frame_gpu_timers) / sizeof(p->frame_gpu_timers[0])); i++) {
++        FFPFrameGpuTimer *t = &p->frame_gpu_timers[i];
++        D3D11_QUERY_DATA_TIMESTAMP_DISJOINT disjoint;
++        UINT64 begin, end;
++        if (t->pending < 2)
++            continue;
++        if (p->ctx->lpVtbl->GetData(p->ctx, (ID3D11Asynchronous *)t->disjoint, &disjoint, sizeof(disjoint), D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK ||
++            p->ctx->lpVtbl->GetData(p->ctx, (ID3D11Asynchronous *)t->begin, &begin, sizeof(begin), D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK ||
++            p->ctx->lpVtbl->GetData(p->ctx, (ID3D11Asynchronous *)t->end, &end, sizeof(end), D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK)
++            continue;
++        if (t->pending == 2 && !disjoint.Disjoint && disjoint.Frequency && end >= begin) {
++            LONG64 us = (LONG64)llrint((double)(end - begin) * 1000000.0 / (double)disjoint.Frequency);
++            InterlockedExchange64(&p->frame_gpu_last_us, us);
++            InterlockedExchange64(&p->frame_gpu_total_us,
++                InterlockedCompareExchange64(&p->frame_gpu_total_us, 0, 0) + us);
++            InterlockedIncrement64(&p->frame_gpu_count);
++        }
++        t->pending = 0;
++    }
++}
++
++static int ffp_frame_gpu_timer_begin(FFPD3D11 *p)
++{
++    unsigned k, count = (unsigned)(sizeof(p->frame_gpu_timers) / sizeof(p->frame_gpu_timers[0]));
++    if (ffp_frame_gpu_timer_ensure(p) < 0)
++        return -1;
++    ffp_frame_gpu_timer_poll(p);
++    for (k = 0; k < count; k++) {
++        unsigned i = (p->frame_gpu_timer_next + k) % count;
++        FFPFrameGpuTimer *t = &p->frame_gpu_timers[i];
++        if (t->pending)
++            continue;
++        p->ctx->lpVtbl->Begin(p->ctx, (ID3D11Asynchronous *)t->disjoint);
++        p->ctx->lpVtbl->End(p->ctx, (ID3D11Asynchronous *)t->begin);
++        t->pending = 1;
++        p->frame_gpu_timer_next = (i + 1) % count;
++        return (int)i;
++    }
++    return -1;
++}
++
++static void ffp_frame_gpu_timer_end(FFPD3D11 *p, int index, int discard)
++{
++    FFPFrameGpuTimer *t;
++    if (index < 0 || index >= (int)(sizeof(p->frame_gpu_timers) / sizeof(p->frame_gpu_timers[0])))
++        return;
++    t = &p->frame_gpu_timers[index];
++    if (t->pending != 1)
++        return;
++    p->ctx->lpVtbl->End(p->ctx, (ID3D11Asynchronous *)t->end);
++    p->ctx->lpVtbl->End(p->ctx, (ID3D11Asynchronous *)t->disjoint);
++    t->pending = discard ? 3 : 2;
++}
++
+ static int ffp_acrylic_apply(FFPD3D11 *p, ID3D11Texture2D *bb, ID3D11RenderTargetView *rtv,
+                              int w, int h, char *err, size_t n)
+ {
+@@ -3308,6 +3413,7 @@ void ffp_d3d11_destroy(FFPD3D11 *p)
+     FFP_REL(p->acrylic_noise);
+     ffp_acrylic_renderer_free(&p->acrylic_renderer);
+     ffp_acrylic_timer_free(p);
++    ffp_frame_gpu_timer_free(p);
+     FFP_REL(p->overlay_readback_staging);
+     av_freep(&p->overlay_readback_data);
+     av_frame_free(&p->up_frame);
+@@ -3427,6 +3533,33 @@ const FFPD3D11Limits *ffp_d3d11_limits(c
+     return &p->lim;
+ }
+ 
++int ffp_d3d11_frame_stats(FFPD3D11 *p, uint32_t *present_count, uint32_t *present_refresh_count,
++                          uint32_t *sync_refresh_count, uint64_t *sync_qpc_time, uint64_t *sync_gpu_time,
++                          uint64_t *gpu_total_us, uint64_t *gpu_frames, uint64_t *gpu_last_us)
++{
++    DXGI_FRAME_STATISTICS stats;
++    HRESULT hr;
++
++    if (!p)
++        return 0;
++    ffp_frame_gpu_timer_poll(p);
++    if (gpu_total_us) *gpu_total_us = (uint64_t)InterlockedCompareExchange64(&p->frame_gpu_total_us, 0, 0);
++    if (gpu_frames) *gpu_frames = (uint64_t)InterlockedCompareExchange64(&p->frame_gpu_count, 0, 0);
++    if (gpu_last_us) *gpu_last_us = (uint64_t)InterlockedCompareExchange64(&p->frame_gpu_last_us, 0, 0);
++    if (!p->sc)
++        return 0;
++    memset(&stats, 0, sizeof(stats));
++    hr = p->sc->lpVtbl->GetFrameStatistics(p->sc, &stats);
++    if (FAILED(hr))
++        return 0;
++    if (present_count) *present_count = stats.PresentCount;
++    if (present_refresh_count) *present_refresh_count = stats.PresentRefreshCount;
++    if (sync_refresh_count) *sync_refresh_count = stats.SyncRefreshCount;
++    if (sync_qpc_time) *sync_qpc_time = (uint64_t)stats.SyncQPCTime.QuadPart;
++    if (sync_gpu_time) *sync_gpu_time = (uint64_t)stats.SyncGPUTime.QuadPart;
++    return 1;
++}
++
+ int ffp_d3d11_frame_ok(const void *dev, const AVFrame *f)
+ {
+     AVHWFramesContext *fc;
+@@ -3727,6 +3860,7 @@ int ffp_d3d11_display(FFPD3D11 *p, const
+     RECT dst, target;
+     HRESULT hr;
+     int rw, rh, ret = -1, copied = 0, shader = 0;
++    int gpu_timer = -1, gpu_timer_ended = 0;
+ 
+     EnterCriticalSection(&p->cs);
+     ffp_last_hr = S_OK;
+@@ -3743,6 +3877,7 @@ int ffp_d3d11_display(FFPD3D11 *p, const
+         goto done;
+     if (p->hwctx && InterlockedCompareExchange((volatile LONG *)&p->hwctx->decoder_bind_fallbacks, 0, 0))
+         ffp_d3d11_record_fallback(p, "decoder_pool_no_srv");     /* a decoder pool was created again without SHADER_RESOURCE */
++    gpu_timer = ffp_frame_gpu_timer_begin(p);
+     if (f->format == AV_PIX_FMT_CUDA) {
+         memset(&in, 0, sizeof(in));
+         in.vis_w = FFMAX(f->width - f->crop_left, 1);
+@@ -3758,6 +3893,8 @@ int ffp_d3d11_display(FFPD3D11 *p, const
+         ret = ffp_cuda_render(p, f, pp, rtv, p->sc_w, p->sc_h, direct, err, err_size);
+         if (ret < 0) goto done;
+         if (ret > 0) {
++            ffp_frame_gpu_timer_end(p, gpu_timer, 1);
++            gpu_timer_ended = 1;
+             FFP_REL(rtv); FFP_REL(bb);
+             LeaveCriticalSection(&p->cs);
+             return 1; /* unsafe retired frame skipped, not a presenter failure */
+@@ -3770,6 +3907,8 @@ int ffp_d3d11_display(FFPD3D11 *p, const
+         (void)ffp_acrylic_apply(p, bb, rtv, p->sc_w, p->sc_h, err, err_size);
+         ffp_overlay_capture_readback(p, bb, p->sc_w, p->sc_h);
+         ffp_unlock_dev(p);
++        ffp_frame_gpu_timer_end(p, gpu_timer, 0);
++        gpu_timer_ended = 1;
+         FFP_REL(rtv);
+         FFP_REL(bb);
+         p->route_shader = 1;
+@@ -3830,6 +3969,8 @@ int ffp_d3d11_display(FFPD3D11 *p, const
+             shader = FFP_ROUTE_PICK_VP;
+         } else {
+             if (ret < 0) goto done;
++            ffp_frame_gpu_timer_end(p, gpu_timer, 0);
++            gpu_timer_ended = 1;
+             if (p010_no_vp)
+                 ffp_d3d11_record_fallback(p, "p010_vp_unsupported:shader");
+             p->route_shader = 1;
+@@ -3883,6 +4024,8 @@ int ffp_d3d11_display(FFPD3D11 *p, const
+     ffp_unlock_dev(p);
+     if (ret < 0)
+         goto done;
++    ffp_frame_gpu_timer_end(p, gpu_timer, 0);
++    gpu_timer_ended = 1;
+     ret = -1;
+     FFP_REL(ov);
+     FFP_REL(rtv);   /* a back-buffer view left alive makes the next ResizeBuffers fail (DXGI_ERROR_INVALID_CALL) */
+@@ -3902,6 +4045,8 @@ int ffp_d3d11_display(FFPD3D11 *p, const
+     return 0;
+ fail:
+ done:
++    if (gpu_timer >= 0 && !gpu_timer_ended)
++        ffp_frame_gpu_timer_end(p, gpu_timer, 1);
+     FFP_REL(rtv);
+     FFP_REL(ov);
+     FFP_REL(bb);
+@@ -4210,6 +4355,8 @@ void ffp_d3d11_cuda_remap_stats(const FF
+ void *ffp_d3d11_device_ptr(FFPD3D11 *p) { return NULL; }
+ int ffp_d3d11_frame_ok(const void *dev, const AVFrame *f) { return 0; }
+ const FFPD3D11Limits *ffp_d3d11_limits(const FFPD3D11 *p) { return NULL; }
++int ffp_d3d11_frame_stats(FFPD3D11 *p, uint32_t *pc, uint32_t *pr, uint32_t *sr, uint64_t *sq, uint64_t *sg,
++                          uint64_t *gt, uint64_t *gc, uint64_t *gl) { return 0; }
+ int ffp_d3d11_display(FFPD3D11 *p, const AVFrame *f, const FFPPresParams *pp, int *d, char *e, size_t n) { return -1; }
+ void ffp_d3d11_clear(FFPD3D11 *p) {}
+ int ffp_d3d11_set_overlay(FFPD3D11 *p, int l, const FFPOverlayLayer *o, char *e, size_t n) { return -1; }
+--- a/fftools/ffplay_presenter.h
++++ b/fftools/ffplay_presenter.h
+@@ -242,6 +242,10 @@ const FFPD3D11Limits *ffp_d3d11_limits(c
+ /* presents f (hardware D3D11 frame or system frame); *direct = 1 if no copy was needed.
+  * Returns 0 or a negative value (err filled): the caller must stop using the presenter. */
+ int ffp_d3d11_display(FFPD3D11 *p, const AVFrame *f, const FFPPresParams *pp, int *direct, char *err, size_t err_size);
++/* DXGI frame statistics for the last successful present. Returns 1 when available, 0 when disjoint/unsupported. */
++int ffp_d3d11_frame_stats(FFPD3D11 *p, uint32_t *present_count, uint32_t *present_refresh_count,
++                          uint32_t *sync_refresh_count, uint64_t *sync_qpc_time, uint64_t *sync_gpu_time,
++                          uint64_t *gpu_total_us, uint64_t *gpu_frames, uint64_t *gpu_last_us);
+ void ffp_d3d11_clear(FFPD3D11 *p);
+ /* renders f through the VideoProcessor into a BGRA buffer (av_malloc, ffp_free) of the size documented for ffp_snapshot */
+ int ffp_d3d11_snapshot(FFPD3D11 *p, const AVFrame *f, const FFPPresParams *pp, uint8_t **out, int *w, int *h,

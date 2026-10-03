@@ -1,0 +1,194 @@
+--- a/libavcodec/libaribcaption.c
++++ b/libavcodec/libaribcaption.c
+@@ -68,6 +68,7 @@ typedef struct ARIBCaptionContext {
+     aribcc_renderer_t *renderer;
+ 
+     int subtitle_type;
++    int caption_type;
+     int encoding_scheme;
+     int ass_single_rect;
+     char *font;
+@@ -133,7 +134,7 @@ static void logcat_callback(aribcc_logle
+             lvl = AV_LOG_INFO;
+         }
+ 
+-        av_log(ctx, lvl, "%s\n", message);
++        av_log(ctx->avctx, lvl, "%s\n", message);
+     }
+ }
+ 
+@@ -319,6 +320,7 @@ static int aribcaption_trans_bitmap_subt
+     int ret = 0;
+     AVSubtitle *sub = ctx->sub;
+     int status, rect_idx;
++    int image_count, rect_count;
+     int old_width = ctx->frame_width;
+     int old_height = ctx->frame_height;
+ 
+@@ -348,6 +350,7 @@ static int aribcaption_trans_bitmap_subt
+         return AVERROR_EXTERNAL;
+     }
+ 
++    aribcc_render_result_cleanup(&ctx->render_result);
+     status = aribcc_renderer_render(ctx->renderer, ctx->pts, &ctx->render_result);
+     switch (status) {
+     case ARIBCC_RENDER_STATUS_GOT_IMAGE:
+@@ -359,8 +362,11 @@ static int aribcaption_trans_bitmap_subt
+         return 0;
+ 
+     case ARIBCC_RENDER_STATUS_NO_IMAGE:
+-        ff_dlog(ctx, "no image\n");
+-        return 0;
++        aribcc_render_result_cleanup(&ctx->render_result);
++        ff_dlog(ctx, "no image (clear)\n");
++        sub->format = 0;
++        sub->num_rects = 0;
++        return 1;
+ 
+     case ARIBCC_RENDER_STATUS_ERROR:
+         av_log(ctx, AV_LOG_ERROR,
+@@ -374,19 +380,28 @@ static int aribcaption_trans_bitmap_subt
+         return AVERROR_EXTERNAL;
+     }
+ 
+-    if (!ctx->render_result.image_count || ctx->render_result.images == NULL) {
++    image_count = ctx->render_result.image_count;
++    if (!image_count || ctx->render_result.images == NULL ||
++        !ctx->caption.region_count) {
+         aribcc_render_result_cleanup(&ctx->render_result);
+-        ff_dlog(ctx, "no image (%d)\n", ctx->render_result.image_count);
+-        return 0;
++        ff_dlog(ctx, "no image (%d) (clear)\n", image_count);
++        sub->format = 0;
++        sub->num_rects = 0;
++        return 1;
+     }
+ 
++    rect_count = FFMIN(image_count, ctx->caption.region_count);
++    if (rect_count != image_count || rect_count != ctx->caption.region_count)
++        av_log(ctx, AV_LOG_WARNING,
++               "Rendered image count (%d) differs from caption region count (%u).\n",
++               image_count, ctx->caption.region_count);
+     sub->format = 0; /* graphic */
+-    sub->rects = av_calloc(ctx->render_result.image_count, sizeof(*sub->rects));
++    sub->rects = av_calloc(rect_count, sizeof(*sub->rects));
+     if (!sub->rects) {
+         ret = AVERROR(ENOMEM);
+         goto fail;
+     }
+-    for (int i = 0; i < ctx->render_result.image_count; i++) {
++    for (int i = 0; i < rect_count; i++) {
+         sub->rects[i] = av_mallocz(sizeof(*sub->rects[i]));
+         if (!sub->rects[i]) {
+             ret = AVERROR(ENOMEM);
+@@ -394,7 +409,7 @@ static int aribcaption_trans_bitmap_subt
+         }
+     }
+ 
+-    for (rect_idx = 0; rect_idx < ctx->caption.region_count; rect_idx++) {
++    for (rect_idx = 0; rect_idx < rect_count; rect_idx++) {
+         AVSubtitleRect *rect = sub->rects[rect_idx];
+         aribcc_image_t *image = &ctx->render_result.images[rect_idx];
+         int w, h, shrink_height, dst_idx;
+@@ -459,7 +474,7 @@ static int aribcaption_trans_bitmap_subt
+             /* ARIB TR-B14 version 3.8 Fascicle 1-(2/2) Volume 3 [Section 4] */
+             /* No position information is provided for profile C */
+             rect->x = (ctx->frame_width - rect->w) / 2;
+-            rect->y = ctx->frame_height - rect->h * (ctx->caption.region_count - rect_idx);
++            rect->y = ctx->frame_height - rect->h * (rect_count - rect_idx);
+         } else {
+             rect->x = image->dst_x * ctx->bitmap_plane_width / ctx->frame_width;
+             rect->y = image->dst_y * ctx->bitmap_plane_height / ctx->frame_height;
+@@ -482,7 +497,7 @@ static int aribcaption_trans_bitmap_subt
+ 
+ fail:
+     if (sub->rects) {
+-        for (int i = 0; i < ctx->caption.region_count; i++) {
++        for (int i = 0; i < rect_count; i++) {
+             if (sub->rects[i]) {
+                 av_freep(&sub->rects[i]->data[0]);
+                 av_freep(&sub->rects[i]->data[1]);
+@@ -914,10 +929,15 @@ static int aribcaption_decode(AVCodecCon
+     }
+     if (status > 0) {
+         *got_sub_ptr = 1;
++        sub->start_display_time = 0;
+         if (ctx->avpkt->pts != AV_NOPTS_VALUE)
+             sub->pts = av_rescale_q(ctx->avpkt->pts,
+                                     ctx->time_base, AV_TIME_BASE_Q);
+-        if (ctx->caption.wait_duration == ARIBCC_DURATION_INDEFINITE)
++        else
++            sub->pts = AV_NOPTS_VALUE;
++        if (ctx->subtitle_type == SUBTITLE_BITMAP && !sub->num_rects)
++            sub->end_display_time = 0;
++        else if (ctx->caption.wait_duration == ARIBCC_DURATION_INDEFINITE)
+             sub->end_display_time = UINT32_MAX;
+         else
+             sub->end_display_time = (uint32_t)ctx->caption.wait_duration;
+@@ -943,13 +963,20 @@ static av_cold int aribcaption_close(AVC
+ {
+     ARIBCaptionContext *ctx = avctx->priv_data;
+ 
+-    av_freep(&ctx->clut);
+-    if (ctx->renderer)
++    aribcc_render_result_cleanup(&ctx->render_result);
++    if (ctx->renderer) {
+         aribcc_renderer_free(ctx->renderer);
+-    if (ctx->decoder)
++        ctx->renderer = NULL;
++    }
++    av_freep(&ctx->clut);
++    if (ctx->decoder) {
+         aribcc_decoder_free(ctx->decoder);
+-    if (ctx->context)
++        ctx->decoder = NULL;
++    }
++    if (ctx->context) {
+         aribcc_context_free(ctx->context);
++        ctx->context = NULL;
++    }
+ 
+     return 0;
+ }
+@@ -993,14 +1020,14 @@ static av_cold int aribcaption_init(AVCo
+         av_log(avctx, AV_LOG_ERROR, "Failed to alloc libaribcaption context.\n");
+         return AVERROR_EXTERNAL;
+     }
+-    aribcc_context_set_logcat_callback(ctx->context, logcat_callback, avctx);
++    aribcc_context_set_logcat_callback(ctx->context, logcat_callback, ctx);
+     if (!(ctx->decoder = aribcc_decoder_alloc(ctx->context))) {
+         av_log(avctx, AV_LOG_ERROR, "Failed to alloc libaribcaption decoder.\n");
+         return AVERROR_EXTERNAL;
+     }
+     if (!aribcc_decoder_initialize(ctx->decoder,
+                                    (enum aribcc_encoding_scheme_t) ctx->encoding_scheme,
+-                                   ARIBCC_CAPTIONTYPE_CAPTION,
++                                   (enum aribcc_captiontype_t)ctx->caption_type,
+                                    profile,
+                                    ARIBCC_LANGUAGEID_FIRST)) {
+         av_log(avctx, AV_LOG_ERROR, "Failed to initialize libaribcaption decoder.\n");
+@@ -1034,7 +1061,7 @@ static av_cold int aribcaption_init(AVCo
+             return AVERROR_EXTERNAL;
+         }
+         if(!aribcc_renderer_initialize(ctx->renderer,
+-                                       ARIBCC_CAPTIONTYPE_CAPTION,
++                                       (enum aribcc_captiontype_t)ctx->caption_type,
+                                        ARIBCC_FONTPROVIDER_TYPE_AUTO,
+                                        ARIBCC_TEXTRENDERER_TYPE_AUTO)) {
+             av_log(avctx, AV_LOG_ERROR, "Failed to initialize libaribcaption renderer.\n");
+@@ -1157,6 +1184,15 @@ static const AVOption options[] = {
+       OFFSET(replace_msz_glyph), AV_OPT_TYPE_BOOL, { .i64 = 1 }, 0, 1, SD },
+     {"canvas_size", "set input video size (WxH or abbreviation) [bitmap]",
+       OFFSET(canvas_width), AV_OPT_TYPE_IMAGE_SIZE, { .str = NULL }, 0, INT_MAX, SD },
++    { "caption_type", "ARIB caption type",
++      OFFSET(caption_type), AV_OPT_TYPE_INT,
++      { .i64 = ARIBCC_CAPTIONTYPE_CAPTION },
++      ARIBCC_CAPTIONTYPE_CAPTION, ARIBCC_CAPTIONTYPE_SUPERIMPOSE,
++      SD, .unit = "caption_type" },
++    { "caption", "caption service", 0, AV_OPT_TYPE_CONST,
++      { .i64 = ARIBCC_CAPTIONTYPE_CAPTION }, .flags = SD, .unit = "caption_type" },
++    { "superimpose", "superimpose service", 0, AV_OPT_TYPE_CONST,
++      { .i64 = ARIBCC_CAPTIONTYPE_SUPERIMPOSE }, .flags = SD, .unit = "caption_type" },
+     { NULL }
+ };
+ 
