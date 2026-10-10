@@ -93,7 +93,7 @@ jobs:
   windows:
     name: App and per-user MSI
     needs: ffmpeg
-    runs-on: windows-latest
+    runs-on: windows-2022   # build.ps1 requires VS 2022; windows-latest ships VS 2026
     timeout-minutes: 60
     outputs:
       version: ${{ steps.version.outputs.version }}

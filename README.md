@@ -5,17 +5,16 @@ A video player for Windows, made for Japanese digital-TV recordings and broadcas
 ## Features
 
 - Plays local files and network streams: MPEG-TS, MP4, MKV, HLS and more.
-- **ARIB captions (字幕) and superimposed text (文字スーパー)**, drawn at the broadcaster's layout, colours and ruby, and kept sharp at any window size. Caption style follows the Windows caption settings.
-- **Film mode (inverse telecine) and deinterlacing** for 1080i broadcasts, on the GPU when available.
-- Hardware decoding through Direct3D 11, with an NVIDIA CUDA path. Video frames stay on the GPU.
-- Playlists: local and remote M3U/M3U8, an automatic playlist for anything you open, and resume where you left off.
-- Frame-accurate stepping, and copying the current frame to the clipboard, with or without captions.
-- A Windows 11 (Fluent) interface with light and dark themes: a title strip with a main menu, a docked seek and transport bar with decoder and codec chips, and a playlist panel beside the video (F6). Always on top cycles through its four modes (Ctrl+T). Playback keys: Left / Right seek 5 s, F2 open folder, F4 stop, F5 settings, F7 control panel. The interface language follows Windows (Korean or English).
+- **ARIB captions (字幕) and superimposed text (文字スーパー)** at the broadcaster's layout, colours and ruby.
+- **Film mode (inverse telecine) and deinterlacing** for 1080i broadcasts.
+- Hardware decoding on any GPU.
+- Playlists (M3U/M3U8) with resume.
+- Frame stepping, frame copy, picture and sound filters, and a mini player.
+- Fluent-style interface in Korean or English, light and dark.
 
 ## Requirements
 
-- Windows 11, 64-bit.
-- A GPU with Direct3D 11 support. An NVIDIA GPU enables the CUDA zero-copy path.
+- 64-bit Windows.
 
 ## Install
 
