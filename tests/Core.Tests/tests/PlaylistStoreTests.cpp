@@ -1,6 +1,5 @@
 #include "wvptest.h"
-
-#include <windows.h>
+#include "TempDir.h"
 
 #include <string>
 
@@ -9,36 +8,9 @@
 #include "wvp/PlaylistStore.h"
 
 using namespace wvp;
+using wvptest::TempDir;
 
 namespace {
-
-void RemoveTree(const std::wstring& dir) {
-    WIN32_FIND_DATAW fd;
-    HANDLE h = FindFirstFileW((dir + L"\\*").c_str(), &fd);
-    if (h != INVALID_HANDLE_VALUE) {
-        do {
-            std::wstring n = fd.cFileName;
-            if (n == L"." || n == L"..") continue;
-            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) RemoveTree(dir + L"\\" + n);
-            else DeleteFileW((dir + L"\\" + n).c_str());
-        } while (FindNextFileW(h, &fd));
-        FindClose(h);
-    }
-    RemoveDirectoryW(dir.c_str());
-}
-
-struct TempDir {
-    std::wstring path;
-    TempDir() {
-        static int counter = 0;
-        wchar_t buf[MAX_PATH + 1];
-        GetTempPathW(MAX_PATH, buf);
-        path = std::wstring(buf) + L"wvp_pls_" + std::to_wstring(GetCurrentProcessId()) + L"_" + std::to_wstring(GetTickCount64()) + L"_" + std::to_wstring(counter++);
-        CreateDirectoryW(path.c_str(), nullptr);
-    }
-    ~TempDir() { RemoveTree(path); }
-    std::wstring Sub(const std::wstring& n) const { return path + L"\\" + n; }
-};
 
 std::vector<MediaItem> Sample() {
     return { MediaItem(L"C:\\media\\one.mp4", L"One", 61.0), MediaItem(L"http://h/two.ts", L"\xb450\xbc88\xc9f8") };
@@ -53,7 +25,7 @@ TEST_CASE(PlaylistStore_save_load_list_exists) {
     CHECK(!s.Exists(L"Mix"));
     REQUIRE(s.Save(L"Mix", Sample()));
     CHECK(s.Exists(L"Mix"));
-    CHECK(GetFileAttributesW((s.Dir() + L"\\Mix.m3u8").c_str()) != INVALID_FILE_ATTRIBUTES);
+    CHECK(fileio::IsRegularFile(s.Dir() + fileio::kSep + L"Mix.m3u8"));
     auto back = s.Load(L"Mix");
     REQUIRE(back.size() == 2);
     CHECK_EQ(back[0].url, L"C:\\media\\one.mp4");
@@ -63,7 +35,7 @@ TEST_CASE(PlaylistStore_save_load_list_exists) {
     REQUIRE(list.size() == 1);
     CHECK_EQ(list[0].name, L"Mix");
     CHECK_EQ(list[0].itemCount, 2);
-    CHECK_EQ(list[0].path, s.Dir() + L"\\Mix.m3u8");
+    CHECK_EQ(list[0].path, s.Dir() + fileio::kSep + L"Mix.m3u8");
     CHECK(list[0].modifiedMs > 1600000000000LL);
     CHECK(s.Load(L"Missing").empty());
 }
@@ -76,7 +48,7 @@ TEST_CASE(PlaylistStore_list_sorted_case_insensitive_and_ignores_other_files) {
     REQUIRE(s.Save(L"cherry", {}));
     REQUIRE(s.Save(L"\xac00\xb098", Sample()));
     REQUIRE(fileio::AtomicWriteFile(t.Sub(L"notes.txt"), "x"));
-    CreateDirectoryW(t.Sub(L"folder.m3u8").c_str(), nullptr);
+    TempDir::MakeDir(t.Sub(L"folder.m3u8"));
     auto list = s.List();
     REQUIRE(list.size() == 4);
     CHECK_EQ(list[0].name, L"Apple");
@@ -278,7 +250,7 @@ TEST_CASE(PlaylistStore_import_creates_detached_editable_m3u8_copy_and_refuses_h
     REQUIRE(loaded.isPlaylist && !loaded.isHlsStream);
     REQUIRE(loaded.title == L"Documentaries");
     REQUIRE(loaded.items.size() == (size_t)1);
-    CHECK_EQ(loaded.items[0].url, t.Sub(L"media\\one.mp4"));
+    CHECK_EQ(loaded.items[0].url, t.Sub(std::wstring(L"media") + fileio::kSep + L"one.mp4"));
     const std::wstring imported = store.ImportEditableCopy(loaded.title, loaded.items, loaded.isPlaylist, loaded.isHlsStream);
     REQUIRE(imported == L"Documentaries");
     CHECK(!store.IsReference(imported));
@@ -301,7 +273,7 @@ TEST_CASE(PlaylistStore_import_creates_detached_editable_m3u8_copy_and_refuses_h
     CHECK(!hls.isPlaylist);
     CHECK(store.ImportEditableCopy(L"Master", hls.items, hls.isPlaylist, hls.isHlsStream).empty());
     CHECK(!store.Exists(L"Master"));
-    DeleteFileW(source.c_str());
+    fileio::RemoveFile(source);
     CHECK_EQ(store.Load(imported).size(), (size_t)2);
 }
 
@@ -335,7 +307,7 @@ TEST_CASE(PlaylistStore_delete_clears_playlist_resume_but_keeps_item_history) {
 
 TEST_CASE(PlaylistStore_default_dir_is_under_app_data) {
     PlaylistStore s;   // no I/O in the constructor
-    std::wstring suffix = L"aribplayer\\Playlists";
+    std::wstring suffix = std::wstring(L"aribplayer") + fileio::kSep + L"Playlists";
     REQUIRE(s.Dir().size() > suffix.size());
     CHECK_EQ(s.Dir().substr(s.Dir().size() - suffix.size()), suffix);
 }

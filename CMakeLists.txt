@@ -22,6 +22,14 @@ if(NOT CMAKE_GENERATOR MATCHES "Visual Studio")
 endif()
 
 set(WVP_ROOT "${CMAKE_CURRENT_SOURCE_DIR}")
+# Selects src/platform/<WVP_PLATFORM>/ in PlayerCore and tests/Core.Tests (names follow sys.platform / process.platform).
+if(WIN32)
+    set(WVP_PLATFORM win32)
+elseif(APPLE)
+    set(WVP_PLATFORM darwin)
+else()
+    message(FATAL_ERROR "No platform/ implementation for this OS.")
+endif()
 set(WVP_BIN_ROOT "${WVP_ROOT}/artifacts/bin" CACHE PATH "Final outputs go to <WVP_BIN_ROOT>/<Config>/<Target>/")
 set(WVP_FFPLAY_DIR "${WVP_ROOT}/ffmpeg/dist/win64" CACHE PATH "libffplay + FFmpeg DLLs (ffmpeg/build-ffplay.ps1 output)")
 

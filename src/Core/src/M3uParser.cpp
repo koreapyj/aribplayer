@@ -113,19 +113,9 @@ bool IsHls(std::wstring_view text) {
     return ContainsI(text, L"#EXT-X-TARGETDURATION") || ContainsI(text, L"#EXT-X-STREAM-INF") || ContainsI(text, L"#EXT-X-MEDIA-SEQUENCE");
 }
 
-static std::wstring MbToWide(UINT cp, const char* p, size_t n, bool strict, bool* ok) {
-    if (ok) *ok = true;
-    if (n == 0) return {};
-    int len = MultiByteToWideChar(cp, strict ? MB_ERR_INVALID_CHARS : 0, p, (int)n, nullptr, 0);
-    if (len <= 0) { if (ok) *ok = false; return {}; }
-    std::wstring w((size_t)len, L'\0');
-    MultiByteToWideChar(cp, strict ? MB_ERR_INVALID_CHARS : 0, p, (int)n, w.data(), len);
-    return w;
-}
-
 std::wstring Decode(const std::uint8_t* b, size_t n, bool allowAnsiFallback) {
     if (n >= 3 && b[0] == 0xEF && b[1] == 0xBB && b[2] == 0xBF)
-        return MbToWide(CP_UTF8, (const char*)b + 3, n - 3, false, nullptr);
+        return ToWide(std::string_view((const char*)b + 3, n - 3));
     if (n >= 2 && b[0] == 0xFF && b[1] == 0xFE) {
         std::wstring w((n - 2) / 2, L'\0');
         for (size_t i = 0; i < w.size(); ++i) w[i] = (wchar_t)(b[2 + 2 * i] | (b[3 + 2 * i] << 8));
@@ -136,13 +126,10 @@ std::wstring Decode(const std::uint8_t* b, size_t n, bool allowAnsiFallback) {
         for (size_t i = 0; i < w.size(); ++i) w[i] = (wchar_t)((b[2 + 2 * i] << 8) | b[3 + 2 * i]);
         return w;
     }
-    bool ok = false;
-    std::wstring w = MbToWide(CP_UTF8, (const char*)b, n, true, &ok);
-    if (ok) return w;
-    if (!allowAnsiFallback) return MbToWide(CP_UTF8, (const char*)b, n, false, nullptr);
-    w = MbToWide(CP_ACP, (const char*)b, n, false, &ok);
-    if (ok) return w;
-    w.resize(n);
+    std::string_view u((const char*)b, n);
+    if (IsValidUtf8(u) || !allowAnsiFallback) return ToWide(u);
+    if (auto w = FromSystemCodePage(u)) return *w;
+    std::wstring w(n, L'\0');
     for (size_t i = 0; i < n; ++i) w[i] = b[i];
     return w;
 }

@@ -1,4 +1,5 @@
 #include "wvp/MediaUri.h"
+#include "wvp/FileIo.h"
 #include "wvp/MediaItem.h"
 #include "wvp/Utf.h"
 
@@ -183,15 +184,7 @@ std::wstring Combine(const std::wstring& a, const std::wstring& b) {
     return a + L'\\' + b;
 }
 
-std::wstring GetFullPath(const std::wstring& p) {
-    DWORD n = GetFullPathNameW(p.c_str(), 0, nullptr, nullptr);
-    if (n == 0) return p;
-    std::wstring out(n, L'\0');
-    DWORD m = GetFullPathNameW(p.c_str(), n, out.data(), nullptr);
-    if (m == 0 || m >= n) return p;
-    out.resize(m);
-    return out;
-}
+std::wstring GetFullPath(const std::wstring& p) { return fileio::FullPath(p); }
 
 std::wstring GetExtension(const std::wstring& p) {
     size_t sep = p.find_last_of(L"\\/:");

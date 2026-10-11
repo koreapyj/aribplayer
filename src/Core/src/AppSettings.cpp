@@ -137,7 +137,7 @@ PlanPrefs PlanPrefsFor(const std::wstring& hwDecoder, const std::wstring& presen
 SettingsStore::SettingsStore(std::wstring path) : path_(path.empty() ? DefaultPath() : std::move(path)) {}
 
 std::wstring SettingsStore::AppDataDir() { return fileio::LocalAppDataApp(); }
-std::wstring SettingsStore::DefaultPath() { return AppDataDir() + L"\\settings.json"; }
+std::wstring SettingsStore::DefaultPath() { return AppDataDir() + fileio::kSep + L"settings.json"; }
 
 std::string SettingsStore::ToJson(const AppSettings& s) {
     JsonWriter w;

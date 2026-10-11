@@ -4,7 +4,6 @@
 #include <charconv>
 #include <cmath>
 #include <cstdio>
-#include <iterator>
 
 #include "wvp/Utf.h"
 
@@ -87,74 +86,4 @@ JsonWriter& JsonWriter::Int(std::int64_t v) { BeforeValue(); out_ += std::to_str
 JsonWriter& JsonWriter::Bool(bool v) { BeforeValue(); out_ += v ? "true" : "false"; return *this; }
 JsonWriter& JsonWriter::Null() { BeforeValue(); out_ += "null"; return *this; }
 
-namespace fileio {
-
-bool ReadAllBytes(const std::wstring& path, std::string& out) {
-    out.clear();
-    HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
-                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (h == INVALID_HANDLE_VALUE) return false;
-    LARGE_INTEGER sz{};
-    bool ok = GetFileSizeEx(h, &sz) && sz.QuadPart >= 0 && sz.QuadPart < (1LL << 30);
-    if (ok) {
-        out.resize((size_t)sz.QuadPart);
-        size_t done = 0;
-        while (ok && done < out.size()) {
-            DWORD got = 0;
-            ok = ReadFile(h, out.data() + done, (DWORD)std::min<size_t>(out.size() - done, 1u << 24), &got, nullptr) && got != 0;
-            done += got;
-        }
-        out.resize(done);
-    }
-    CloseHandle(h);
-    return ok;
-}
-
-bool EnsureDirectory(const std::wstring& dir) {
-    if (dir.empty()) return false;
-    DWORD a = GetFileAttributesW(dir.c_str());
-    if (a != INVALID_FILE_ATTRIBUTES) return (a & FILE_ATTRIBUTE_DIRECTORY) != 0;
-    size_t cut = dir.find_last_of(L"\\/");
-    if (cut != std::wstring::npos && cut > 0 && !(cut == 2 && dir[1] == L':')) {
-        if (!EnsureDirectory(dir.substr(0, cut))) return false;
-    }
-    if (CreateDirectoryW(dir.c_str(), nullptr)) return true;
-    a = GetFileAttributesW(dir.c_str());
-    return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY);
-}
-
-bool AtomicWriteFile(const std::wstring& path, std::string_view bytes, bool durable) {
-    size_t cut = path.find_last_of(L"\\/");
-    if (cut != std::wstring::npos && cut > 0) { if (!EnsureDirectory(path.substr(0, cut))) return false; }
-    std::wstring tmp = path + L".tmp";
-    HANDLE h = CreateFileW(tmp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (h == INVALID_HANDLE_VALUE) return false;
-    bool ok = true;
-    size_t done = 0;
-    while (ok && done < bytes.size()) {
-        DWORD put = 0;
-        ok = WriteFile(h, bytes.data() + done, (DWORD)std::min<size_t>(bytes.size() - done, 1u << 24), &put, nullptr) && put != 0;
-        done += put;
-    }
-    if (ok && durable) ok = FlushFileBuffers(h) != 0;
-    CloseHandle(h);
-    if (ok) ok = MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | (durable ? MOVEFILE_WRITE_THROUGH : 0)) != 0;
-    if (!ok) DeleteFileW(tmp.c_str());
-    return ok;
-}
-
-std::wstring LocalAppDataApp() {
-    wchar_t buf[MAX_PATH * 2];
-    DWORD n = GetEnvironmentVariableW(L"LOCALAPPDATA", buf, (DWORD)std::size(buf));
-    std::wstring base;
-    if (n > 0 && n < std::size(buf)) base.assign(buf, n);
-    else {
-        DWORD t = GetTempPathW((DWORD)std::size(buf), buf);
-        if (t > 0 && t < std::size(buf)) base.assign(buf, t);
-    }
-    while (!base.empty() && (base.back() == L'\\' || base.back() == L'/')) base.pop_back();
-    return base + L"\\aribplayer";
-}
-
-}
 }

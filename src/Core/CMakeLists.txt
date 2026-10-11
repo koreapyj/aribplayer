@@ -1,5 +1,8 @@
 file(GLOB PLAYER_CORE_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp")
 file(GLOB PLAYER_CORE_HEADERS CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/include/wvp/*.h")
+# OS-specific implementations (file I/O, UTF conversion, HTTP, clipboard/PNG): one directory per platform, no #ifdefs in src/.
+file(GLOB PLAYER_CORE_PLATFORM_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/platform/${WVP_PLATFORM}/*.cpp")
+list(APPEND PLAYER_CORE_SOURCES ${PLAYER_CORE_PLATFORM_SOURCES})
 
 add_library(PlayerCore STATIC ${PLAYER_CORE_SOURCES} ${PLAYER_CORE_HEADERS})
 wvp_output_dirs(PlayerCore)

@@ -10,6 +10,7 @@
 #include <thread>
 
 #include "wvp/AppSettings.h"
+#include "wvp/FileIo.h"
 #include "wvp/JsonLite.h"
 #include "wvp/JsonWriter.h"
 #include "wvp/M3uParser.h"
@@ -41,10 +42,7 @@ bool IsReserved(const std::wstring& n) {
     return false;
 }
 
-std::int64_t FileTimeToUnixMs(const FILETIME& ft) {
-    ULARGE_INTEGER u; u.LowPart = ft.dwLowDateTime; u.HighPart = ft.dwHighDateTime;
-    return (std::int64_t)(u.QuadPart / 10000ULL) - 11644473600000LL;
-}
+bool EqualsNoCase(const std::wstring& a, const std::wstring& b) { return WinPath::ToLower(a) == WinPath::ToLower(b); }
 
 bool SameSource(const std::wstring& a, const std::wstring& b) {
     if (a == b) return true;
@@ -106,7 +104,7 @@ bool WritePlaybackHistory(const std::wstring& path, const std::vector<StoredItem
 
 }
 
-std::wstring PlaylistStore::DefaultDir() { return SettingsStore::AppDataDir() + L"\\Playlists"; }
+std::wstring PlaylistStore::DefaultDir() { return SettingsStore::AppDataDir() + fileio::kSep + L"Playlists"; }
 
 // One background thread per store (started with the first job) that runs history writes in order.
 class PlaylistStore::HistoryWriter {
@@ -162,8 +160,8 @@ PlaylistStore::PlaylistStore(std::wstring dir)
     while (dir_.size() > 3 && (dir_.back() == L'\\' || dir_.back() == L'/')) dir_.pop_back();
 }
 
-std::wstring PlaylistStore::ReferenceIndexPath() const { return dir_ + L"\\references.json"; }
-std::wstring PlaylistStore::PlaybackHistoryPath() const { return dir_ + L"\\playback-history.json"; }
+std::wstring PlaylistStore::ReferenceIndexPath() const { return dir_ + fileio::kSep + L"references.json"; }
+std::wstring PlaylistStore::PlaybackHistoryPath() const { return dir_ + fileio::kSep + L"playback-history.json"; }
 
 bool PlaylistStore::LoadReferences(std::vector<Reference>& out) const {
     out.clear();
@@ -239,13 +237,12 @@ std::wstring PlaylistStore::SanitizeName(const std::wstring& name) {
 
 bool PlaylistStore::IsValidName(const std::wstring& name) { return !name.empty() && SanitizeName(name) == name; }
 
-std::wstring PlaylistStore::PathFor(const std::wstring& name) const { return dir_ + L"\\" + name + kExt; }
+std::wstring PlaylistStore::PathFor(const std::wstring& name) const { return dir_ + fileio::kSep + name + kExt; }
 
 bool PlaylistStore::Exists(const std::wstring& name) const {
     if (!IsValidName(name)) return false;
     if (FindReferenceByName(name)) return true;
-    DWORD a = GetFileAttributesW(PathFor(name).c_str());
-    return a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY);
+    return fileio::IsRegularFile(PathFor(name));
 }
 
 bool PlaylistStore::IsReference(const std::wstring& name) const { return FindReferenceByName(name).has_value(); }
@@ -254,7 +251,7 @@ std::optional<PlaylistStore::Reference> PlaylistStore::FindReferenceByName(const
     if (!IsValidName(name)) return std::nullopt;
     std::vector<Reference> refs;
     if (!LoadReferences(refs)) return std::nullopt;
-    auto it = std::find_if(refs.begin(), refs.end(), [&](const Reference& r) { return _wcsicmp(r.name.c_str(), name.c_str()) == 0; });
+    auto it = std::find_if(refs.begin(), refs.end(), [&](const Reference& r) { return EqualsNoCase(r.name, name); });
     return it == refs.end() ? std::nullopt : std::optional<Reference>(*it);
 }
 
@@ -287,7 +284,7 @@ std::wstring PlaylistStore::AddOrUpdateReference(const std::wstring& source, con
 bool PlaylistStore::UpdateReferenceItems(const std::wstring& name, const std::vector<MediaItem>& items) {
     std::vector<Reference> refs;
     if (!LoadReferences(refs)) return false;
-    auto it = std::find_if(refs.begin(), refs.end(), [&](const Reference& r) { return _wcsicmp(r.name.c_str(), name.c_str()) == 0; });
+    auto it = std::find_if(refs.begin(), refs.end(), [&](const Reference& r) { return EqualsNoCase(r.name, name); });
     if (it == refs.end()) return false;
     it->items = items;
     return SaveReferences(refs);
@@ -321,26 +318,19 @@ PlaylistStore::ReferenceRefreshResult PlaylistStore::RefreshReference(const std:
 
 std::vector<PlaylistStore::Info> PlaylistStore::List() const {
     std::vector<Info> out;
-    WIN32_FIND_DATAW fd;
-    HANDLE h = FindFirstFileW((dir_ + L"\\*" + kExt).c_str(), &fd);
-    if (h != INVALID_HANDLE_VALUE) {
-        do {
-            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
-            std::wstring file = fd.cFileName;
-            // FindFirstFile also matches 8.3 aliases like *.m3u8x: require the exact extension.
-            if (file.size() <= 5 || WinPath::ToLower(file.substr(file.size() - 5)) != kExt) continue;
-            Info i;
-            i.name = file.substr(0, file.size() - 5);
-            i.path = dir_ + L"\\" + file;
-            i.modifiedMs = FileTimeToUnixMs(fd.ftLastWriteTime);
-            try {
-                std::string bytes;
-                if (fileio::ReadAllBytes(i.path, bytes))
-                    i.itemCount = (int)M3uParser::Parse(M3uParser::Decode((const std::uint8_t*)bytes.data(), bytes.size(), false), i.path).items.size();
-            } catch (...) {}
-            out.push_back(std::move(i));
-        } while (FindNextFileW(h, &fd));
-        FindClose(h);
+    for (const fileio::DirEntry& e : fileio::ListFiles(dir_)) {
+        const std::wstring& file = e.name;
+        if (file.size() <= 5 || WinPath::ToLower(file.substr(file.size() - 5)) != kExt) continue;
+        Info i;
+        i.name = file.substr(0, file.size() - 5);
+        i.path = dir_ + fileio::kSep + file;
+        i.modifiedMs = e.modifiedMs;
+        try {
+            std::string bytes;
+            if (fileio::ReadAllBytes(i.path, bytes))
+                i.itemCount = (int)M3uParser::Parse(M3uParser::Decode((const std::uint8_t*)bytes.data(), bytes.size(), false), i.path).items.size();
+        } catch (...) {}
+        out.push_back(std::move(i));
     }
     std::vector<Reference> refs;
     if (LoadReferences(refs)) {
@@ -517,7 +507,7 @@ bool PlaylistStore::Rename(const std::wstring& from, const std::wstring& to, std
     if (auto ref = FindReferenceByName(from)) {
         std::vector<Reference> refs;
         if (!LoadReferences(refs)) return fail(L"The playlist could not be renamed.");
-        auto it = std::find_if(refs.begin(), refs.end(), [&](const Reference& r) { return _wcsicmp(r.name.c_str(), from.c_str()) == 0; });
+        auto it = std::find_if(refs.begin(), refs.end(), [&](const Reference& r) { return EqualsNoCase(r.name, from); });
         if (it == refs.end()) return fail(L"The playlist no longer exists.");
         it->name = to;
         if (!SaveReferences(refs)) return fail(L"The playlist could not be renamed.");
@@ -528,7 +518,7 @@ bool PlaylistStore::Rename(const std::wstring& from, const std::wstring& to, std
         WritePlaybackHistory(PlaybackHistoryPath(), items, playlists);
         return true;
     }
-    if (!MoveFileExW(PathFor(from).c_str(), PathFor(to).c_str(), 0)) return fail(L"The playlist could not be renamed.");
+    if (!fileio::RenameNoReplace(PathFor(from), PathFor(to))) return fail(L"The playlist could not be renamed.");
     std::vector<StoredItemState> items;
     std::vector<StoredPlaylistState> playlists;
     ReadPlaybackHistory(PlaybackHistoryPath(), items, playlists);
@@ -543,10 +533,10 @@ bool PlaylistStore::Delete(const std::wstring& name) {
     std::vector<Reference> refs;
     if (LoadReferences(refs)) {
         auto before = refs.size();
-        refs.erase(std::remove_if(refs.begin(), refs.end(), [&](const Reference& r) { return _wcsicmp(r.name.c_str(), name.c_str()) == 0; }), refs.end());
+        refs.erase(std::remove_if(refs.begin(), refs.end(), [&](const Reference& r) { return EqualsNoCase(r.name, name); }), refs.end());
         if (refs.size() != before) deleted = SaveReferences(refs);
     }
-    if (!deleted) deleted = DeleteFileW(PathFor(name).c_str()) != 0;
+    if (!deleted) deleted = fileio::RemoveFile(PathFor(name));
     if (!deleted) return false;
     std::vector<StoredItemState> items;
     std::vector<StoredPlaylistState> playlists;

@@ -1,6 +1,5 @@
 #include "wvptest.h"
-
-#include <windows.h>
+#include "TempDir.h"
 
 #include <string>
 #include <vector>
@@ -13,36 +12,9 @@
 #include "wvp/Utf.h"
 
 using namespace wvp;
+using wvptest::TempDir;
 
 namespace {
-
-void RemoveTree(const std::wstring& dir) {
-    WIN32_FIND_DATAW fd;
-    HANDLE h = FindFirstFileW((dir + L"\\*").c_str(), &fd);
-    if (h != INVALID_HANDLE_VALUE) {
-        do {
-            std::wstring n = fd.cFileName;
-            if (n == L"." || n == L"..") continue;
-            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) RemoveTree(dir + L"\\" + n);
-            else DeleteFileW((dir + L"\\" + n).c_str());
-        } while (FindNextFileW(h, &fd));
-        FindClose(h);
-    }
-    RemoveDirectoryW(dir.c_str());
-}
-
-struct TempDir {
-    std::wstring path;
-    TempDir() {
-        static int counter = 0;
-        wchar_t buf[MAX_PATH + 1];
-        GetTempPathW(MAX_PATH, buf);
-        path = std::wstring(buf) + L"wvp_m3uw_" + std::to_wstring(GetCurrentProcessId()) + L"_" + std::to_wstring(GetTickCount64()) + L"_" + std::to_wstring(counter++);
-        CreateDirectoryW(path.c_str(), nullptr);
-    }
-    ~TempDir() { RemoveTree(path); }
-    std::wstring File(const std::wstring& n) const { return path + L"\\" + n; }
-};
 
 bool Contains(const std::wstring& h, const std::wstring& n) { return h.find(n) != std::wstring::npos; }
 
@@ -77,7 +49,7 @@ TEST_CASE(M3uWriter_empty_title_uses_display_title) {
 
 TEST_CASE(M3uWriter_saves_utf8_without_bom_and_relative_paths) {
     TempDir t;
-    std::wstring media = t.path + L"\\sub\\a.mp4";
+    std::wstring media = t.File(std::wstring(L"sub") + fileio::kSep + L"a.mp4");
     std::wstring file = t.File(L"q.m3u8");
     REQUIRE(M3uWriter::Save(file, { MediaItem(media, L"A", 3.0) }, true));
     std::string bytes;
@@ -89,12 +61,12 @@ TEST_CASE(M3uWriter_saves_utf8_without_bom_and_relative_paths) {
     auto back = M3uParser::Parse(ToWide(bytes), file);
     REQUIRE(back.items.size() == 1);
     CHECK_EQ(back.items[0].url, media);
-    CHECK(GetFileAttributesW((file + L".tmp").c_str()) == INVALID_FILE_ATTRIBUTES);
+    CHECK(!fileio::IsRegularFile(file + L".tmp"));
 }
 
 TEST_CASE(M3uWriter_absolute_when_not_relative) {
     TempDir t;
-    std::wstring media = t.path + L"\\sub\\a.mp4";
+    std::wstring media = t.File(std::wstring(L"sub") + fileio::kSep + L"a.mp4");
     std::wstring file = t.File(L"abs.m3u8");
     REQUIRE(M3uWriter::Save(file, { MediaItem(media, L"A") }, false));
     std::string bytes;
@@ -116,11 +88,11 @@ TEST_CASE(M3uWriter_overwrites_existing_file_atomically) {
 
 TEST_CASE(M3uWriter_relative_paths_unicode_and_parent_dirs) {
     TempDir t;
-    std::wstring sub = t.path + L"\\\xb4e4\xc545";
-    CreateDirectoryW(sub.c_str(), nullptr);
-    std::wstring file = sub + L"\\list.m3u8";
-    std::wstring inside = sub + L"\\\xc601\xc0c1\\\x65e5\x672c.mp4";
-    std::wstring sibling = t.path + L"\\other\\b.mp4";
+    std::wstring sub = t.File(L"\xb4e4\xc545");
+    TempDir::MakeDir(sub);
+    std::wstring file = sub + fileio::kSep + L"list.m3u8";
+    std::wstring inside = sub + fileio::kSep + L"\xc601\xc0c1" + fileio::kSep + L"\x65e5\x672c.mp4";
+    std::wstring sibling = t.File(std::wstring(L"other") + fileio::kSep + L"b.mp4");
     std::wstring text = M3uWriter::ToString({ MediaItem(inside, L"in"), MediaItem(sibling, L"out"), MediaItem(L"https://x/y.mp4", L"url") }, sub);
     CHECK(Contains(text, L"\r\n\xc601\xc0c1\\\x65e5\x672c.mp4\r\n"));
     CHECK(Contains(text, L"\r\n..\\other\\b.mp4\r\n"));
@@ -142,7 +114,7 @@ TEST_CASE(M3uWriter_get_relative_path) {
 TEST_CASE(M3uWriter_loads_through_PlaylistLoader) {
     TempDir t;
     std::wstring file = t.File(L"pl.m3u8");
-    std::wstring media = t.path + L"\\v.mp4";
+    std::wstring media = t.File(L"v.mp4");
     REQUIRE(M3uWriter::Save(file, { MediaItem(media, L"T\x00e9st \x2603", 12.0), MediaItem(L"http://h/s.ts", L"Stream") }, true));
     PlaylistLoader loader;
     auto r = loader.Load(file);

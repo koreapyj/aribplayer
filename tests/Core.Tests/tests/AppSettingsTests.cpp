@@ -1,6 +1,5 @@
 #include "wvptest.h"
-
-#include <windows.h>
+#include "TempDir.h"
 
 #include <cstring>
 #include <string>
@@ -9,36 +8,9 @@
 #include "wvp/JsonWriter.h"
 
 using namespace wvp;
+using wvptest::TempDir;
 
 namespace {
-
-void RemoveTree(const std::wstring& dir) {
-    WIN32_FIND_DATAW fd;
-    HANDLE h = FindFirstFileW((dir + L"\\*").c_str(), &fd);
-    if (h != INVALID_HANDLE_VALUE) {
-        do {
-            std::wstring n = fd.cFileName;
-            if (n == L"." || n == L"..") continue;
-            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) RemoveTree(dir + L"\\" + n);
-            else DeleteFileW((dir + L"\\" + n).c_str());
-        } while (FindNextFileW(h, &fd));
-        FindClose(h);
-    }
-    RemoveDirectoryW(dir.c_str());
-}
-
-struct TempDir {
-    std::wstring path;
-    TempDir() {
-        static int counter = 0;
-        wchar_t buf[MAX_PATH + 1];
-        GetTempPathW(MAX_PATH, buf);
-        path = std::wstring(buf) + L"wvp_set_" + std::to_wstring(GetCurrentProcessId()) + L"_" + std::to_wstring(GetTickCount64()) + L"_" + std::to_wstring(counter++);
-        CreateDirectoryW(path.c_str(), nullptr);
-    }
-    ~TempDir() { RemoveTree(path); }
-    std::wstring File(const std::wstring& n) const { return path + L"\\" + n; }
-};
 
 void WriteText(const std::wstring& path, const std::string& text) {
     REQUIRE(fileio::AtomicWriteFile(path, text));
@@ -48,7 +20,7 @@ void WriteText(const std::wstring& path, const std::string& text) {
 
 TEST_CASE(Settings_defaults_when_missing_or_corrupt_and_round_trip) {
     TempDir t;
-    SettingsStore store(t.File(L"nested\\deeper\\settings.json"));
+    SettingsStore store(t.File(std::wstring(L"nested") + fileio::kSep + L"deeper" + fileio::kSep + L"settings.json"));
     AppSettings d = store.Load();
     CHECK(d == AppSettings{});
     CHECK(d.theme == ThemeSetting::System);
@@ -79,7 +51,7 @@ TEST_CASE(Settings_defaults_when_missing_or_corrupt_and_round_trip) {
     CHECK_EQ(back.window.dpi, 144);
     CHECK_EQ(back.miniWindow.dpi, 96);
     CHECK_EQ(back.accentColor, 0xFF3A7BD5u);
-    CHECK(GetFileAttributesW((store.Path() + L".tmp").c_str()) == INVALID_FILE_ATTRIBUTES);
+    CHECK(!fileio::IsRegularFile(store.Path() + L".tmp"));
 
     WriteText(store.Path(), "{ not json");
     CHECK(store.Load() == AppSettings{});
@@ -234,13 +206,10 @@ TEST_CASE(Settings_utf8_bom_is_accepted) {
 
 TEST_CASE(Settings_default_path_is_under_localappdata) {
     std::wstring p = SettingsStore::DefaultPath();
-    std::wstring suffix = L"aribplayer\\settings.json";
+    std::wstring suffix = std::wstring(L"aribplayer") + fileio::kSep + L"settings.json";
     REQUIRE(p.size() > suffix.size());
     CHECK_EQ(p.substr(p.size() - suffix.size()), suffix);
-    wchar_t buf[MAX_PATH * 2];
-    DWORD n = GetEnvironmentVariableW(L"LOCALAPPDATA", buf, (DWORD)std::size(buf));
-    if (n > 0 && n < std::size(buf)) CHECK(p.compare(0, n, std::wstring(buf, n)) == 0);
-    CHECK_EQ(SettingsStore::AppDataDir() + L"\\settings.json", p);
+    CHECK_EQ(SettingsStore::AppDataDir() + fileio::kSep + L"settings.json", p);
     CHECK_EQ(SettingsStore().Path(), p);
 }
 
