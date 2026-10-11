@@ -868,10 +868,11 @@ void PlaylistPanel::OnLayout() {
 
 void PlaylistPanel::Paint(pui::IRenderer& r, const pui::Theme& t) {
     const RectF b = Bounds();
-    if (overlay_) r.FillRoundRect(b, t.overlayRadius, t.flyoutSurface);   // popup over the video: opaque base
-    r.FillRoundRect(b, t.overlayRadius, t.panelFill);
+    const float radius = squareCorners_ ? 0.f : t.overlayRadius;
+    if (overlay_) r.FillRoundRect(b, radius, t.flyoutSurface);   // popup over the video: opaque base
+    r.FillRoundRect(b, radius, t.panelFill);
     const float px = Px();
-    r.StrokeRoundRect(b.Deflate(px / 2, px / 2, px / 2, px / 2), t.overlayRadius, t.panelStroke, px);
+    r.StrokeRoundRect(b.Deflate(px / 2, px / 2, px / 2, px / 2), radius, t.panelStroke, px);
     r.FillRect({b.l + px, dividerY_, b.r - px, dividerY_ + px}, t.panelStroke);
     r.FillRect({b.l + px, footerRect_.t, b.r - px, footerRect_.t + px}, t.panelStroke);
     pui::TextStyle ts;

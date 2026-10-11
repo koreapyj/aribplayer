@@ -579,9 +579,11 @@ void App::OpenPanelOverlay() {
     auto panel = std::make_unique<PlaylistPanel>(*this, true);
     PlaylistPanel* raw = panel.get();
     raw->SetBounds({right - w, top, right, bottom});
+    raw->SetSquareCorners(fs);
     pui::PopupOptions po;
     po.lightDismiss = true;
     po.takeFocus = false;
+    if (fs) po.acrylicRadius = 0.f;
     po.onClosed = [this, raw] {
         if (panelPopup_ == raw) panelPopup_ = nullptr;
         SyncModel();

@@ -29,6 +29,8 @@ public:
     /// overlay = the popup instance (opaque flyout surface under the panel fill).
     explicit PlaylistPanel(AppContext& ctx, bool overlay = false);
     ~PlaylistPanel() override;
+    /// Full screen: the panel is flush with the screen edges, so its corners are square.
+    void SetSquareCorners(bool square) { squareCorners_ = square; }
 
     /// Panel shown / reopened: views the current (last played) playlist with its current item selected and scrolled into view.
     void Refresh();
@@ -132,6 +134,7 @@ private:
 
     AppContext& ctx_;
     bool overlay_;
+    bool squareCorners_ = false;
     std::string viewed_;                    // playlist name; empty = the unnamed (default) playlist
     bool readOnly_ = false, chipsDirty_ = true, active_ = false;
     std::vector<wvp::MediaItem> items_;     // snapshot while the viewed playlist is not the live current one

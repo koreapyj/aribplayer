@@ -679,8 +679,12 @@ LRESULT CALLBACK App::VideoProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
             int b = a->S(6);
             if (p.x < b || p.x >= a->cw_ - b || p.y >= a->ch_ - b) return HTTRANSPARENT;
         }
-        if (a->host_.PopupCount() > 0) return HTTRANSPARENT;
         const float xDip = p.x / a->scale_, yDip = p.y / a->scale_;
+        if (a->UserPopupOpen()) return HTTRANSPARENT;
+        if (a->host_.PopupCount() > 0) {   // notices only: just the notice itself is the shell's, the rest stays draggable video
+            const pui::Widget* w = a->host_.HitTest({xDip, yDip});
+            if (w && a->shell_ && !a->shell_->IsAncestorOf(w) && w != a->shell_) return HTTRANSPARENT;
+        }
         if ((a->layout_.bar.Contains(xDip, yDip) || (a->layout_.titleSlides && a->layout_.title.Contains(xDip, yDip))) &&
             a->ChromeHittableAt(a->Now(), {xDip, yDip}))
             return HTTRANSPARENT;
@@ -1337,8 +1341,8 @@ LRESULT App::Proc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
         Flush();
         return 0;
     case WM_RBUTTONUP: {
-        // While any popup (even a toast / InfoBar notice) is open the video child is HTTRANSPARENT, so a right-click over
-        // the video lands here instead of the video child: open the video context menu unless it hit a popup or visible chrome.
+        // While a menu or flyout is open the video child is HTTRANSPARENT, so a right-click over the video lands here
+        // instead of the video child: open the video context menu unless it hit a popup or visible chrome.
         const pui::PointF dip{GET_X_LPARAM(lp) / scale_, GET_Y_LPARAM(lp) / scale_};
         const pui::Widget* hit = host_.HitTest(dip);
         const bool onPopup = hit && shell_ && hit != shell_ && !shell_->IsAncestorOf(hit);

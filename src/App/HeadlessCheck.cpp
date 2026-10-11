@@ -1053,7 +1053,7 @@ int App::RunHeadlessCheck() {
         };
         const pui::PointF videoMenuPoint{cw_ / (2.f * scale_), ch_ / (2.f * scale_)};
         checkFullscreenContextMenu("fullscreen_video_rightclick_opens_menu", "fullscreen_video_menu_item_invokes", videoMenuPoint);
-        {   // a notice (toast) open: the video child is transparent, the right-click reaches the main window
+        {   // a notice (toast) open: a right-click reaching the main window still opens the menu
             host_.CloseAllPopups();
             nativemenu::ClearLastShown();
             ShowToast(L"Speed: 1.1x");
