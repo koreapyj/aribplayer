@@ -29,6 +29,15 @@ MeasuredCopies Measure(const wvp::DebugInfo& d) {
     return m;
 }
 
+namespace {
+// The presenter the plan targets: the "present:<name>" step.
+std::string PlannedPresenter(const wvp::Plan& p) {
+    for (const auto& s : p.steps)
+        if (s.kind == wvp::PlanStep::Kind::Present && s.name.rfind("present:", 0) == 0) return s.name.substr(8);
+    return {};
+}
+}
+
 PlanCheck CheckPlan(const wvp::Plan& p, const wvp::DebugInfo& d) {
     PlanCheck r;
     if (!p.ok) return r;
@@ -45,25 +54,12 @@ PlanCheck CheckPlan(const wvp::Plan& p, const wvp::DebugInfo& d) {
         if (!hwPlan && m.hwDirect + m.hwDownload > 0)
             r.problems.push_back("planned software decoding, measured hw frames " + Ll(m.hwDirect + m.hwDownload));
     }
-    if (!d.Renderer.empty()) {
-        if (p.presenter == "sdl" && d.Renderer.rfind("sdl", 0) != 0)
-            r.problems.push_back("planned presenter sdl, actual renderer " + d.Renderer);
-        else if (p.presenter == "d3d11" && d.Renderer.rfind("d3d11", 0) != 0)   // "d3d11" and "d3d11:videoprocessor" both match
-            r.problems.push_back("planned presenter d3d11, actual renderer " + d.Renderer);
-    }
     if (d.Presenter.Present) {
-        bool cudaInput = false;
-        for (const auto& step : p.steps)
-            if (step.kind == wvp::PlanStep::Kind::Present && step.name == "present:d3d11" && step.in == wvp::FrameDomain::Cuda)
-                cudaInput = true;
-        if (warm && cudaInput && p.cost.deviceCopies == 0 && d.Presenter.FramesCudaCopied.value_or(0) > 0)
-            r.problems.push_back("planned 0 device copies, measured cuda copied " + Ll(*d.Presenter.FramesCudaCopied));
-        if (warm && cudaInput && p.cost.deviceCopies == 1 && d.Presenter.FramesCudaZeroCopy.value_or(0) > 0)
-            r.notes.push_back("cuda import zero-copy measured despite planned device copy");
+        const std::string planned = PlannedPresenter(p);
         if (!d.Presenter.Error.empty()) r.problems.push_back("presenter error: " + d.Presenter.Error);
-        if (warm && !d.Presenter.Name.empty() && d.Presenter.Name != p.presenter)
-            r.problems.push_back("planned presenter " + p.presenter + ", presenter in use " + d.Presenter.Name);
-        if (warm && p.presenter == "d3d11" && p.cost.hostCopies == 0 && d.Presenter.FramesUploaded.value_or(0) > 0)
+        if (warm && !d.Presenter.Name.empty() && !planned.empty() && d.Presenter.Name != planned)
+            r.problems.push_back("planned presenter " + planned + ", presenter in use " + d.Presenter.Name);
+        if (warm && p.cost.hostCopies == 0 && d.Presenter.FramesUploaded.value_or(0) > 0)
             r.problems.push_back("planned 0 host copies, measured presenter uploads " + Ll(*d.Presenter.FramesUploaded));
     }
     r.mismatch = !r.problems.empty();
@@ -94,12 +90,10 @@ std::vector<OverlayLine> BuildPlanLines(const wvp::Plan& p, const wvp::DebugInfo
     for (const auto& note : chk.notes) add(LineKind::Dim, Pad10("") + "NOTE " + note);
     if (d.Presenter.Present) {
         std::string t = Pad10("presenter") + d.Presenter.Name;
-        if (d.Presenter.Name != d.Presenter.Requested && !d.Presenter.Requested.empty()) t += " (requested " + d.Presenter.Requested + ")";
         t += " direct " + Ll(d.Presenter.FramesDirect.value_or(0)) + " uploaded " + Ll(d.Presenter.FramesUploaded.value_or(0));
-        t += " cuda zero-copy " + Ll(d.Presenter.FramesCudaZeroCopy.value_or(0)) + ", copied " + Ll(d.Presenter.FramesCudaCopied.value_or(0));
         bool bad = false;
         for (const auto& pr : chk.problems)
-            if (pr.find("presenter") != std::string::npos || pr.find("cuda copied") != std::string::npos) bad = true;
+            if (pr.find("presenter") != std::string::npos) bad = true;
         add(bad ? LineKind::Warn : LineKind::Normal, t);
         if (!d.Presenter.Error.empty()) add(LineKind::Warn, Pad10("") + "error: " + d.Presenter.Error);
         if (!d.Presenter.Route.empty())
@@ -119,17 +113,6 @@ std::vector<OverlayLine> BuildPlanLines(const wvp::Plan& p, const wvp::DebugInfo
             add(d.Presenter.DebugMessages.value_or(0) > 0 ? LineKind::Warn : LineKind::Normal,
                 Pad10("") + "d3d11 debug layer " + (*d.Presenter.DebugLayer ? "on" : "unavailable") + ", " +
                     Ll(d.Presenter.DebugMessages.value_or(0)) + " messages");
-        if (!d.Presenter.Params.empty() && d.Presenter.Params != "{}") add(LineKind::Dim, Pad10("") + "params " + d.Presenter.Params);
-    }
-    const auto& pp = p.presenterParams;
-    if (!pp.IsIdentity()) {
-        std::string t;
-        auto part = [&](const std::string& s) { t += (t.empty() ? "" : ", ") + s; };
-        if (pp.rotation != 0) part("rotate " + std::to_string(pp.rotation));
-        if (pp.flipH) part("hflip");
-        if (pp.flipV) part("vflip");
-        if (pp.eq) part("eq b=" + G(pp.brightness) + " c=" + G(pp.contrast) + " s=" + G(pp.saturation) + " g=" + G(pp.gamma));
-        add(LineKind::Normal, Pad10("presenter") + t);
     }
     for (const auto& n : p.notes) add(LineKind::Dim, Pad10("") + n);
     if (showRejected) {

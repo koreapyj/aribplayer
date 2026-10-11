@@ -21,10 +21,10 @@
 #include "features/OpenFlows.h"
 #include "features/PlaybackExtras.h"
 #include "features/PropertiesDialog.h"
-#include "wvp/FrameCapture.h"
+#include "wvp/win32/FrameCapture.h"
 #include "wvp/M3uWriter.h"
 #include "wvp/PlaylistLoader.h"
-#include "wvp/Utf.h"
+#include "wvp/win32/Utf.h"
 
 namespace app {
 
@@ -58,8 +58,8 @@ void App::RestoreCurrentPlaylist() {
     if (!currentPlaylistName_.empty()) {
         currentPlaylistItems_ = svc_->playlists.Load(currentPlaylistName_);
     } else {
-        const std::wstring path = dataDir_ + L"\\unnamed.m3u8";
-        if (GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES) {
+        const std::string path = UnnamedPath();
+        if (wvp::platform::Exists(path)) {
             try { currentPlaylistItems_ = wvp::PlaylistLoader().Load(path).items; }
             catch (...) { currentPlaylistItems_.clear(); }
         }
@@ -70,12 +70,12 @@ void App::RestoreCurrentPlaylist() {
 }
 
 bool App::PersistCurrentPlaylist() {
-    if (currentPlaylistName_.empty()) return wvp::M3uWriter::Save(dataDir_ + L"\\unnamed.m3u8", currentPlaylistItems_, false);
+    if (currentPlaylistName_.empty()) return wvp::M3uWriter::Save(UnnamedPath(), currentPlaylistItems_, false);
     if (svc_->playlists.IsReference(currentPlaylistName_)) return true;  // referenced sources are never overwritten
     return svc_->playlists.Save(currentPlaylistName_, currentPlaylistItems_);
 }
 
-void App::SetCurrentPlaylistName(const std::wstring& name) {
+void App::SetCurrentPlaylistName(const std::string& name) {
     if (currentPlaylistName_ == name) return;
     currentPlaylistName_ = name;
     svc_->settings.currentPlaylist = name;
@@ -83,12 +83,12 @@ void App::SetCurrentPlaylistName(const std::wstring& name) {
     ForPanels([](PlaylistPanel& p) { p.OnCurrentPlaylistChanged(); });
 }
 
-void App::SetResumeDecision(const std::wstring& decision) {
-    resumeDecision_ = wvp::ToUtf8(decision);
+void App::SetResumeDecision(const std::string& decision) {
+    resumeDecision_ = decision;
     if (debugVisible_) RefreshDebugOverlay();
 }
 
-void App::SavePlaybackSnapshot(const std::wstring& playlist, const std::wstring& url, int index, double position, double duration,
+void App::SavePlaybackSnapshot(const std::string& playlist, const std::string& url, int index, double position, double duration,
                                bool seekable, bool force, bool ended) {
     if (url.empty()) return;
     const uint64_t now = Now();
@@ -113,22 +113,22 @@ void App::SavePlaybackHistory(bool force, bool ended, double positionOverride) {
                          model_.seekable, force, ended);
 }
 
-std::vector<wvp::MediaItem> App::PlaylistItems(const std::wstring& name) {
+std::vector<wvp::MediaItem> App::PlaylistItems(const std::string& name) {
     if (!name.empty() && svc_->playlists.IsReference(name)) return svc_->playlists.Load(name);
     if (name == currentPlaylistName_) return currentPlaylistItems_;
     if (!name.empty()) return svc_->playlists.Load(name);
-    const std::wstring path = dataDir_ + L"\\unnamed.m3u8";
-    if (GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES) return {};
+    const std::string path = UnnamedPath();
+    if (!wvp::platform::Exists(path)) return {};
     try { return wvp::PlaylistLoader().Load(path).items; }
     catch (...) { return {}; }
 }
 
-bool App::SavePlaylistItems(const std::wstring& name, const std::vector<wvp::MediaItem>& items) {
+bool App::SavePlaylistItems(const std::string& name, const std::vector<wvp::MediaItem>& items) {
     if (!name.empty() && svc_->playlists.IsReadOnly(name)) return false;
-    bool saved = name.empty() ? wvp::M3uWriter::Save(dataDir_ + L"\\unnamed.m3u8", items, false)
+    bool saved = name.empty() ? wvp::M3uWriter::Save(UnnamedPath(), items, false)
                               : svc_->playlists.Save(name, items);
     if (name == currentPlaylistName_) {
-        std::wstring currentUrl = ctl_ && ctl_->Current() ? ctl_->Current()->url : std::wstring();
+        std::string currentUrl = ctl_ && ctl_->Current() ? ctl_->Current()->url : std::string();
         int current = -1;
         if (!currentUrl.empty()) {
             for (size_t i = 0; i < items.size(); ++i)
@@ -145,30 +145,30 @@ bool App::SavePlaylistItems(const std::wstring& name, const std::vector<wvp::Med
             pending_->start = current;
         }
     }
-    if (!saved) ShowInfoBar(InfoSeverity::Error, Tr(L"Could not save the playlist", L"재생목록을 저장할 수 없습니다"), name.empty() ? Tr(L"Unnamed playlist", L"이름 없는 재생목록") : name);
+    if (!saved) ShowInfoBar(InfoSeverity::Error, Tr(L"Could not save the playlist", L"재생목록을 저장할 수 없습니다"), name.empty() ? Tr(L"Unnamed playlist", L"이름 없는 재생목록") : wvp::ToWide(name));
     return saved;
 }
 
-void App::PlayPlaylist(const std::wstring& name, const std::vector<wvp::MediaItem>& items, int start) {
+void App::PlayPlaylist(const std::string& name, const std::vector<wvp::MediaItem>& items, int start) {
     PlayPlaylistAtPosition(name, items, start, -1);
 }
 
-void App::PlayPlaylistAtPosition(const std::wstring& name, const std::vector<wvp::MediaItem>& items, int start, double position) {
+void App::PlayPlaylistAtPosition(const std::string& name, const std::vector<wvp::MediaItem>& items, int start, double position) {
     if (ctl_ && ctl_->Current()) SavePlaybackHistory(true);
     const bool keepPlaying = ctl_ && currentPlaylistName_ != name && currentPlaylistItems_ == items &&
                              ctl_->CurrentIndex() == start && ctl_->Current() && position <= 0;
     SetCurrentPlaylistName(name);
     currentPlaylistItems_ = items;
-    if (!PersistCurrentPlaylist()) ShowInfoBar(InfoSeverity::Error, Tr(L"Could not save the playlist", L"재생목록을 저장할 수 없습니다"), name.empty() ? Tr(L"Unnamed playlist", L"이름 없는 재생목록") : name);
+    if (!PersistCurrentPlaylist()) ShowInfoBar(InfoSeverity::Error, Tr(L"Could not save the playlist", L"재생목록을 저장할 수 없습니다"), name.empty() ? Tr(L"Unnamed playlist", L"이름 없는 재생목록") : wvp::ToWide(name));
     if (ctl_) { if (!keepPlaying) ctl_->SetQueue(currentPlaylistItems_, start, true, position); }
     else pending_ = PendingPlay{currentPlaylistItems_, start, !items.empty(), position};
 }
 
-void App::AppendPlaylistItems(const std::wstring& name, const std::vector<wvp::MediaItem>& items) {
+void App::AppendPlaylistItems(const std::string& name, const std::vector<wvp::MediaItem>& items) {
     AppendItems(name, items, false);   // playlist views (drops, Add files): append only, never start or change playback
 }
 
-void App::AppendItems(const std::wstring& name, const std::vector<wvp::MediaItem>& items, bool startIfIdle) {
+void App::AppendItems(const std::string& name, const std::vector<wvp::MediaItem>& items, bool startIfIdle) {
     if (items.empty()) return;
     if (!name.empty() && svc_->playlists.IsReadOnly(name)) {
         ShowInfoBar(InfoSeverity::Warning, Tr(L"Playlist is read-only", L"재생목록이 읽기 전용입니다"), Tr(L"This playlist references a source file or URL. Import it to make an editable copy.", L"이 재생목록은 원본 파일 또는 주소를 참조합니다. 가져오기로 편집 가능한 사본을 만드세요."));
@@ -182,7 +182,7 @@ void App::AppendItems(const std::wstring& name, const std::vector<wvp::MediaItem
     }
     if (!ctl_) {
         currentPlaylistItems_.insert(currentPlaylistItems_.end(), items.begin(), items.end());
-        if (!PersistCurrentPlaylist()) ShowInfoBar(InfoSeverity::Error, Tr(L"Could not save the playlist", L"재생목록을 저장할 수 없습니다"), name.empty() ? Tr(L"Unnamed playlist", L"이름 없는 재생목록") : name);
+        if (!PersistCurrentPlaylist()) ShowInfoBar(InfoSeverity::Error, Tr(L"Could not save the playlist", L"재생목록을 저장할 수 없습니다"), name.empty() ? Tr(L"Unnamed playlist", L"이름 없는 재생목록") : wvp::ToWide(name));
         if (startIfIdle) pending_ = PendingPlay{currentPlaylistItems_, 0, true};
         return;
     }
@@ -205,7 +205,7 @@ void App::ReplaceUnnamedPlaylistAtPosition(std::vector<wvp::MediaItem> items, do
     else pending_ = PendingPlay{currentPlaylistItems_, 0, true, position};
 }
 
-void App::PlaylistRenamed(const std::wstring& from, const std::wstring& to) {
+void App::PlaylistRenamed(const std::string& from, const std::string& to) {
     ForPanels([&](PlaylistPanel& p) { p.OnPlaylistRenamed(from, to); });
     if (currentPlaylistName_ == from) SetCurrentPlaylistName(to);
 }
@@ -214,7 +214,7 @@ void App::PlaylistsChanged() {
     ForPanels([](PlaylistPanel& p) { p.OnPlaylistsChanged(); });
 }
 
-void App::PlaylistDeleted(const std::wstring& name) {
+void App::PlaylistDeleted(const std::string& name) {
     ForPanels([&](PlaylistPanel& p) { p.OnPlaylistDeleted(name); });
     if (currentPlaylistName_ != name) return;
     std::vector<wvp::MediaItem> unnamed = PlaylistItems({});
@@ -235,36 +235,30 @@ void App::UpdateKeepAwake() {
 }
 
 void App::InitPlayer() {
-    playerCreating_ = true;
-    // SDL would keep the display awake for as long as its video subsystem lives (paused, idle); UpdateKeepAwake owns that.
-    SetEnvironmentVariableW(L"SDL_VIDEO_ALLOW_SCREENSAVER", L"1");
-    // ffp_create runs on a worker thread while this thread keeps pumping messages
-    wvp::FfPlayer::CreateAsync(video_, hwnd_, WM_NOTIFY_PLAYER, [this](std::unique_ptr<wvp::FfPlayer> p, int err) {
-        playerCreating_ = false;
-        if (!p) {
-            playerFailed_ = true;
-            ShowInfoBar(InfoSeverity::Error, Tr(L"Player unavailable", L"플레이어를 사용할 수 없습니다"), TrW(L"libffplay failed to start (error " + std::to_wstring(err) + L")", L"libffplay를 시작하지 못했습니다 (오류 " + std::to_wstring(err) + L")"));
-            return;
-        }
-        player_ = std::move(p);
-        ctl_ = std::make_unique<wvp::PlaybackController>(*player_, [this](std::function<void()> f) { PostToUi(std::move(f)); });
-        ctl_->SetFilters(svc_->filters.Provider());
-        WirePipeline();
-        if (opt_.stats) ctl_->SetBaseOption(L"stats", L"1");   // --stats: ffplay status line (A-V, fd, aq, vq, sq) via the log callback
-        for (const auto& [k, v] : LibffplayDeviceOptions(std::wstring(playAdapter_.luid.begin(), playAdapter_.luid.end()), opt_))
-            ctl_->SetBaseOption(k, v);
-        WirePlayer();
-        EnsureVideoDropHook();
-        ctl_->SetQueue(currentPlaylistItems_, -1, false);  // restore without autoplay; pending opens are applied below
-        OnPlayerReady.raise();
-        ApplyPendingQueue();
-        SyncModel();
-        Flush();
-    });
+    // The first presenter runs on the display adapter; SelectVideoGpuNow moves it once the adapters are probed.
+    const std::string display = platform_ ? platform_->DisplayAdapter(hwnd_) : std::string();
+    int err = 0;
+    player_ = wvp::FfPlayer::Create(MakePresenter(display), [this](std::function<void()> f) { PostToUi(std::move(f)); }, &err,
+                                    opt_.headless ? "dummy" : "");   // --headless-check plays silently on SDL's dummy driver
+    if (!player_) {
+        playerFailed_ = true;
+        ShowInfoBar(InfoSeverity::Error, Tr(L"Player unavailable", L"플레이어를 사용할 수 없습니다"), TrW(L"libffplay failed to start (error " + std::to_wstring(err) + L")", L"libffplay를 시작하지 못했습니다 (오류 " + std::to_wstring(err) + L")"));
+        return;
+    }
+    ctl_ = std::make_unique<wvp::PlaybackController>(*player_, [this](std::function<void()> f) { PostToUi(std::move(f)); });
+    ctl_->SetFilters(svc_->filters.Provider());
+    WirePipeline();
+    if (opt_.stats) ctl_->SetBaseOption("stats", "1");   // --stats: ffplay status line (A-V, fd, aq, vq, sq) via the log callback
+    WirePlayer();
+    ctl_->SetQueue(currentPlaylistItems_, -1, false);  // restore without autoplay; pending opens are applied below
+    OnPlayerReady.raise();
+    ApplyPendingQueue();
+    SyncModel();
+    Flush();
 }
 
 void App::WirePlayer() {
-    ctl_->onOpening = [this](const std::wstring& url, const wvp::OpenOptions& o) {
+    ctl_->onOpening = [this](const std::string& url, const wvp::OpenOptions& o) {
         acrylicMediaHasVideo_ = false;
         acrylicD3D11_ = false;
         acrylicPresenterFailed_ = false;
@@ -273,40 +267,30 @@ void App::WirePlayer() {
         lastOpenUrl_ = url;
         lastOpenOpts_ = o;
         effOpts_ = o;
-        lastOpenCmd_ = log::FfplayCommandLine(url, o);
-        log::EventW("open", L"url: " + url);
-        log::EventW("open", L"options: " + log::FormatOptionsLine(o));
-        log::EventW("open", L"ffplay: " + lastOpenCmd_);
+        log::Event("open", "url: " + url);
+        log::Event("open", "options: " + log::FormatOptionsLine(o));
         LogOpenPlan();
         UpdateAcrylicState(true);
         if (debugVisible_) RefreshDebugOverlay();
     };
     ctl_->onFilterChange = [this](const wvp::FilterChange& c) {
-        std::wstring m = L"vf" + std::wstring(c.videoRebuild ? L" (rebuild)" : L" (unchanged)") + L"=" + c.videoFilter + L" | af" +
-                         (c.audioRebuild ? L" (rebuild)" : L" (unchanged)") + L"=" + c.audioFilter;
-        for (const auto& cmd : c.commands) m += L" | cmd " + cmd.target + L" " + cmd.command + L" " + cmd.argument;
-        if (c.presenterParamsChanged) m += L" | presenter params " + wvp::PresenterParamsJson(c.presenterParams);
-        log::EventW("filter", m);
-        if (!lastOpenUrl_.empty()) {   // the playing graph differs from the open-time options: keep overlay / log / ffplay line in sync
+        std::string m = "vf" + std::string(c.videoRebuild ? " (rebuild)" : " (unchanged)") + "=" + c.videoFilter + " | af" +
+                         (c.audioRebuild ? " (rebuild)" : " (unchanged)") + "=" + c.audioFilter;
+        log::Event("filter", m);
+        if (!lastOpenUrl_.empty()) {   // the playing graph differs from the open-time options: keep overlay / log in sync
             effOpts_ = log::EffectiveOptions(lastOpenOpts_, c.videoFilter, c.audioFilter);
-            if (const wvp::Plan* pl = svc_->filters.CurrentPlan()) {   // presenter-applied rotation / flip / eq are not in the vf
-                std::erase_if(effOpts_, [](const auto& e) { return e.first == L"presenter_params"; });
-                if (pl->presenter != "sdl" && !pl->presenterParams.IsIdentity()) effOpts_.emplace_back(L"presenter_params", wvp::PresenterParamsJson(pl->presenterParams));
-            }
-            lastOpenCmd_ = log::FfplayCommandLine(lastOpenUrl_, effOpts_);
-            log::EventW("filter", L"effective options: " + log::FormatOptionsLine(effOpts_));
-            log::EventW("filter", L"ffplay: " + lastOpenCmd_);
+            log::Event("filter", "effective options: " + log::FormatOptionsLine(effOpts_));
             if (debugVisible_) RefreshDebugOverlay();
         }
     };
     player_->FilterError.add([](const wvp::FilterErrorInfo& e) {
-        log::EventW("filter", L"ERROR " + e.Type + L" " + e.Filter + L" code " + std::to_wstring(e.Code) + L": " + e.Message, log::kError);
+        log::Event("filter", "ERROR " + e.Type + " " + e.Filter + " code " + std::to_string(e.Code) + ": " + e.Message, log::kError);
     });
     player_->Prepared.add([this](const wvp::MediaPreparedInfo& p) {
         frameStep_.Reset();
         log::Event("player", "prepared: duration " + std::to_string(p.Duration) + " s, " + std::to_string(p.Width) + "x" + std::to_string(p.Height) + " SAR " +
                                  std::to_string(p.SarNum) + ":" + std::to_string(p.SarDen) + ", video " + (p.HasVideo ? "yes" : "no") + ", audio " +
-                                 (p.HasAudio ? "yes" : "no") + ", seekable " + (p.Seekable ? "yes" : "no") + ", title: " + wvp::ToUtf8(p.Title));
+                                 (p.HasAudio ? "yes" : "no") + ", seekable " + (p.Seekable ? "yes" : "no") + ", title: " + p.Title);
         model_.dur = p.Duration; model_.seekable = p.Seekable; model_.prepared = true;
         acrylicMediaHasVideo_ = p.HasVideo;
         UpdateKeepAwake();
@@ -326,7 +310,7 @@ void App::WirePlayer() {
         chipsNextMs_ = chipsPreparedMs_ + 500;   // the presenter / decoder settle after PREPARED: refresh at +0.5 s and +1.5 s
         RefreshChips();
         mediaAspect_ = p.HasVideo ? MiniAspectForMedia(p.DisplayWidth(), p.DisplayHeight()) : 16.0 / 9.0;
-        if (!p.Title.empty()) model_.title = p.Title;
+        if (!p.Title.empty()) model_.title = wvp::ToWide(p.Title);
         model_.subCount = 0;
         if (auto mi = player_->GetMediaInfo()) model_.subCount = CycleableSubtitleCount(*mi);
         CheckReady();
@@ -337,8 +321,7 @@ void App::WirePlayer() {
         if (p.HasVideo && sizedForUrl_ != lastOpenUrl_ && hwnd_ && modes_.Mode() == ShellMode::NowPlaying && !modes_.mini && !modes_.fullscreen &&
             IsWindowVisible(hwnd_) && !IsZoomed(hwnd_) && !IsIconic(hwnd_)) {
             sizedForUrl_ = lastOpenUrl_;
-            const wvp::Rotation rot = svc_->filters.Settings().rotation;
-            if (auto sz = VideoDisplaySize(p.Width, p.Height, p.SarNum, p.SarDen, rot == wvp::Rotation::Cw90 || rot == wvp::Rotation::Ccw90))
+            if (auto sz = VideoDisplaySize(p.Width, p.Height, p.SarNum, p.SarDen))
                 SizeWindowToVideo(WindowScale(CommandId::WindowSize100), sz);
         }
     });
@@ -377,16 +360,15 @@ void App::WirePlayer() {
     });
     player_->Error.add([this](const wvp::PlayerErrorInfo& e) {
         if (e.DeviceLost) {   // AppPipeline reopens on a fresh device
-            log::EventW("player", L"decoder device lost: " + e.Message, log::kWarning);
+            log::Event("player", "decoder device lost: " + e.Message, log::kWarning);
             return;
         }
-        log::EventW("player", L"ERROR code " + std::to_wstring(e.Code) + L": " + e.Message + L" (" + e.Url + L")", log::kError);
+        log::Event("player", "ERROR code " + std::to_string(e.Code) + ": " + e.Message + " (" + e.Url + ")", log::kError);
         OnMediaError.raise(e);
         ShowPlaybackError(*this, e);
     });
     player_->PresenterError.add([this](const wvp::PresenterErrorInfo& e) {
-        log::EventW("presenter", L"fallback to " + e.Fallback + L": " + e.Error, log::kWarning);
-        if (e.DeviceLost) return;   // AppPipeline reopens on a fresh device; the presenter itself is fine
+        if (e.DeviceLost) return;   // OnPresenterError reopens on a fresh device
         acrylicD3D11_ = false;
         acrylicPresenterFailed_ = true;
         acrylicNeedsApply_ = true;
@@ -394,7 +376,6 @@ void App::WirePlayer() {
         if (debugVisible_) RefreshDebugOverlay();
     });
     player_->Ended.add([this] { log::Event("player", "ended"); SavePlaybackHistory(true, true); OnMediaEnded.raise(); });
-    player_->Input.add([this](const wvp::InputEventArgs& e) { OnVideoInput(e); });
     ctl_->resolveResumePosition = [this](const wvp::MediaItem& item, double requestedPosition) {
         const auto state = svc_->playlists.GetItemPlaybackState(item.url);
         const double duration = state.duration > 0 ? state.duration : item.duration.value_or(0.0);
@@ -403,19 +384,19 @@ void App::WirePlayer() {
         decisionState.position = candidate;
         decisionState.duration = duration;
         const double result = wvp::PlaylistStore::ResumePosition(decisionState);
-        std::wstring reason;
-        if (state.played) reason = L"played item: reset to start";
-        else if (!state.seekable || duration <= 0) reason = L"unseekable or live stream: start at 0";
-        else if (result <= 0) reason = L"within 5 seconds of start/end: start at 0";
-        else reason = L"resume at " + std::to_wstring((int)result) + L" seconds";
-        SetResumeDecision(currentPlaylistName_.empty() ? reason : currentPlaylistName_ + L": " + reason);
+        std::string reason;
+        if (state.played) reason = "played item: reset to start";
+        else if (!state.seekable || duration <= 0) reason = "unseekable or live stream: start at 0";
+        else if (result <= 0) reason = "within 5 seconds of start/end: start at 0";
+        else reason = "resume at " + std::to_string((int)result) + " seconds";
+        SetResumeDecision(currentPlaylistName_.empty() ? reason : currentPlaylistName_ + ": " + reason);
         return result;
     };
     ctl_->beforeLeavingCurrent = [this] {
         if (!ctl_ || !ctl_->Current()) return;
         const bool haveHistoryIdentity = !historyCurrentUrl_.empty();
-        const std::wstring& url = haveHistoryIdentity ? historyCurrentUrl_ : ctl_->Current()->url;
-        const std::wstring& playlist = haveHistoryIdentity ? historyCurrentPlaylistName_ : currentPlaylistName_;
+        const std::string& url = haveHistoryIdentity ? historyCurrentUrl_ : ctl_->Current()->url;
+        const std::string& playlist = haveHistoryIdentity ? historyCurrentPlaylistName_ : currentPlaylistName_;
         const int index = haveHistoryIdentity ? historyCurrentIndex_ : ctl_->CurrentIndex();
         double position = model_.pos;
         double duration = model_.dur;
@@ -431,15 +412,15 @@ void App::WirePlayer() {
         SavePlaybackSnapshot(playlist, url, index, position, duration, model_.seekable, true);
     };
     ctl_->CurrentChanged.add([this](const wvp::MediaItem* it, int idx) {
-        historyCurrentUrl_ = it ? it->url : std::wstring();
+        historyCurrentUrl_ = it ? it->url : std::string();
         historyCurrentIndex_ = idx;
         historyCurrentPlaylistName_ = currentPlaylistName_;
-        log::EventW("queue", L"current #" + std::to_wstring(idx) + L": " + (it ? it->url : std::wstring(L"(none)")));
+        log::Event("queue", "current #" + std::to_string(idx) + ": " + (it ? it->url : std::string("(none)")));
         acrylicMediaHasVideo_ = false;
         acrylicD3D11_ = false;
         acrylicPresenterFailed_ = false;
         acrylicNeedsApply_ = true;
-        model_.title = it ? it->DisplayTitle() : std::wstring();
+        model_.title = it ? wvp::ToWide(it->DisplayTitle()) : std::wstring();
         model_.prepared = false; model_.seekable = false; model_.pos = 0; model_.dur = 0; model_.subCount = 0;
         if (!it && !pending_ && currentPlaylistItems_.empty()) {   // nothing left to play: leave the video-only modes, stay in the player view
             if (modes_.mini) SetMiniPlayer(false);
@@ -457,7 +438,7 @@ void App::WirePlayer() {
     ctl_->QueueChanged.add([this]() {
         currentPlaylistItems_ = ctl_->Items();
         if (!suppressPlaylistPersistence_ && !PersistCurrentPlaylist())
-            ShowInfoBar(InfoSeverity::Error, Tr(L"Could not save the current playlist", L"현재 재생목록을 저장할 수 없습니다"), currentPlaylistName_.empty() ? Tr(L"Unnamed playlist", L"이름 없는 재생목록") : currentPlaylistName_);
+            ShowInfoBar(InfoSeverity::Error, Tr(L"Could not save the current playlist", L"현재 재생목록을 저장할 수 없습니다"), currentPlaylistName_.empty() ? Tr(L"Unnamed playlist", L"이름 없는 재생목록") : wvp::ToWide(currentPlaylistName_));
         ForPanels([](PlaylistPanel& p) { p.OnQueueChanged(); });
         SyncModel(); Flush();
     });
@@ -577,7 +558,7 @@ void App::ResizeWindowForPlaylistPanel(int videoWidthPx, bool panelWanted) {
 }
 
 /// Ctrl+S from anywhere in the player view: opens the panel when hidden and puts the keyboard focus in its search box.
-/// The video child (SDL) may own the Win32 focus: take it back to the main window so keys reach the widget host.
+/// The video child may own the Win32 focus: take it back to the main window so keys reach the widget host.
 void App::FocusPlaylistSearch() {
     if (modes_.Mode() != ShellMode::NowPlaying) return;
     if (!svc_->settings.playlistPanel) TogglePlaylistPanel();
@@ -620,7 +601,7 @@ void App::ForPanels(const std::function<void(PlaylistPanel&)>& f) {
 
 void App::CycleAlwaysOnTop() {
     svc_->settings.alwaysOnTop = sl::NextAlwaysOnTop(svc_->settings.alwaysOnTop);
-    OnSettingsChanged(*this);   // saves and re-applies HWND_TOPMOST
+    OnSettingsChanged(*this);
     const wchar_t* names[] = {Tr(L"Always on top: Off", L"항상 위에: 사용 안 함"), Tr(L"Always on top: On", L"항상 위에: 항상"),
                             Tr(L"Always on top: While playing", L"항상 위에: 재생 중"), Tr(L"Always on top: While fullscreen", L"항상 위에: 전체 화면")};
     ShowToast(names[sl::AlwaysOnTopIndex(svc_->settings.alwaysOnTop)]);
@@ -804,8 +785,8 @@ void App::Execute(CommandId c) {
     case C::ToggleTimeMode: ToggleTimeMode(); break;
     case C::ToggleHwDecoding: {   // bar H/W | S/W chip: the configured decoder <-> off, same path as Settings > Playback > Hardware decoding
         wvp::AppSettings& s = svc_->settings;
-        if (s.hwDecoder != L"off") { s.hwDecoderLastOn = s.hwDecoder; s.hwDecoder = L"off"; }
-        else s.hwDecoder = wvp::IsValidHwDecoder(s.hwDecoderLastOn) && s.hwDecoderLastOn != L"off" ? s.hwDecoderLastOn : L"auto";
+        if (s.hwDecoder != "off") { s.hwDecoderLastOn = s.hwDecoder; s.hwDecoder = "off"; }
+        else s.hwDecoder = wvp::IsValidHwDecoder(s.hwDecoderLastOn) && s.hwDecoderLastOn != "off" ? s.hwDecoderLastOn : "auto";
         OnSettingsChanged(*this);
         SyncModel();
         break;
@@ -853,11 +834,10 @@ dbg::OverlayContext App::BuildDebugContext() {
         }
     }
     if (const wvp::Plan* pl = svc_->filters.CurrentPlan()) c.plan = *pl;
-    c.url = wvp::ToUtf8(lastOpenUrl_);
+    c.url = lastOpenUrl_;
     c.resumeDecision = resumeDecision_;
     if (!lastOpenUrl_.empty()) {
-        c.openOptions = wvp::ToUtf8(log::FormatOptionsLine(effOpts_));
-        c.ffplayCmd = wvp::ToUtf8(lastOpenCmd_);
+        c.openOptions = log::FormatOptionsLine(effOpts_);
     }
     const wvp::FilterSettings& fs = svc_->filters.Settings();
     c.requestedSpeed = fs.speed;

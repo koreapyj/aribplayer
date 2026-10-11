@@ -7,6 +7,7 @@
 #include <numeric>
 
 #include "features/FxModel.h"
+#include "wvp/win32/Utf.h"
 
 namespace app::fx {
 
@@ -115,10 +116,11 @@ bool IsLocalPath(const std::wstring& s) {
 std::vector<PropSection> BuildProperties(const wvp::MediaInfo& info, std::optional<std::int64_t> size) {
     std::vector<PropSection> out;
     PropSection file{Tr(L"File", L"파일"), {}};
-    std::wstring name = !info.Title.empty() ? info.Title : FileName(info.Url);
+    const std::wstring url = wvp::ToWide(info.Url);
+    std::wstring name = !info.Title.empty() ? wvp::ToWide(info.Title) : FileName(url);
     if (!name.empty()) file.rows.push_back({Tr(L"Title", L"제목"), name});
-    if (!info.Url.empty()) file.rows.push_back({IsLocalPath(info.Url) ? Tr(L"Path", L"경로") : Tr(L"URL", L"주소"), info.Url});
-    if (!info.Format.empty()) file.rows.push_back({Tr(L"Container", L"컨테이너"), info.Format});
+    if (!info.Url.empty()) file.rows.push_back({IsLocalPath(url) ? Tr(L"Path", L"경로") : Tr(L"URL", L"주소"), url});
+    if (!info.Format.empty()) file.rows.push_back({Tr(L"Container", L"컨테이너"), wvp::ToWide(info.Format)});
     file.rows.push_back({Tr(L"Duration", L"재생 시간"), FormatDurationText(info.Duration)});
     file.rows.push_back({Tr(L"Bit rate", L"비트 전송률"), FormatBitRateText(info.BitRate)});
     if (size) file.rows.push_back({Tr(L"Size", L"크기"), FormatFileSizeText(*size)});
@@ -134,27 +136,27 @@ std::vector<PropSection> BuildProperties(const wvp::MediaInfo& info, std::option
             if (list.size() > 1) sec.rows.push_back({Tr(L"Stream ", L"스트림 ") + std::to_wstring(i + 1), s.Selected ? Tr(L"(playing)", L"(재생 중)") : L""});
             rowsFor(sec, s);
             std::wstring lang = LanguageName(s.Language);
-            if (lang.empty() && !s.Language.empty() && s.Language != L"und") lang = s.Language;
+            if (lang.empty() && !s.Language.empty() && s.Language != "und") lang = wvp::ToWide(s.Language);
             if (!lang.empty()) sec.rows.push_back({Tr(L"Language", L"언어"), lang});
-            if (!s.Title.empty()) sec.rows.push_back({Tr(L"Stream title", L"스트림 제목"), s.Title});
+            if (!s.Title.empty()) sec.rows.push_back({Tr(L"Stream title", L"스트림 제목"), wvp::ToWide(s.Title)});
         }
         out.push_back(std::move(sec));
     };
     addStreams(wvp::StreamType::Video, Tr(L"Video", L"영상"), [](PropSection& sec, const wvp::StreamInfo& s) {
-        sec.rows.push_back({Tr(L"Codec", L"코덱"), s.Codec});
+        sec.rows.push_back({Tr(L"Codec", L"코덱"), wvp::ToWide(s.Codec)});
         sec.rows.push_back({Tr(L"Resolution", L"해상도"), FormatResolution(s.Width, s.Height)});
         sec.rows.push_back({Tr(L"Pixel aspect (SAR)", L"픽셀 가로세로 비 (SAR)"), FormatSar(s.SarNum, s.SarDen)});
         sec.rows.push_back({Tr(L"Display aspect (DAR)", L"화면 가로세로 비 (DAR)"), FormatDar(s.Width, s.Height, s.SarNum, s.SarDen)});
         sec.rows.push_back({Tr(L"Frame rate", L"프레임 속도"), FormatFrameRate(s.Fps)});
-        if (!s.PixFmt.empty()) sec.rows.push_back({Tr(L"Pixel format", L"픽셀 형식"), s.PixFmt});
+        if (!s.PixFmt.empty()) sec.rows.push_back({Tr(L"Pixel format", L"픽셀 형식"), wvp::ToWide(s.PixFmt)});
     });
     addStreams(wvp::StreamType::Audio, Tr(L"Audio", L"소리"), [](PropSection& sec, const wvp::StreamInfo& s) {
-        sec.rows.push_back({Tr(L"Codec", L"코덱"), s.Codec});
+        sec.rows.push_back({Tr(L"Codec", L"코덱"), wvp::ToWide(s.Codec)});
         sec.rows.push_back({Tr(L"Sample rate", L"샘플 속도"), FormatSampleRate(s.SampleRate)});
         sec.rows.push_back({Tr(L"Channels", L"채널 수"), FormatChannels(s.Channels)});
     });
     addStreams(wvp::StreamType::Subtitle, Tr(L"Subtitles", L"자막"), [](PropSection& sec, const wvp::StreamInfo& s) {
-        sec.rows.push_back({Tr(L"Codec", L"코덱"), s.Codec});
+        sec.rows.push_back({Tr(L"Codec", L"코덱"), wvp::ToWide(s.Codec)});
     });
     return out;
 }

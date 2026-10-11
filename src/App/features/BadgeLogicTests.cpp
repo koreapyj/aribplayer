@@ -4,7 +4,7 @@
 namespace {
 using namespace app::badge;
 
-wvp::StreamInfo Stream(wvp::StreamType t, const wchar_t* codec, int channels = 0) {
+wvp::StreamInfo Stream(wvp::StreamType t, const char* codec, int channels = 0) {
     wvp::StreamInfo s;
     s.Type = t;
     s.Codec = codec;
@@ -20,7 +20,7 @@ LOGIC_TEST(badge_chips_video_and_audio) {
     d.HasVideo = d.HasAudio = true;
     d.Video.HwaccelDevice = "d3d11va";
     wvp::MediaInfo m;
-    m.Streams = {Stream(wvp::StreamType::Video, L"hevc"), Stream(wvp::StreamType::Audio, L"eac3", 6)};
+    m.Streams = {Stream(wvp::StreamType::Video, "hevc"), Stream(wvp::StreamType::Audio, "eac3", 6)};
     std::vector<Chip> want{{ChipKind::HwSw, L"H/W"}, {ChipKind::VideoCodec, L"HEVC"},
                            {ChipKind::AudioCodec, L"E-AC3"}, {ChipKind::Channels, L"5.1"}};
     LT_CHECK(BuildChips(d, m) == want);
@@ -33,18 +33,18 @@ LOGIC_TEST(badge_chips_video_and_audio) {
 
 LOGIC_TEST(badge_chips_fourcc_and_hdr) {
     wvp::MediaInfo m;
-    m.Streams = {Stream(wvp::StreamType::Video, L"mpeg2video"), Stream(wvp::StreamType::Audio, L"aac", 2)};
+    m.Streams = {Stream(wvp::StreamType::Video, "mpeg2video"), Stream(wvp::StreamType::Audio, "aac", 2)};
     LT_CHECK(BuildChips(wvp::DebugInfo{}, m)[0].text == L"MPEG2VIDEO");   // no FourCC: codec name
-    m.Streams[0].FourCC = L"mpg2";
-    m.Streams[0].ColorTransfer = L"bt709";
+    m.Streams[0].FourCC = "mpg2";
+    m.Streams[0].ColorTransfer = "bt709";
     auto c = BuildChips(wvp::DebugInfo{}, m);
     LT_CHECK(c[0] == (Chip{ChipKind::VideoCodec, L"MPG2"}));
     LT_CHECK_EQ(c.size(), (size_t)3);   // no HDR chip
-    m.Streams[0].ColorTransfer = L"smpte2084";
+    m.Streams[0].ColorTransfer = "smpte2084";
     c = BuildChips(wvp::DebugInfo{}, m);
     LT_CHECK(c[0] == (Chip{ChipKind::Hdr, L"HDR"}));
     LT_CHECK(c[1].text == L"MPG2");
-    m.Streams[0].ColorTransfer = L"arib-std-b67";
+    m.Streams[0].ColorTransfer = "arib-std-b67";
     LT_CHECK(BuildChips(wvp::DebugInfo{}, m)[0].kind == ChipKind::Hdr);
 }
 
@@ -53,7 +53,7 @@ LOGIC_TEST(badge_chips_audio_only_and_empty) {
     d.Valid = true;
     d.HasAudio = true;
     wvp::MediaInfo m;
-    m.Streams = {Stream(wvp::StreamType::Audio, L"flac", 2)};
+    m.Streams = {Stream(wvp::StreamType::Audio, "flac", 2)};
     auto c = BuildChips(d, m);
     LT_CHECK_EQ(c.size(), (size_t)2);   // no H/W chip without video
     LT_CHECK(c[0].kind == ChipKind::AudioCodec);

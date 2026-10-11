@@ -1,14 +1,14 @@
 # Debugging the player
 
-Everything below reports what libffplay actually does at runtime (the opened decoder, the hardware device that really
-got created, the filter graphs really configured, the renderer object really created), next to what the app asked for.
-A difference between the two is highlighted.
+Everything below reports what libffplay and the presenter actually do at runtime (the opened decoder, the hardware device
+that really got created, the filter graphs really configured, the presenter route really drawing), next to what the app
+asked for. A difference between the two is highlighted.
 
 The app is built against `ffmpeg/dist/win64` and ships those DLLs; it imports `libffplay.dll` normally and checks no
 version (a missing DLL or export stops it at launch with the loader's error). The startup log records the loaded
 FFmpeg version. Filters, the decoder of each hwaccel and the build features are compiled into the app from that dist
-(`BuildCapabilities`); GPU devices, drivers, decode support, runtimes and interop paths are checked at runtime by the
-probe child.
+(`BuildCapabilities`); GPU devices, drivers, decode support, the presenter's capabilities and interop paths are checked at
+runtime by the probe child of each adapter.
 
 ## Command line
 
@@ -21,11 +21,10 @@ aribplayer.exe [options] [file | url | playlist ...]
 | `--console` | Log lines go to a console. Attaches to the parent console, opens one when there is none. Streams already redirected to a file or pipe are used as they are. Log lines go to stderr, like ffplay. |
 | `--log-level=<level>` | libffplay / FFmpeg level: `quiet`, `error`, `warning`, `info`, `verbose`, `debug`, `trace` (or the AV_LOG number). Default `warning`; `info` while any log output (`--console`, `--log-file`, Debug logging) or `--stats` is active. |
 | `--stats` | Adds `stats=1` to every open: ffplay's periodic status line (`12.31 A-V: -0.008 fd=0 aq=34KB vq=890KB sq=0B`) goes through the log callback at info level. In the log it is throttled to 2 lines per second. |
-| `--planner=off` | Disables GPU pipeline planning and keeps the non-planner open options for debugging isolation (see below). |
 | `--log-file=<path>` | Appends timestamped lines to `<path>` (folders are created). |
 | `--help`, `-h`, `/?` | Prints the usage text to the console and exits. |
 | `--logictest [filter]`, `--headless-check <media> [--result=<json>]` | Test modes, no visible window. |
-| `--probe-gpu <file>` | Internal: the app starts itself with this at startup to run the GPU capability probe in a short-lived child process (the drivers keep tens of MB of per-process state after probing) and reads the JSON answer from `<file>`. If the child fails, the probes run in-process. |
+| `--probe-gpu <file> --adapter-luid=<id>` | Internal: the video platform starts the app with this to probe one adapter in a short-lived child process (the drivers keep tens of MB of per-process state after probing) and reads the JSON answer from `<file>`. When the child gives no answer (it could not start or crashed) the adapter is probed once more inside the app (`GPU probe helper gave no answer ...` warning); a child that runs over 30 s is terminated and its adapter is not used (`GPU probe helper hung ...`). |
 
 Log line format: `2026-10-04 12:34:56.789 [INFO ] src: message`. `av:` lines are libffplay / FFmpeg `av_log` output (delivered
 through `FfPlayer::SetLogCallback`, so they are not written to the raw stderr), everything else is an app event:
@@ -33,12 +32,13 @@ through `FfPlayer::SetLogCallback`, so they are not written to the raw stderr), 
 | src | events |
 | --- | --- |
 | `app` | start (libffplay version / API), close |
-| `open` | one record trio per open: `url: ...`, `options: key=value ...` (the exact list handed to `ffp_open`), `ffplay: ffplay.exe ...` (equivalent command line) |
+| `open` | one record pair per open: `url: ...`, `options: key=value ...` (the exact list handed to `ffp_open`) |
 | `player` | `prepared: ...`, `state: Playing|Paused|...`, `ended`, `ERROR ...` |
 | `queue` | current item changes |
 | `seek` | seeks from the keyboard (`key relative -5 s` for Left / Right and `-30`, `+60`, `-300` ... for the modifier arrows, each landing on the key packet closest to the target; Ctrl+Shift+Left / Ctrl+Shift+Right log `key previous keyframe` / `key next keyframe`) and the seek bar (`bar to 12.5 s`) |
-| `filter` | every live filter change (vf / af rebuild strings and filter commands) and filter errors |
+| `filter` | every live filter change (vf / af rebuild strings, the effective options) and filter errors |
 | `mode` | `now-playing`, `full-screen`, `mini-player` |
+| `presenter` | the presenter of each adapter switch, presenter failures (`PRESENTER_ERROR`: the item is reopened) |
 | `debug` | overlay on / off |
 
 Settings > Advanced > **Debug logging** writes the same stream (info level) to
@@ -59,55 +59,36 @@ How to read it (`requested -> actual`; a row in the warning colour with `MISMATC
 
 | Row | Meaning |
 | --- | --- |
-| `renderer` | The renderer/route actually used: `vulkan`, `sdl:<name>`, `d3d11:videoprocessor`, `d3d11:shader` or `d3d11:shader-cuda`. `frame_path` describes the last decoded frame: `hw_direct` (retained hardware frame), `hw_download` (downloaded to system memory), `software`. Read sink-download and presenter counters too: `hw_direct` alone does not prove the whole pipeline has no host copy. More than one non-zero decode-path counter shows `PATH CHANGED` (mid-stream fallback). |
+| `output` | The drawing path the presenter reports (`d3d11:videoprocessor` or `d3d11:shader`; the presenter's name when it reports none). `frame_path` describes the last decoded frame: `hw_direct` (retained hardware frame), `hw_download` (downloaded to system memory), `software`. Read sink-download and presenter counters too: `hw_direct` alone does not prove the whole pipeline has no host copy. More than one non-zero decode-path counter shows `PATH CHANGED` (mid-stream fallback). |
 | `video` | codec, the decoder implementation really opened, decoded size -> output size, SAR, frame rate. |
 | `hwaccel` | `requested d3d11va -> actual <device type of the decoder's hw_device_ctx>`. `actual none` plus `error:` means the request could not be honoured (e.g. a codec without d3d11va support) and decoding is software. |
-| `pix_fmt` | pixel format as decoded (`d3d11` for hardware frames), after the hardware transfer (`nv12`), and the format handed to the renderer. |
+| `pix_fmt` | pixel format as decoded (`d3d11` for hardware frames), after the hardware transfer (`nv12`), and the format handed to the presenter. |
 | `audio`, `audio out` | codec / decoder, source rate, channels, layout, sample format; output device, rate, channels, `hw_buf`, average A-V `diff_avg`, output `latency`. |
 | `arib audio`, `audio 1`, `audio 2` | ARIB transport streams only: the preference (`audio1` / `audio2`), the source playing now (`audio1`, `audio2`, `silence`), source changes at the cursor, synthesised silence in ms, role recomputations; then per role the stream, PID, component tag, decoded audio buffered ahead of the cursor, and `STARVED` when its data stopped (or a PMT removed it). |
 | `vf req` / `vf graph` | the video filter string the app set vs the graph really configured, in order, including auto-inserted `scale` / `format` (listed as `auto-inserted:`). A requested filter missing from the graph, or out of order, is a mismatch. |
 | `af req` / `af graph` | the same for audio (`aformat`, `aresample` appear as auto-inserted). |
 | `vf nodes` / `af nodes` | the configured nodes with the hardware device each one runs on, e.g. `hwupload[d3d11va] > ivtc_d3d11[d3d11va] > hwdownload`. |
-| `deinterlace` | the single Deinterlace option as really in the graph: `IVTC: ivtc_cuda (cuda), residual-combing fallback unavailable`, `IVTC: ivtc_d3d11 (d3d11), ...`, `IVTC: fieldmatch+bwdif(interlaced)+decimate (CPU)`, `bwdif (CPU)`, `yadif (CPU)` or `none`. Warning when the mode is enabled but not in the graph. |
+| `deinterlace` | the single Deinterlace option as really in the graph: `IVTC: ivtc_d3d11 (d3d11), residual-combing fallback unavailable`, `IVTC: fieldmatch+bwdif(interlaced)+decimate (CPU)`, `bwdif (CPU)`, `yadif (CPU)` or `none`. Warning when the mode is enabled but not in the graph. |
 | `path` | only for a `hwupload` ... GPU filter ... `hwdownload` round trip in the graph: the data path of a frame (see below). |
 | `speed` | the app's requested speed vs the product of all `atempo` values in the audio graph. |
 | `sync` | master clock (`audio` / `video` / `external`), the clocks, and `A-V` in milliseconds (the same number as ffplay's `A-V:`); dropped frames (early / late), duplicated frames, frame timer drift. |
 | `queues` | packets, bytes and duration queued for audio / video / subtitles. |
 | `streams` | stream index, start time and time base per stream. |
 | `position` | position / duration, paused, speed. |
-| `open`, `options`, `ffplay` | the url and the exact `key=value` options of the last open and the equivalent `ffplay.exe` command line. |
+| `open`, `options` | the url and the exact `key=value` options of the last open (with the live filter strings applied). |
 
 Unknown values in a runtime snapshot show `?` and are never treated as a mismatch.
 
 ### Frame paths
 
-* Software decode: `CPU decode -> filters (CPU) -> renderer`.
-* `hwaccel=d3d11va` with the SDL renderer: `GPU decode (d3d11) -> CPU download (nv12) -> filters -> renderer upload`
+* Software decode: `CPU decode -> filters (CPU) -> presenter upload`.
+* `hwaccel=d3d11va` with `hwframes=download`: `GPU decode (d3d11) -> CPU download (nv12) -> filters -> presenter upload`
   (`frame_path hw_download`).
-* `hwaccel` with the Vulkan renderer: `GPU decode -> Vulkan` (`hw_direct`), no CPU copy unless a filter needs one.
 * D3D11VA with the D3D11 presenter: `GPU decode (d3d11) -> D3D11 VP/shader`; supported frames remain on the GPU.
-  CUDA uses `GPU decode / CUDA filters -> D3D11 CUDA import`, with zero presenter copies or a GPU-only copy
-  according to the runtime import path. Unsupported formats still fall back to download/upload.
+  Unsupported formats still fall back to download/upload.
 * A `hwupload` ... GPU filter ... `hwdownload` round trip in the graph:
-  `GPU decode -> CPU download -> <domain> upload + <filter> -> CPU download -> <renderer>`.
+  `GPU decode -> CPU download -> <domain> upload + <filter> -> CPU download -> <presenter>`.
   This path has four GPU/CPU transfers; compare it with the CPU recipe in the overlay (`deinterlace` row, `queues`, drops).
-
-## Reproducing with ffplay.exe
-
-Every open logs the equivalent command line (`open: ffplay: ...`, and in the overlay). It uses the flags the project's
-patched `ffmpeg\dist\win64\ffplay.exe` accepts (verified with `ffplay.exe -h full`): `-vf -af -ss -t -hwaccel -volume -loop
--sync -codec/-vcodec/-acodec -f -x -y -ast/-vst/-sst`, boolean flags (`-stats`, `-fast`, ... and `-no<name>` for a false
-value) and any other key as an AVFormat / AVCodec / protocol option (`-user_agent "..."`). Options libffplay understands but
-ffplay.exe has no flag for are appended as a comment: `# no CLI equivalent: filter_hw_device=d3d11va` (ffplay.exe has no
-`-filter_hw_device`; libffplay creates the `type[:device]` hardware device and attaches it to every video filter). The line is quoted for cmd and PowerShell (double quotes, `\"` for
-embedded quotes); a filter string containing `$` or a back-tick needs PowerShell escaping by hand; delete the trailing
-`# ...` comment in cmd.
-
-Example (hardware decoding, deinterlace and 1.5x speed):
-
-```
-ffplay.exe -hwaccel d3d11va -stats -vf "yadif,setpts=PTS/1.5" -af "atempo=1.5" "C:\Videos\clip.mp4"
-```
 
 Run with `--console --log-level=verbose --stats --log-file=C:\temp\wvp.log` to see the `av:` lines (decoder selection,
 hwaccel negotiation, filter graph configuration) and the status line next to the app events in one timeline.
@@ -115,12 +96,11 @@ hwaccel negotiation, filter graph configuration) and the status line next to the
 ## Headless checks
 
 ```
-set SDL_AUDIODRIVER=dummy
 aribplayer.exe --console --log-level=verbose --stats --log-file=%TEMP%\aribplayer-check.log --headless-check testmedia\testsrc2-360p-short.mp4
 ```
 
-`--headless-check` verifies the overlay (Tab on / off, layer z-order below title / bar / popup, text from the real player,
-refresh), and with `--log-file` it reads its own log at the end and requires the open / options / ffplay line, `prepared`,
+`--headless-check` plays on SDL's dummy audio driver and verifies the overlay (Tab on / off, layer z-order below title / bar /
+popup, text from the real player, refresh), and with `--log-file` it reads its own log at the end and requires the open / options lines, `prepared`,
 `state`, `seek`, `filter`, `av:` lines and, with `--stats`, the `A-V:` status line (missing ones are listed in the
 `log_file_missing` note). No window is ever visible.
 
@@ -131,26 +111,29 @@ from the input's folder or its parent, and the queue-end step makes one keyframe
 
 ## GPU adapter
 
-libffplay plays on the adapter of the app's own UI device (as Windows assigns it, honouring Settings > Display > Graphics):
-the app reads its LUID (`IDXGIDevice::GetAdapter`) and passes `d3d11_adapter_luid=<HHHHHHHH:LLLLLLLL>` to every open and to the
-capability probe child, so the presenter, the d3d11va decode device and CUDA (matched by LUID; no matching CUDA device = no
-CUDA) all use that GPU. When the UI device is not on a hardware adapter (WARP, the Microsoft Basic Render Driver, software
-adapters), the first hardware adapter with D3D11 video support is used instead; with none, playback is software + SDL. The
-startup log has `adapter: UI device: <name> (vendor 0x...., luid ...); playback: <reason>`, and the Tab overlay an `adapter:`
-line (a warning when it is not the UI adapter). Before each open the UI adapter is re-read; a changed adapter is logged and
-used from that open on.
+Video runs on the adapter the video GPU selection picks (Settings > Playback > Video GPU, Automatic by default:
+`wvp::SelectVideoGpu`, see `src/Core/include/wvp/VideoGpu.h`). The Windows video platform (`src/Presenter`) lists the
+hardware adapters (DXGI, grouped into physical GPUs by PCI location), probes each one in a child process and creates the
+D3D11 presenter on the chosen adapter; its D3D11VA device is the device libffplay decodes and filters on (nothing runs
+on another GPU). Windows video is D3D11 only: there is no CUDA decoding, filtering or import.
 
-Test / diagnostic switches (default off; all also reach the probe child, except the route):
+The probe starts first thing at startup, while the window is created, and every open waits for its plan: an item opened
+before the probe answered (command line, restored queue) is opened when the plan arrives (`caps: startup probe done N ms
+after start`, then `open: first media prepared N ms after start`). If no adapter can be probed, neither by its helper nor
+in the app, nothing is opened and an error notice says that video cannot be played (`caps: no adapter could be probed`);
+the same notice names the reason when the planner finds no pipeline for the current settings (e.g. a custom filter the
+player cannot run). The presenter starts on the adapter of the window's monitor; the choice moves it. The log has
+`adapter: <trigger>: video GPU <name> (luid ...), display adapter ...: <reason>` and `presenter: presenter on <luid>` lines.
+
+Test / diagnostic switches (default off; the presenter options also reach the probe child, except the route):
 
 - `--test-ui-device-loss=<ms>`: simulates one UI GPU device loss that many ms after playback starts (the Gfx draw/commit fails
   with DXGI_ERROR_DEVICE_REMOVED; the normal rebind runs). `--headless-check` always runs the simulated-loss steps
   (`ui_loss_*`); the `gpu:` log lines carry detection -> UI-visible timings.
-- `--no-cuda`: the planner sees no CUDA device (the probe result is masked), to check the d3d11va zero-copy plans on NVIDIA.
-- `--d3d11-debug`: `d3d11_debug=1`, the D3D11 debug layer on libffplay's devices (needs the Graphics Tools optional feature);
+- `--d3d11-debug`: the D3D11 debug layer on the presenter's devices (needs the Graphics Tools optional feature);
   `ID3D11InfoQueue` messages appear in the log prefixed `d3d11-debug:`.
 - `--d3d11-force-caps=p010=0,decoder_srv=0,...`: masks presenter capabilities (`nv12_srv`, `p010_srv`, `decoder_srv`, `p010`,
-  `rotate`, `mirror`, `procamp`, `shader`, `cuda_import`) to exercise the fallbacks; the overlay's presenter `fallbacks` line lists
-  what was taken.
+  `shader`) to exercise the fallbacks; the overlay's presenter `fallbacks` line lists what was taken.
 - `--d3d11-route=vp|shader`: forces the presenter route.
 
 ## GPU pipeline planner
@@ -161,7 +144,7 @@ On is one planner operation with bwdif and yadif as candidates:
 
 | Where the deinterlacer runs | Efficiency | Quality |
 |---|---|---|
-| GPU (a `bwdif_*` variant in the chosen domain: `bwdif_d3d11`, `bwdif_cuda`, ...) | bwdif | bwdif |
+| GPU (a `bwdif_*` variant in the chosen domain: `bwdif_d3d11`, ...) | bwdif | bwdif |
 | GPU domain without any bwdif variant in the build | that domain's yadif | that domain's yadif |
 | CPU | `yadif` | `bwdif` |
 
@@ -172,33 +155,36 @@ The cost model picks GPU vs CPU; the step reason (Tab overlay `deinterlace` row 
 presenter's VideoProcessor always runs progressive with auto processing off. Content with 4:2:2 / 4:4:4 chroma is never
 planned with `hwframes=keep` (the presenter and the GPU filters take 4:2:0 hardware frames only): the plan note says
 `chroma 4:2:2: hw frames are downloaded (no hwframes=keep)`. IVTC plans the
-cheapest variant: `ivtc_d3d11` / `ivtc_cuda` alone (GPU ivtc clears the interlaced flag, so no deinterlacer follows and the plan
+cheapest variant: `ivtc_d3d11` alone (GPU ivtc clears the interlaced flag, so no deinterlacer follows and the plan
 note says `residual-combing fallback: unavailable (GPU ivtc)`; a caps filter with `"flags_combed": true` gets
 `<bwdif in the same domain>=mode=send_frame:parity=auto:deint=interlaced` appended), or on the CPU
 `fieldmatch,bwdif=mode=send_frame:parity=auto:deint=interlaced,decimate`.
-With software decoding a GPU variant is uploaded inside the graph (`sw > hwupload > ivtc_cuda > present:d3d11(import cuda)`).
+With software decoding a GPU variant is uploaded inside the graph (`sw > hwupload > ivtc_d3d11 > present:d3d11`).
+The build's CUDA filters (`ivtc_cuda`, `bwdif_cuda`, `scale_npp`, ...) are classified in the frame domain `cuda`, which has
+no device type: no device, decoder, upload, interop or presenter input reaches it, so they are never planned (a custom chain
+naming one has no pipeline).
+Hardware decoders: "Auto" is resolved by the planner from the capabilities (it costs every usable decoder and software
+decoding), libffplay always gets an explicit `hwaccel` and `hwframes`, plus `vcodec` when the build's decoder for that codec
+and hwaccel is not the codec's default decoder.
 The current library supports hardware-frame output from that graph (`upload_hw_sink`, source patch
-`1010-libffplay-presenters.patch`); the D3D11 presenter can consume it when the runtime probe reports a usable CUDA import path.
+`1009-libffplay-engine.patch`); the D3D11 presenter consumes D3D11 frames from it directly.
 The planner still accounts for available filters, devices, interop and copy costs when choosing GPU or CPU processing.
 The primary real-playback interlace fixture is Japanese/Korean broadcast 1920x1080i at 30000/1001 pictures/s (60000/1001
 fields/s): `testmedia/hw/h264-1920x1080i-2997.ts`. `bwdif=mode=send_frame` should produce about 29.97 fps and
 `mode=send_field` about 59.94 fps. These fixtures are made by interleaving 59.94p fields; libx264 emits MBAFF
 (`mb_adaptive_frame_field_flag=1`, `field_pic_flag=0`), not genuine PAFF (libx264 cannot encode PAFF).
 
-The app uses `ffp_probe_caps` at startup to ask what the machine can do and plans the whole video pipeline
-from that: decoder, the `vf` string with its hardware transitions, the presenter and which operations the presenter absorbs.
-The probe results, not the library, determine whether a GPU runtime or device is usable.
-The d3d11 presenter creates its CUDA context
-(about 100 MB private and 160 MB GPU memory) only for an open that uses CUDA (`hwaccel=cuda`, a `_cuda` filter or a CUDA filter
-device); with d3d11va or software decoding `nvcuda64.dll` has no context in the process. Log lines (all with `--console` or `--log-file`):
+The app probes every adapter at startup (the platform's checks of decode support and the presenter, merged with libffplay's
+portable `ffp_probe_caps` on the same devices and the build tables) and plans the whole video pipeline from that: decoder,
+the `vf` string with its hardware transitions, and which frames reach the presenter. The presenter is always the
+platform's (D3D11 on Windows); there is no presenter preference. The probe results, not the library, determine whether a
+GPU runtime or device is usable. Log lines (all with `--console` or `--log-file`):
 
 - `caps: ...` one line per section of the probe: source / adapter / features, devices (`ok` and `failed`), decoders usable,
   filters (and which of them are hardware filters), interop checks (`d3d11>qsv map FAILED` = that mapping is not usable and
-  will not be planned), presenters. `caps: unavailable` means the probe returned no usable capability data, so the planner
-  is not activated. The required library/API check is separate. Device or interop failures in an otherwise valid probe
-  exclude those paths without disabling the whole planner.
-- `pipeline: planner active: <summary>` once capabilities arrived. A summary reads `cuda(keep) > ivtc_cuda > present:d3d11
-  [host 0, device 1]`: decoder (`(keep)` = hardware frames stay on the GPU), the filter steps, the presenter, and the planned
+  will not be planned), presenters. Device or interop failures in an otherwise valid probe exclude those paths.
+- `pipeline: planner active: <summary>` once capabilities arrived. A summary reads `d3d11va(keep) > ivtc_d3d11 > present:d3d11
+  [host 0, device 0]`: decoder (`(keep)` = hardware frames stay on the GPU), the filter steps, the presenter, and the planned
   copies per frame (host = GPU<->system memory, device = GPU-side copies). Compare with the `frame_path` counters of the overlay.
 - `pipeline: <summary>` at every open, plus the rejected alternatives at `--log-level=verbose` (`rejected: ... (1 more host copy)`).
 - `pipeline: content: hevc 1280x720 8-bit` after PREPARED: the plan is made with the real codec / size / bit depth. A first open of a
@@ -206,28 +192,20 @@ device); with d3d11va or software decoding `nvcuda64.dll` has no context in the 
   (`replanned for the content ... -> reopen`). The content is cached per URL, so the next open is planned right the first time.
 - `pipeline: fallback: <key> (<reason>)` a plan element did not work in practice (planned `hwaccel` is not what decodes after 40
   frames, `hwframes=keep` fell back to download, a hardware filter raised a filter error). The key is blacklisted for the
-  session (`hwaccel:cuda`, `hwframes_keep`, `filter:ivtc_cuda`), the pipeline is replanned and the item reopened. At most one
-  fallback per open. A d3d11 presenter failure (`PRESENTER_ERROR` event, libffplay already fell back to SDL) uses the key
-  `presenter:d3d11`: the plan is made without d3d11 (rotation / flip / eq go back into the graph) and the item is reopened.
-- `pipeline: presenter refused its parameters (error -22): not absorbing them` rotation / flip / eq are normally applied by the d3d11
-  presenter itself (live `SetPresenterParams`, the first frame already has them via the `presenter_params` open option). When the
-  presenter refuses them the keys `absorb:eq` / `absorb:rotate` / `absorb:flip` are blacklisted and that operation runs in the graph.
+  session (`hwaccel:d3d11va`, `hwframes_keep`, `filter:ivtc_d3d11`), the pipeline is replanned and the item reopened. At most one
+  fallback per open. A presenter failure (`PRESENTER_ERROR` event) is no fallback: the engine stops presenting for that open,
+  the app reopens the item at its position and the presenter recreates its device in its next open (a lost device also
+  re-selects the video GPU). A second failure within 2 s leaves the item playing without video.
 
 The Tab overlay shows a `pipeline` section while a plan is active: the plan, each step with its copy kind, planned vs measured
 copies, and the rejected alternatives; a mismatch (e.g. planned d3d11va, decoding in software) is flagged there too.
-Settings > Playback has "Hardware decoding" (Auto, Prefer GPU, D3D11VA, D3D12VA, CUDA, DXVA2, Off) and "Video output" (Auto,
-Direct3D 11, SDL); changing either replans and reopens the current item at the same position. Direct3D 11 output needs a
-runtime probe reporting a usable `d3d11` presenter; otherwise the planner falls back to SDL when available. The overlay also shows
+Settings > Playback has "Hardware decoding" (Auto, Prefer GPU, D3D11VA, D3D12VA, DXVA2, Off; an old profile's `cuda` reads
+as Auto); changing it replans and
+reopens the current item at the same position. The overlay also shows
 `presenter d3d11 direct N uploaded M` and warns about presenter mismatches/errors or an uploaded count
 against a no-host-copy plan. These are aggregate counters, not copy guarantees: `direct` can include
-D3D11 shader inputs requiring a device-local slice copy, and `uploaded` includes GPU-only CUDA fallback
-copies as well as system-memory uploads. Consult `frames_cuda_copied` and `frames_d3d11_copied` in the
-debug JSON before diagnosing a host-copy mismatch.
-
-`--planner=off` is a debugging isolation switch: it keeps the legacy open options (`hwaccel` from the Hardware decoding
-setting, `vf` from the filter presets, SDL output) to distinguish a planner problem from an engine problem. The startup
-probe child may still run, but capability results do not
-activate the planner; the log reports `caps: planner disabled (--planner=off)`.
+D3D11 shader inputs requiring a device-local slice copy. Consult `frames_d3d11_copied` in the debug JSON before diagnosing a
+host-copy mismatch.
 
 ## ARIB captions and superimpose
 

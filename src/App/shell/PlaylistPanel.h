@@ -37,16 +37,16 @@ public:
     void OnCurrentChanged();
     /// App switched the current playlist (play from a page, open files ...): the panel follows it.
     void OnCurrentPlaylistChanged();
-    void OnPlaylistRenamed(const std::wstring& from, const std::wstring& to);
-    void OnPlaylistDeleted(const std::wstring& name);
+    void OnPlaylistRenamed(const std::string& from, const std::string& to);
+    void OnPlaylistDeleted(const std::string& name);
     void OnPlaylistsChanged();
     /// The app just saved `url` as played: updates the cached flag (no history read) and repaints.
-    void OnItemPlayed(const std::wstring& url);
+    void OnItemPlayed(const std::string& url);
     /// A row of the viewed list is selected (Play with nothing loaded starts it, like a double click).
     bool CanPlaySelection() const { auto s = SelectedRows(); return !s.empty() && s.front() < (int)Items().size(); }
     void PlaySelection() { auto s = SelectedRows(); if (!s.empty()) PlayRow(s.front()); }
 
-    const std::wstring& Viewed() const { return viewed_; }
+    const std::string& Viewed() const { return viewed_; }
     bool ViewedReadOnly() const { return readOnly_; }
     /// Data events arrived while hidden (or never filled): the owner calls Refresh() when the panel is shown.
     bool Stale() const { return stale_; }
@@ -61,7 +61,7 @@ public:
     pui::VirtualList* List() const;
     pui::TextBox* Search() const { return search_; }
     int ChipCount() const { return (int)chips_.size(); }
-    const std::wstring& ChipName(int i) const { return chipNames_[(size_t)i]; }
+    const std::string& ChipName(int i) const { return chipNames_[(size_t)i]; }
     bool ChipReadOnly(int i) const { return chipReadOnly_[(size_t)i]; }
     TextButton* Chip(int i) const { return chips_[(size_t)i]; }
     GlyphButton* PlusButton() const { return plus_; }
@@ -87,7 +87,7 @@ private:
     int CurrentRow() const;
     bool Editable() const { return !readOnly_; }
     void Reload();                          // rebuilds chips + list for viewed_ (keeps it)
-    void SetViewed(const std::wstring& name);
+    void SetViewed(const std::string& name);
     void RebuildChips();
     void LayoutChips();
     void ReloadSnapshot();
@@ -112,12 +112,12 @@ private:
     void AddSource(plp::PanelAction a);
     void AfterAdd();
     void NewAlbum();
-    void RenameAlbum(const std::wstring& name);
-    void DeleteAlbum(const std::wstring& name);
-    void RefreshAlbum(const std::wstring& name);
-    void EditableCopyOfAlbum(const std::wstring& name);
+    void RenameAlbum(const std::string& name);
+    void DeleteAlbum(const std::string& name);
+    void RefreshAlbum(const std::string& name);
+    void EditableCopyOfAlbum(const std::string& name);
     void SaveDefaultAsAlbum();
-    void AlbumAdded(const std::wstring& name);   // import flows: shows the new playlist
+    void AlbumAdded(const std::string& name);   // import flows: shows the new playlist
     void ShowPlusMenu();
     void ShowChipMenu(int index);
     void ShowRowMenu(int row, pui::PointF pt);
@@ -132,11 +132,11 @@ private:
 
     AppContext& ctx_;
     bool overlay_;
-    std::wstring viewed_;                   // playlist name; empty = the unnamed (default) playlist
+    std::string viewed_;                    // playlist name; empty = the unnamed (default) playlist
     bool readOnly_ = false, chipsDirty_ = true, active_ = false;
     std::vector<wvp::MediaItem> items_;     // snapshot while the viewed playlist is not the live current one
     std::wstring filter_, summary_;
-    std::unordered_set<std::wstring> played_;   // URLs shown dimmed; refreshed on load / queue change / save, never per paint
+    std::unordered_set<std::string> played_;   // URLs shown dimmed; refreshed on load / queue change / save, never per paint
     float chipScroll_ = 0, chipMax_ = 0;    // chipMax_ = overflow width (0 = chips fit)
     bool chipReveal_ = false;               // viewed chip must be scrolled into view once the strip has a size
     bool stale_ = false;                    // data events arrived while hidden: Refresh() on the next show
@@ -150,7 +150,7 @@ private:
     PanelList* list_ = nullptr;
     GlyphButton* sort_ = nullptr;           // right of the search box; opens the Sort menu
     std::vector<TextButton*> chips_;
-    std::vector<std::wstring> chipNames_;
+    std::vector<std::string> chipNames_;
     std::vector<bool> chipReadOnly_;
     std::unique_ptr<ItemSource> source_;
     pui::RectF footerRect_{}, summaryRect_{};

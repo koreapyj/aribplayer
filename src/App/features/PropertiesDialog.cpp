@@ -8,6 +8,7 @@
 #include "pui/Buttons.h"
 #include "pui/Panels.h"
 #include "pui/ScrollViewer.h"
+#include "wvp/win32/Utf.h"
 
 namespace app {
 
@@ -143,9 +144,10 @@ void ShowPropertiesDialog(AppContext& ctx) {
         return;
     }
     std::optional<std::int64_t> size;
-    if (fx::IsLocalPath(info->Url)) {
+    const std::wstring wideUrl = wvp::ToWide(info->Url);
+    if (fx::IsLocalPath(wideUrl)) {
         WIN32_FILE_ATTRIBUTE_DATA fa{};
-        if (GetFileAttributesExW(info->Url.c_str(), GetFileExInfoStandard, &fa))
+        if (GetFileAttributesExW(wideUrl.c_str(), GetFileExInfoStandard, &fa))
             size = (std::int64_t)(((std::uint64_t)fa.nFileSizeHigh << 32) | fa.nFileSizeLow);
     }
     auto dlg = std::make_unique<PropertiesDialogWidget>(fx::BuildProperties(*info, size), &ctx.Measurer());

@@ -362,7 +362,7 @@ LOGIC_TEST(keyboard_table_mapping) {
     LT_CHECK(LookupKey(0x27, 0) == C::SeekForward5);
     LT_CHECK(LookupKey(0x25, kModCtrl | kModShift) == C::KeyframePrevious);
     LT_CHECK(LookupKey(0x27, kModCtrl | kModShift) == C::KeyframeNext);
-    LT_CHECK(LookupKey(0x25, kModAlt) == C::None);                // Alt+arrows are free again
+    LT_CHECK(LookupKey(0x25, kModAlt) == C::None);                // Alt+arrows are unbound
     LT_CHECK(LookupKey(0x76, 0) == C::ToggleControlPanel);        // F7
     LT_CHECK(LookupKey(0x75, 0) == C::TogglePlaylistPanel);       // F6
     LT_CHECK(LookupKey(0x73, 0) == C::Stop);                      // F4
@@ -415,7 +415,7 @@ LOGIC_TEST(keyboard_table_mapping) {
         LT_CHECK(b.command != C::None);
         LT_CHECK(seen.insert({b.vk, b.mods}).second);
     }
-    {   // exactly the navigation keys; every action the removed keys reached is still a command, only its key is gone
+    {   // exactly the navigation keys
         const std::pair<int, unsigned> nav[] = {{0x72, 0}, {'O', kModCtrl}, {'U', kModCtrl}, {0x74, 0}, {0x75, 0}};
         const C navCmd[] = {C::OpenFiles, C::OpenFiles, C::OpenUrl, C::OpenSettings, C::TogglePlaylistPanel};
         for (size_t i = 0; i < 5; i++) LT_CHECK(LookupKey(nav[i].first, nav[i].second) == navCmd[i]);
@@ -481,13 +481,12 @@ LOGIC_TEST(keyboard_speed_steps_round_and_clamp) {
 
 LOGIC_TEST(window_size_from_video) {
     // SAR source: 1440x1080 SAR 4:3 -> 1920x1080
-    auto sar = VideoDisplaySize(1440, 1080, 4, 3, false);
+    auto sar = VideoDisplaySize(1440, 1080, 4, 3);
     LT_CHECK(sar && sar->w == 1920 && sar->h == 1080);
-    { auto q0 = VideoDisplaySize(1920, 1080, 0, 0, false); LT_CHECK(q0 && q0->w == 1920 && q0->h == 1080); }
-    { auto q1 = VideoDisplaySize(1920, 1080, 1, 1, true); LT_CHECK(q1 && q1->w == 1080 && q1->h == 1920); }   // rotated 90
-    LT_CHECK(!VideoDisplaySize(0, 0, 0, 0, false));
+    { auto q0 = VideoDisplaySize(1920, 1080, 0, 0); LT_CHECK(q0 && q0->w == 1920 && q0->h == 1080); }
+    LT_CHECK(!VideoDisplaySize(0, 0, 0, 0));
     static_assert(kFallbackVideoW == 1024 && kFallbackVideoH == 768);   // nominal size when no video is known
-    { auto fb = VideoDisplaySize(kFallbackVideoW, kFallbackVideoH, 0, 0, false); LT_CHECK(fb && fb->w == 1024 && fb->h == 768); }
+    { auto fb = VideoDisplaySize(kFallbackVideoW, kFallbackVideoH, 0, 0); LT_CHECK(fb && fb->w == 1024 && fb->h == 768); }
     LT_CHECK_EQ(WindowScale(LookupKey('1', 0)), 0.5);
     LT_CHECK_EQ(WindowScale(LookupKey('2', 0)), 1.0);
     LT_CHECK_EQ(WindowScale(LookupKey('3', 0)), 1.5);

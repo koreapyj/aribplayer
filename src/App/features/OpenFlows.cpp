@@ -13,7 +13,9 @@
 #include "features/OpenLogic.h"
 #include "features/TextInputDialog.h"
 #include "wvp/MediaUri.h"
+#include "wvp/Platform.h"
 #include "wvp/PlaylistLoader.h"
+#include "wvp/win32/Utf.h"
 
 namespace app {
 
@@ -24,14 +26,6 @@ using Microsoft::WRL::ComPtr;
 constexpr GUID kGuidFiles = {0x6a1f0c11, 0x2b7e, 0x4c53, {0x9a, 0x01, 0x57, 0x8e, 0x21, 0x6b, 0x30, 0x01}};
 constexpr GUID kGuidFolder = {0x6a1f0c11, 0x2b7e, 0x4c53, {0x9a, 0x01, 0x57, 0x8e, 0x21, 0x6b, 0x30, 0x02}};
 constexpr GUID kGuidPlaylist = {0x6a1f0c11, 0x2b7e, 0x4c53, {0x9a, 0x01, 0x57, 0x8e, 0x21, 0x6b, 0x30, 0x03}};
-
-std::wstring Widen(const std::string& s) {
-    if (s.empty()) return {};
-    int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), nullptr, 0);
-    std::wstring w((size_t)n, L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), w.data(), n);
-    return w;
-}
 
 // Empty result = cancelled.
 std::vector<std::wstring> PickPaths(HWND owner, const GUID& clientGuid, bool folder, bool multi, const COMDLG_FILTERSPEC* filters,
@@ -120,31 +114,31 @@ std::vector<std::wstring> ListDropFolder(const std::wstring& folder, bool& skipp
 enum class DispatchTarget { SpecificPlaylist, VideoView };
 
 struct ResolvedInput {
-    std::wstring source;
-    std::wstring title;
-    std::wstring managedName;
+    std::string source;
+    std::string title;
+    std::string managedName;
     std::vector<wvp::MediaItem> items;
     bool isPlaylist = false;
     bool isHls = false;
     bool offlineFallback = false;
 };
 
-std::wstring SourceName(const std::wstring& source) { return open::PlaylistName(source); }
+std::string SourceName(const std::string& source) { return open::PlaylistName(source); }
 
-std::wstring ManagedPlaylistName(wvp::PlaylistStore& store, const std::wstring& source) {
+std::string ManagedPlaylistName(wvp::PlaylistStore& store, const std::string& source) {
     auto input = wvp::MediaUri::Parse(source);
     if (!input.IsLocal()) return {};
-    const std::wstring path = wvp::WinPath::ToLower(wvp::WinPath::GetFullPath(input.localPath ? *input.localPath : source));
+    const std::string path = wvp::platform::FullPath(input.localPath ? *input.localPath : source);
     for (const auto& info : store.List()) {
         if (info.isReference) continue;
-        if (wvp::WinPath::ToLower(wvp::WinPath::GetFullPath(info.path)) == path) return info.name;
+        if (wvp::platform::NamesEqualIgnoreCase(wvp::platform::FullPath(info.path), path)) return info.name;
     }
     return {};
 }
 
-std::wstring ErrorText(const std::exception& ex) { return std::wstring(Tr(L"Open failed: ", L"열기 실패: ")) + Widen(ex.what()); }
+std::wstring ErrorText(const std::exception& ex) { return std::wstring(Tr(L"Open failed: ", L"열기 실패: ")) + wvp::ToWide(ex.what()); }
 
-void PlayLoadedPlaylist(AppContext& ctx, const std::wstring& name, const std::vector<wvp::MediaItem>& items, int startItem,
+void PlayLoadedPlaylist(AppContext& ctx, const std::string& name, const std::vector<wvp::MediaItem>& items, int startItem,
                         bool resumePlaylist) {
     if (items.empty()) return;
     int start = std::clamp(startItem, 0, (int)items.size() - 1);
@@ -162,7 +156,7 @@ void PlayLoadedPlaylist(AppContext& ctx, const std::wstring& name, const std::ve
     ctx.PlayPlaylistAtPosition(name, items, start, preferred);
 }
 
-void Dispatch(AppContext& ctx, const std::vector<std::wstring>& inputs, DispatchTarget target, std::wstring playlistName = {},
+void Dispatch(AppContext& ctx, const std::vector<std::wstring>& inputs, DispatchTarget target, std::string playlistName = {},
               bool skipUnsupported = false, std::function<void()> onDone = {}) {
     if (inputs.empty()) { if (onDone) onDone(); return; }
     std::thread([&ctx, inputs, target, playlistName = std::move(playlistName), skipUnsupported,
@@ -172,10 +166,11 @@ void Dispatch(AppContext& ctx, const std::vector<std::wstring>& inputs, Dispatch
         bool fallbackErr = false;   // error text is localised: remember the offline-fallback case instead of searching the text
         bool skipped = false;
         wvp::PlaylistLoader loader;
-        auto loadOne = [&](const std::wstring& source) {
+        auto loadOne = [&](const std::wstring& wideSource) {
+            const std::string source = wvp::ToUtf8(wideSource);
             if (skipUnsupported) {
                 const auto uri = wvp::MediaUri::Parse(source);
-                if (uri.IsLocal() && !uri.HasPlaylistExtension() && !open::IsMediaFile(source)) { skipped = true; return; }
+                if (uri.IsLocal() && !uri.HasPlaylistExtension() && !open::IsMediaFile(wideSource)) { skipped = true; return; }
             }
             ResolvedInput value;
             value.source = source;
@@ -238,17 +233,17 @@ void Dispatch(AppContext& ctx, const std::vector<std::wstring>& inputs, Dispatch
             if (target == DispatchTarget::SpecificPlaylist) {
                 const size_t n = items.size();
                 ctx.AppendPlaylistItems(playlistName, items);
-                const std::wstring dest = playlistName.empty() ? std::wstring(Tr(L"Unnamed playlist", L"이름 없는 재생목록")) : playlistName;
+                const std::wstring dest = playlistName.empty() ? std::wstring(Tr(L"Unnamed playlist", L"이름 없는 재생목록")) : wvp::ToWide(playlistName);
                 ctx.ShowToast(TrW(L"Added " + std::to_wstring(n) + (n == 1 ? L" item to " : L" items to ") + dest,
                                   dest + L"에 " + std::to_wstring(n) + L"개 항목을 추가했습니다"));
             } else {
                 const bool hasPlaylist = std::any_of(resolved.begin(), resolved.end(), [](const ResolvedInput& r) { return r.isPlaylist; });
                 const bool hasVideo = std::any_of(resolved.begin(), resolved.end(), [](const ResolvedInput& r) { return !r.isPlaylist; });
                 if (hasPlaylist && !hasVideo) {
-                    std::vector<std::wstring> names;
+                    std::vector<std::string> names;
                     for (const auto& r : resolved) {
                         if (!r.isPlaylist) continue;
-                        std::wstring name = r.managedName;
+                        std::string name = r.managedName;
                         if (name.empty()) {
                             const bool remote = wvp::MediaUri::Parse(r.source).IsRemote();
                             name = ctx.Svc().playlists.AddOrUpdateReference(r.source, r.title.empty() ? SourceName(r.source) : r.title,
@@ -277,10 +272,11 @@ void Dispatch(AppContext& ctx, const std::vector<std::wstring>& inputs, Dispatch
     }).detach();
 }
 
-void ImportPlaylistSource(AppContext& ctx, std::wstring source, std::function<void(const std::wstring&)> onImported) {
+void ImportPlaylistSource(AppContext& ctx, std::string source, std::function<void(const std::string&)> onImported) {
     AppContext* c = &ctx;
     std::thread([c, source = std::move(source), onImported = std::move(onImported)]() mutable {
-        std::wstring importedName, error;
+        std::string importedName;
+        std::wstring error;
         std::vector<wvp::MediaItem> items;
         bool hls = false, playlist = false;
         try {
@@ -291,7 +287,7 @@ void ImportPlaylistSource(AppContext& ctx, std::wstring source, std::function<vo
                 items = std::move(result.items);
                 importedName = result.title.empty() ? SourceName(source) : result.title;
             }
-        } catch (const std::exception& ex) { error = Widen(ex.what()); }
+        } catch (const std::exception& ex) { error = wvp::ToWide(ex.what()); }
         c->PostToUi([c, source = std::move(source), importedName = std::move(importedName), items = std::move(items), hls, playlist,
                      error = std::move(error), onImported = std::move(onImported)]() mutable {
             if (!error.empty()) {
@@ -303,20 +299,20 @@ void ImportPlaylistSource(AppContext& ctx, std::wstring source, std::function<vo
                                hls ? Tr(L"HLS playlists are video streams and cannot be imported as playlists.", L"HLS 재생목록은 동영상 스트림이므로 재생목록으로 가져올 수 없습니다.") : Tr(L"The selected URL is not a playlist.", L"선택한 주소는 재생목록이 아닙니다."));
                 return;
             }
-            const std::wstring name = c->Svc().playlists.ImportEditableCopy(importedName, items, playlist, hls);
+            const std::string name = c->Svc().playlists.ImportEditableCopy(importedName, items, playlist, hls);
             if (name.empty()) {
                 c->ShowInfoBar(InfoSeverity::Error, Tr(L"Could not import playlist", L"재생목록을 가져올 수 없습니다"), Tr(L"The editable copy could not be saved.", L"편집 가능한 사본을 저장할 수 없습니다."));
                 return;
             }
             if (onImported) onImported(name);
-            c->ShowToast(TrW(L"Imported " + name, name + L" 가져옴"));
+            c->ShowToast(TrW(L"Imported " + wvp::ToWide(name), wvp::ToWide(name) + L" 가져옴"));
             (void)source;  // the imported playlist is detached from the read-only source
         });
     }).detach();
 }
 }
 
-void RefreshPlaylistReference(AppContext& ctx, const std::wstring& name, std::function<void()> onReady) {
+void RefreshPlaylistReference(AppContext& ctx, const std::string& name, std::function<void()> onReady) {
     if (!ctx.Svc().playlists.IsReference(name)) { if (onReady) onReady(); return; }
     AppContext* c = &ctx;
     std::thread([c, name, onReady = std::move(onReady)]() mutable {
@@ -326,16 +322,16 @@ void RefreshPlaylistReference(AppContext& ctx, const std::wstring& name, std::fu
                 const bool fallback = result.usedOfflineFallback;
                 c->ShowInfoBar(fallback ? InfoSeverity::Warning : InfoSeverity::Error,
                                fallback ? Tr(L"Playlist refresh failed", L"재생목록을 새로 고치지 못했습니다") : Tr(L"Could not read playlist", L"재생목록을 읽을 수 없습니다"),
-                               fallback ? std::wstring(Tr(L"Using the last fetched items as an offline fallback. ", L"마지막으로 가져온 항목을 오프라인 대체본으로 사용합니다. ")) + result.error : result.error);
+                               fallback ? std::wstring(Tr(L"Using the last fetched items as an offline fallback. ", L"마지막으로 가져온 항목을 오프라인 대체본으로 사용합니다. ")) + wvp::ToWide(result.error) : wvp::ToWide(result.error));
             }
             if (onReady) onReady();
         });
     }).detach();
 }
 
-void PlayPlaylistEntry(AppContext& ctx, const std::wstring& name, int startItem, bool resumePlaylist,
+void PlayPlaylistEntry(AppContext& ctx, const std::string& name, int startItem, bool resumePlaylist,
                        std::function<void()> onReady) {
-    std::wstring selectedUrl;
+    std::string selectedUrl;
     if (!resumePlaylist) {
         auto oldItems = ctx.PlaylistItems(name);
         if (startItem >= 0 && startItem < (int)oldItems.size()) selectedUrl = oldItems[(size_t)startItem].url;
@@ -359,14 +355,14 @@ void PlayPlaylistEntry(AppContext& ctx, const std::wstring& name, int startItem,
     else play();
 }
 
-void ImportPlaylist(AppContext& ctx, std::function<void(const std::wstring&)> onImported) {
+void ImportPlaylist(AppContext& ctx, std::function<void(const std::string&)> onImported) {
     static const COMDLG_FILTERSPEC filters[] = {{Tr(L"Playlist files", L"재생목록 파일"), L"*.m3u;*.m3u8"}, {Tr(L"All files", L"모든 파일"), L"*.*"}};
     auto paths = PickPaths(ctx.MainHwnd(), kGuidPlaylist, false, false, filters, 2, Tr(L"Import playlist", L"재생목록 가져오기"));
     if (paths.empty()) return;
-    ImportPlaylistSource(ctx, paths.front(), std::move(onImported));
+    ImportPlaylistSource(ctx, wvp::ToUtf8(paths.front()), std::move(onImported));
 }
 
-void AddPlaylistUrlFromPrompt(AppContext& ctx, std::function<void(const std::wstring&)> onAdded) {
+void AddPlaylistUrlFromPrompt(AppContext& ctx, std::function<void(const std::string&)> onAdded) {
     TextPromptOptions o;
     o.title = Tr(L"Import playlist from URL", L"URL에서 재생목록 가져오기");
     o.label = Tr(L"Enter the address of a remote M3U playlist", L"원격 M3U 재생목록의 주소를 입력하세요");
@@ -378,7 +374,7 @@ void AddPlaylistUrlFromPrompt(AppContext& ctx, std::function<void(const std::wst
     AddPlaylistUrl(ctx, *url, std::move(onAdded));
 }
 
-void AddPlaylistUrl(AppContext& ctx, const std::wstring& rawUrl, std::function<void(const std::wstring&)> onAdded) {
+void AddPlaylistUrl(AppContext& ctx, const std::wstring& rawUrl, std::function<void(const std::string&)> onAdded) {
     size_t b = rawUrl.find_first_not_of(L" \t\r\n"), e = rawUrl.find_last_not_of(L" \t\r\n");
     const std::wstring url = b == std::wstring::npos ? std::wstring() : rawUrl.substr(b, e - b + 1);
     const std::wstring validation = open::ValidateUrl(url);
@@ -387,8 +383,9 @@ void AddPlaylistUrl(AppContext& ctx, const std::wstring& rawUrl, std::function<v
         return;
     }
     AppContext* c = &ctx;
-    std::thread([c, url, onAdded = std::move(onAdded)]() mutable {
-        std::wstring title, error;
+    std::thread([c, url = wvp::ToUtf8(url), onAdded = std::move(onAdded)]() mutable {
+        std::string title;
+        std::wstring error;
         std::vector<wvp::MediaItem> items;
         bool hls = false, playlist = false;
         try {
@@ -399,7 +396,7 @@ void AddPlaylistUrl(AppContext& ctx, const std::wstring& rawUrl, std::function<v
                 items = std::move(result.items);
                 title = result.title.empty() ? SourceName(url) : result.title;
             }
-        } catch (const std::exception& ex) { error = Widen(ex.what()); }
+        } catch (const std::exception& ex) { error = wvp::ToWide(ex.what()); }
         c->PostToUi([c, url, title = std::move(title), items = std::move(items), hls, playlist, error = std::move(error),
                      onAdded = std::move(onAdded)]() mutable {
             if (!error.empty()) {
@@ -411,20 +408,20 @@ void AddPlaylistUrl(AppContext& ctx, const std::wstring& rawUrl, std::function<v
                                hls ? Tr(L"HLS playlists are video streams and cannot be imported as playlists.", L"HLS 재생목록은 동영상 스트림이므로 재생목록으로 가져올 수 없습니다.") : Tr(L"The selected URL is not a playlist.", L"선택한 주소는 재생목록이 아닙니다."));
                 return;
             }
-            const std::wstring name = c->Svc().playlists.AddOrUpdateReference(url, title, items, true);
+            const std::string name = c->Svc().playlists.AddOrUpdateReference(url, title, items, true);
             if (name.empty()) {
                 c->ShowInfoBar(InfoSeverity::Error, Tr(L"Could not import playlist", L"재생목록을 가져올 수 없습니다"), Tr(L"The playlist could not be saved.", L"재생목록을 저장할 수 없습니다."));
                 return;
             }
             c->PlaylistsChanged();
             if (onAdded) onAdded(name);
-            c->ShowToast(TrW(L"Added " + name, name + L" 추가함"));
+            c->ShowToast(TrW(L"Added " + wvp::ToWide(name), wvp::ToWide(name) + L" 추가함"));
         });
     }).detach();
 }
 
-void ImportReferenceAsEditableCopy(AppContext& ctx, const std::wstring& name,
-                                   std::function<void(const std::wstring&)> onImported) {
+void ImportReferenceAsEditableCopy(AppContext& ctx, const std::string& name,
+                                   std::function<void(const std::string&)> onImported) {
     auto& store = ctx.Svc().playlists;
     if (!store.IsReference(name)) {
         ctx.ShowInfoBar(InfoSeverity::Error, Tr(L"Could not import playlist", L"재생목록을 가져올 수 없습니다"), Tr(L"This playlist no longer references a source.", L"이 재생목록은 더 이상 원본을 참조하지 않습니다."));
@@ -435,15 +432,15 @@ void ImportReferenceAsEditableCopy(AppContext& ctx, const std::wstring& name,
         auto result = c->Svc().playlists.RefreshReference(name, wvp::PlaylistLoader());
         const bool usingFallback = result.usedOfflineFallback;
         const bool canImport = (result.refreshed && result.isPlaylist && !result.isHlsStream) || usingFallback;
-        std::wstring baseName = result.title.empty() ? name : result.title;
-        std::wstring importedName;
+        std::string baseName = result.title.empty() ? name : result.title;
+        std::string importedName;
         if (canImport) importedName = c->Svc().playlists.ImportEditableCopy(baseName, result.items, true, false);
         c->PostToUi([c, result = std::move(result), usingFallback, canImport, importedName = std::move(importedName),
                      onImported = std::move(onImported)]() mutable {
             if (!result.error.empty()) {
                 c->ShowInfoBar(usingFallback ? InfoSeverity::Warning : InfoSeverity::Error,
                                usingFallback ? Tr(L"Playlist refresh failed", L"재생목록을 새로 고치지 못했습니다") : Tr(L"Could not read playlist", L"재생목록을 읽을 수 없습니다"),
-                               usingFallback ? std::wstring(Tr(L"Using the last fetched items as an offline fallback. ", L"마지막으로 가져온 항목을 오프라인 대체본으로 사용합니다. ")) + result.error : result.error);
+                               usingFallback ? std::wstring(Tr(L"Using the last fetched items as an offline fallback. ", L"마지막으로 가져온 항목을 오프라인 대체본으로 사용합니다. ")) + wvp::ToWide(result.error) : wvp::ToWide(result.error));
             }
             if (!canImport) return;
             if (importedName.empty()) {
@@ -451,7 +448,7 @@ void ImportReferenceAsEditableCopy(AppContext& ctx, const std::wstring& name,
                 return;
             }
             if (onImported) onImported(importedName);
-            c->ShowToast(TrW(L"Imported " + importedName, importedName + L" 가져옴"));
+            c->ShowToast(TrW(L"Imported " + wvp::ToWide(importedName), wvp::ToWide(importedName) + L" 가져옴"));
         });
     }).detach();
 }
@@ -460,7 +457,7 @@ void OpenPaths(AppContext& ctx, const std::vector<std::wstring>& pathsOrUrls, st
     Dispatch(ctx, pathsOrUrls, DispatchTarget::VideoView, {}, false, std::move(onDone));
 }
 
-void DropPathsToPlaylist(AppContext& ctx, const std::vector<std::wstring>& pathsOrUrls, const std::wstring& playlistName,
+void DropPathsToPlaylist(AppContext& ctx, const std::vector<std::wstring>& pathsOrUrls, const std::string& playlistName,
                          std::function<void()> onDone) {
     if (ctx.IsPlaylistReadOnly(playlistName)) {
         ctx.ShowInfoBar(InfoSeverity::Warning, Tr(L"Playlist is read-only", L"재생목록이 읽기 전용입니다"), Tr(L"Import it to make an editable copy.", L"가져오기로 편집 가능한 사본을 만드세요."));
@@ -496,18 +493,18 @@ void OpenFolder(AppContext& ctx) {
     OpenPaths(ctx, files);
 }
 
-void AddFilesToPlaylist(AppContext& ctx, const std::wstring& playlistName, std::function<void()> onDone) {
+void AddFilesToPlaylist(AppContext& ctx, const std::string& playlistName, std::function<void()> onDone) {
     auto files = PickMediaFiles(ctx);
     if (!files.empty()) DropPathsToPlaylist(ctx, files, playlistName, std::move(onDone));
 }
 
-void AddFolderToPlaylist(AppContext& ctx, const std::wstring& playlistName, std::function<void()> onDone) {
+void AddFolderToPlaylist(AppContext& ctx, const std::string& playlistName, std::function<void()> onDone) {
     bool cancelled = false;
     auto files = PickFolderMedia(ctx, cancelled);
     if (!files.empty()) DropPathsToPlaylist(ctx, files, playlistName, std::move(onDone));
 }
 
-void AddUrlToPlaylist(AppContext& ctx, const std::wstring& playlistName, std::function<void()> onDone) {
+void AddUrlToPlaylist(AppContext& ctx, const std::string& playlistName, std::function<void()> onDone) {
     TextPromptOptions o;
     o.title = Tr(L"Add URL", L"주소 추가");
     o.label = Tr(L"Enter the address of a video or stream", L"동영상 또는 스트림 주소를 입력하세요");

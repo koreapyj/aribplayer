@@ -53,10 +53,10 @@ public:
     virtual ShellMode Mode() const = 0;
 
     /// Name of the current playlist; empty identifies the persistent unnamed playlist.
-    virtual std::wstring CurrentPlaylistName() const { return {}; }
-    virtual bool IsCurrentPlaylist(const std::wstring& name) const { return name == CurrentPlaylistName(); }
+    virtual std::string CurrentPlaylistName() const { return {}; }
+    virtual bool IsCurrentPlaylist(const std::string& name) const { return name == CurrentPlaylistName(); }
     /// Loads an arbitrary playlist. The unnamed list is supplied by App; the default supports named playlists in tests.
-    virtual std::vector<wvp::MediaItem> PlaylistItems(const std::wstring& name) {
+    virtual std::vector<wvp::MediaItem> PlaylistItems(const std::string& name) {
         if (name.empty()) {
             if (IsCurrentPlaylist(name)) if (auto* c = Controller()) return c->Items();
             return {};
@@ -64,27 +64,27 @@ public:
         return Svc().playlists.Load(name);
     }
     /// Persistent "played" flag per URL (one history read; may wait for pending history writes).
-    virtual std::vector<bool> PlayedFlags(const std::vector<std::wstring>& urls) { return Svc().playlists.GetPlayedFlags(urls); }
+    virtual std::vector<bool> PlayedFlags(const std::vector<std::string>& urls) { return Svc().playlists.GetPlayedFlags(urls); }
     /// Saves an arbitrary playlist; App persists the unnamed file and syncs controller edits for the current list.
-    virtual bool SavePlaylistItems(const std::wstring& name, const std::vector<wvp::MediaItem>& items) {
+    virtual bool SavePlaylistItems(const std::string& name, const std::vector<wvp::MediaItem>& items) {
         return !name.empty() && Svc().playlists.Save(name, items);
     }
     /// Activates a playlist and starts at the requested item. The app persists its identity.
-    virtual void PlayPlaylist(const std::wstring&, const std::vector<wvp::MediaItem>& items, int) {
+    virtual void PlayPlaylist(const std::string&, const std::vector<wvp::MediaItem>& items, int) {
         AppendToCurrentPlaylist(items);
     }
     /// Activates a playlist item at a remembered offset. Default test contexts may ignore the offset.
-    virtual void PlayPlaylistAtPosition(const std::wstring& name, const std::vector<wvp::MediaItem>& items, int start, double position) {
+    virtual void PlayPlaylistAtPosition(const std::string& name, const std::vector<wvp::MediaItem>& items, int start, double position) {
         (void)position;
         PlayPlaylist(name, items, start);
     }
     /// Replaces the unnamed slot and starts its first item at a remembered offset.
     virtual void ReplaceUnnamedPlaylistAtPosition(std::vector<wvp::MediaItem> items, double position) = 0;
-    virtual bool IsPlaylistReadOnly(const std::wstring& name) { return Svc().playlists.IsReadOnly(name); }
-    virtual void SetResumeDecision(const std::wstring&) {}
+    virtual bool IsPlaylistReadOnly(const std::string& name) { return Svc().playlists.IsReadOnly(name); }
+    virtual void SetResumeDecision(const std::string&) {}
     /// Appends without interrupting current playback. App owns current-list persistence and updates the controller if active.
     /// Playlist views (drops on details / overview, Add files): append only; never starts or changes playback.
-    virtual void AppendPlaylistItems(const std::wstring& name, const std::vector<wvp::MediaItem>& items) {
+    virtual void AppendPlaylistItems(const std::string& name, const std::vector<wvp::MediaItem>& items) {
         if (items.empty()) return;
         if (IsCurrentPlaylist(name)) { AppendToCurrentPlaylist(items); return; }
         auto all = PlaylistItems(name);
@@ -93,8 +93,8 @@ public:
     }
     /// Appends to the current playlist; starts its first item only when nothing is current.
     virtual void AppendToCurrentPlaylist(std::vector<wvp::MediaItem> items) = 0;
-    virtual void PlaylistRenamed(const std::wstring&, const std::wstring&) {}
-    virtual void PlaylistDeleted(const std::wstring&) {}
+    virtual void PlaylistRenamed(const std::string&, const std::string&) {}
+    virtual void PlaylistDeleted(const std::string&) {}
     /// A playlist file was created or rewritten: the panel chips (and a viewed non-current list) refresh at once.
     virtual void PlaylistsChanged() {}
 
@@ -106,6 +106,8 @@ public:
     virtual std::vector<wvp::VideoGpuPref> VideoGpus() const { return {}; }
     /// settings.videoGpu changed: select again and reopen the current item on the new adapter when it changed.
     virtual void VideoGpuSettingChanged() {}
+    /// Shows the error notice when no video GPU could be probed or no pipeline plan exists for the current settings.
+    virtual void ReportPlanProblem() {}
 
     /// mode System follows the OS app theme; accent 0 = system accent colour (0xAARRGGBB straight ARGB otherwise).
     virtual void ApplyTheme(pui::ThemeMode mode, uint32_t accent) = 0;

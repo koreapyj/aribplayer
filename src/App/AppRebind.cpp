@@ -7,7 +7,7 @@
 #include "Localize.h"
 #include "features/Logging.h"
 #include "shell/SettingsWindow.h"
-#include "wvp/Utf.h"
+#include "wvp/win32/Utf.h"
 
 namespace app {
 
@@ -124,7 +124,7 @@ bool App::RebindUi(RebindReason reason, bool forceWarp) {
 
     // Playback restore can start now; the hook returns without waiting for the open.
     videoSoftwareFallback_ = rebind_.FallbackActive() || forceWarp;
-    if (videoSoftwareFallback_) playAdapter_ = PlaybackAdapter{{}, {}, "graphics fallback after repeated device loss -> software decoding + SDL"};
+    if (videoSoftwareFallback_) playAdapter_ = PlaybackAdapter{{}, {}, "graphics fallback after repeated device loss -> software decoding on the default adapter"};
     log::Event("adapter", "UI rebound (" + std::string(RebindReasonName(reason)) + "): " + wvp::ToUtf8(gfx_.adapterName) + " luid " +
                               gfx_.adapterLuid);
     rebindTiming_.hookUs = QpcUs();

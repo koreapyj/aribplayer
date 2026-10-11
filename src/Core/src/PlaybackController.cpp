@@ -8,7 +8,7 @@
 namespace wvp {
 
 namespace {
-void SetOption(OpenOptions& o, const std::wstring& k, const std::wstring& v) {
+void SetOption(OpenOptions& o, const std::string& k, const std::string& v) {
     for (auto& e : o) if (e.first == k) { e.second = v; return; }
     o.emplace_back(k, v);
 }
@@ -47,12 +47,13 @@ int PlaybackController::Rand(int maxExclusive) {
     return maxExclusive <= 1 ? 0 : (int)(rng_() % (unsigned)maxExclusive);
 }
 
-void PlaybackController::SetBaseOption(const std::wstring& key, const std::wstring& value) { SetOption(BaseOptions, key, value); }
+void PlaybackController::SetBaseOption(const std::string& key, const std::string& value) { SetOption(BaseOptions, key, value); }
 
 void PlaybackController::ApplyFilterChange(const FilterChange& c) {
     if (onFilterChange) onFilterChange(c);
+    if (pending_ && (OpenPending() || pending_)) return;   // opened with the new plan, or still waiting for one
     if (c.reopen) {
-        // planner: decoder / presenter / hwframes / filter device changed -> the live commands cannot express it. Only an item
+        // planner: decoder / hwframes / filter device changed -> a live filter change cannot express it. Only an item
         // that is actually open is reopened (at its position, pause kept); otherwise the next open uses the new plan anyway.
         PlayerState st = player_->State();
         if (Current() && (st == PlayerState::Opening || st == PlayerState::Playing || st == PlayerState::Paused)) {
@@ -60,20 +61,8 @@ void PlaybackController::ApplyFilterChange(const FilterChange& c) {
             return;
         }
     }
-    if (c.presenterParamsChanged) {
-        // presenter-applied parameters (rotation/flip/eq): live call instead of a graph change. libffplay validates them against the
-        // presenter in effect, so with nothing open only identity is sent (it also clears stale parameters); anything else rides on
-        // the next open as the presenter_params option.
-        PlayerState st = player_->State();
-        bool open = st == PlayerState::Opening || st == PlayerState::Playing || st == PlayerState::Paused;
-        if (open || c.presenterParams.IsIdentity()) {
-            int err = player_->SetPresenterParams(c.presenterParams);
-            if (err != 0 && open && onPresenterParamsRejected) onPresenterParamsRejected(err, c.presenterParams);
-        }
-    }
     if (c.videoRebuild) player_->SetVideoFilter(c.videoFilter);
     if (c.audioRebuild) player_->SetAudioFilter(c.audioFilter);
-    for (auto& cmd : c.commands) player_->SendFilterCommand(cmd.target, cmd.command, cmd.argument);
 }
 
 std::vector<MediaItem> PlaybackController::PlayOrder() const {
@@ -262,11 +251,6 @@ void PlaybackController::AdvanceAfterEnd(int gen) {
     OpenCurrent();
 }
 
-std::wstring PlaybackController::HwaccelOptionFor(const std::wstring& d) {
-    if (d.empty() || d == L"off" || d == L"none") return L"";
-    return d;
-}
-
 bool PlaybackController::ReopenCurrent(double position, bool paused) {
     if (!Current()) return false;
     if (reopenToken_) { player_->Prepared.remove(reopenToken_); reopenToken_ = 0; }
@@ -285,6 +269,7 @@ bool PlaybackController::ReopenCurrent(double position, bool paused) {
 }
 
 bool PlaybackController::ReopenCurrentHere() {
+    if (HasPendingOpen()) return OpenPending();   // never opened yet: its own start position and pause state apply
     double p = player_->Position();
     bool paused = player_->State() == PlayerState::Paused;
     return ReopenCurrent(p == p ? p : 0.0, paused);
@@ -295,6 +280,7 @@ void PlaybackController::NotifyLeavingCurrent() {
 }
 
 void PlaybackController::OpenCurrent(double startAt, bool applyResumeRule) {
+    pending_.reset();
     const MediaItem* item = Current();
     if (!item) return;
     MediaItem copy = *item;                 // handlers may modify the queue
@@ -302,45 +288,35 @@ void PlaybackController::OpenCurrent(double startAt, bool applyResumeRule) {
     player_->Stop();                        // reuses the single native instance
     if (beforeOpen) beforeOpen(copy.url);
     if (applyResumeRule && resolveResumePosition) startAt = resolveResumePosition(copy, startAt);
-    OpenOptions opts = BaseOptions;
-    OpenOptions plan;
-    if (filters_.planOptions) plan = filters_.planOptions();
-    const bool planMode = !plan.empty() || (filters_.planActive && filters_.planActive());
-    if (planMode) {
-        // The plan encodes the decoder preference: hwDecoder_ is not added (a software plan emits no hwaccel).
-        bool explicitHw = false;
-        for (auto& e : opts) if (e.first == L"hwaccel") explicitHw = true;
-        for (auto& e : plan) {
-            if (e.first == L"hwaccel" && explicitHw) continue;
-            SetOption(opts, e.first, e.second);
-        }
-    } else {
-        bool explicitHw = false;
-        for (auto& e : opts) if (e.first == L"hwaccel") explicitHw = true;
-        if (!explicitHw) {
-            std::wstring hw = HwaccelOptionFor(hwDecoder_);
-            if (!hw.empty()) opts.emplace_back(L"hwaccel", hw);
-        }
+    pending_ = PendingOpen{generation_, startAt, openPaused_};
+    openPaused_ = false;
+    OpenPending();
+}
+
+bool PlaybackController::OpenPending() {
+    if (!pending_) return false;
+    const MediaItem* item = Current();
+    if (pending_->generation != generation_ || !item) {
+        pending_.reset();
+        return false;
     }
-    if (startAt > 0) SetOption(opts, L"ss", std::to_wstring(startAt));
+    std::optional<OpenOptions> plan = filters_.planOptions ? filters_.planOptions() : std::nullopt;
+    if (!plan) return false;
+    const PendingOpen p = *pending_;
+    pending_.reset();
+    MediaItem copy = *item;
+    OpenOptions opts = BaseOptions;
+    for (auto& e : *plan) SetOption(opts, e.first, e.second);
+    std::string af = filters_.audioFilter ? filters_.audioFilter() : "";
+    if (!af.empty()) SetOption(opts, "af", af);
+    if (p.startAt > 0) SetOption(opts, "ss", std::to_string(p.startAt));
     // libffplay ends the open paused with the landing frame presented and the audio clock not yet started (a pause or a
     // frame step after it would let audio run while the first frame decodes, and play would then start out of sync)
-    if (openPaused_) SetOption(opts, L"start_paused", L"1");
-    openPaused_ = false;
-    if (planMode) {
-        std::wstring af = filters_.audioFilter ? filters_.audioFilter() : L"";
-        if (!af.empty()) SetOption(opts, L"af", af);
-        // libffplay keeps the instance's vf across opens: a plan without vf (e.g. eq absorbed by the presenter) must
-        // clear a vf set earlier (legacy mode or a previous plan), or the stale graph runs on frames it cannot take.
-        bool planVf = false;
-        for (auto& e : opts) if (e.first == L"vf") planVf = true;
-        if (!planVf) player_->SetVideoFilter(L"");
-    } else if (filters_.videoFilter || filters_.audioFilter) {
-        std::wstring vf = filters_.videoFilter ? filters_.videoFilter() : L"";
-        std::wstring af = filters_.audioFilter ? filters_.audioFilter() : L"";
-        if (!vf.empty()) SetOption(opts, L"vf", vf);
-        if (!af.empty()) SetOption(opts, L"af", af);
-    }
+    if (p.paused) SetOption(opts, "start_paused", "1");
+    // libffplay keeps the instance's vf across opens: a plan without vf must clear the vf of a previous plan
+    bool planVf = false;
+    for (auto& e : opts) if (e.first == "vf") planVf = true;
+    if (!planVf) player_->SetVideoFilter("");
     player_->SetVolume(volume_);
     player_->SetMuted(muted_);
     if (onOpening) onOpening(copy.url, opts);
@@ -348,6 +324,7 @@ void PlaybackController::OpenCurrent(double startAt, bool applyResumeRule) {
     // re-assert after open as well: the native side persists them, a fake or other backend may not
     player_->SetVolume(volume_);
     player_->SetMuted(muted_);
+    return true;
 }
 
 void PlaybackController::RebuildOrder(bool keepCurrent) {

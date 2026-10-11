@@ -38,12 +38,12 @@ const std::vector<std::wstring>& DeinterlaceLabels();
 /// Combo labels in DeinterlacePriority order: "Efficiency", "Quality".
 const std::vector<std::wstring>& DeinterlacePriorityLabels();
 
-/// Video tab "Reset": color, rotation, flips, deinterlace, IVTC back to defaults (audio/custom kept).
+/// Video tab "Reset": deinterlace and IVTC back to defaults (audio/custom kept).
 wvp::FilterSettings ResetVideoPart(wvp::FilterSettings s);
 /// Audio tab "Reset": normalize, EQ and speed back to defaults.
 wvp::FilterSettings ResetAudioPart(wvp::FilterSettings s);
 wvp::FilterSettings WithEqPreset(wvp::FilterSettings s, int presetIndex);
-bool HasEffect(const wvp::FilterChange& c);        // rebuild flag or commands (the only case worth sending to the player)
+bool HasEffect(const wvp::FilterChange& c);        // a rebuild or reopen flag (the only case worth sending to the player)
 
 // libffplay has no aspect/zoom option (docs/libffplay-api.md): zoom to fill is a centred crop filter computed from the
 // video area aspect and appended to the custom video filter. Limitation: the crop is recomputed on a ~400 ms poll
@@ -53,13 +53,13 @@ struct ZoomState {
     double aspect = 16.0 / 9.0;   // video area (window) aspect the crop is computed for
 };
 ZoomState& Zoom();
-inline constexpr const wchar_t* kZoomInstance = L"crop@wvpzoom";
+inline constexpr const char* kZoomInstance = "crop@wvpzoom";
 /// "crop@wvpzoom=w=min(iw\,ih*A/sar):h=min(ih\,iw*sar/A)": centred crop of the filtered frame to display aspect A.
-std::wstring ZoomCropFilter(double windowAspect);
+std::string ZoomCropFilter(double windowAspect);
 /// Removes the zoom crop piece from a filter string (the panel shows/edits the user's custom string without it).
-std::wstring StripZoom(const std::wstring& vf);
+std::string StripZoom(const std::string& vf);
 /// user custom vf + the zoom crop (when on); user string first.
-std::wstring ComposeCustomVideo(const std::wstring& user, bool zoomOn, double aspect);
+std::string ComposeCustomVideo(const std::string& user, bool zoomOn, double aspect);
 /// Video area aspect: Now playing leaves a stripDip title strip, full screen/mini use the whole client.
 double VideoAreaAspect(float clientWDip, float clientHDip, float stripDip, bool fullscreenOrMini);
 /// The settings the user edits: manager settings with the zoom piece stripped from customVideoFilter.
@@ -81,7 +81,7 @@ int CyclesNeeded(const std::vector<wvp::StreamInfo>& streams, int targetIndex, b
 std::wstring TrackName(const wvp::StreamInfo& s, int ordinalOneBased);
 /// "Audio: English (2/3)", "Subtitles: Off", "Subtitles: Forced (1/2)"; "" when there is nothing to report.
 std::wstring TrackToast(wvp::StreamType type, const std::vector<wvp::StreamInfo>& streams);
-std::wstring LanguageName(const std::wstring& code);
+std::wstring LanguageName(const std::string& code);
 /// ARIB audio item labels: the track names of today's list for the two roles (a role without a stream is "Track 1" /
 /// "Track 2"); when both come out equal they are told apart as "<name> (Audio 1)" / "<name> (Audio 2)".
 void AribAudioNames(const wvp::StreamInfo& audio1, bool has1, const wvp::StreamInfo& audio2, bool has2,

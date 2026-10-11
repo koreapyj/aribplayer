@@ -1,9 +1,11 @@
 #include "features/FxModel.h"
 #include "Localize.h"
+#include "wvp/win32/Utf.h"
 
 #include <algorithm>
 #include <cmath>
 #include <cwchar>
+#include <cctype>
 #include <cwctype>
 
 namespace app::fx {
@@ -41,7 +43,7 @@ int SpeedIndex(double speed) {
     return -1;
 }
 
-std::wstring SpeedLabel(double speed) { return wvp::FilterManager::Num(speed) + L"x"; }
+std::wstring SpeedLabel(double speed) { return wvp::ToWide(wvp::FilterManager::Num(speed)) + L"x"; }
 
 std::wstring BandLabel(int hz) {
     if (hz >= 1000) return std::to_wstring(hz / 1000) + L" kHz";
@@ -80,8 +82,6 @@ FilterSettings ResetVideoPart(FilterSettings s) {
     FilterSettings d;
     s.deinterlace = d.deinterlace; s.deinterlaceRate = d.deinterlaceRate; s.deinterlaceOnlyInterlaced = d.deinterlaceOnlyInterlaced;
     s.deinterlacePriority = d.deinterlacePriority;
-    s.brightness = d.brightness; s.contrast = d.contrast; s.saturation = d.saturation; s.gamma = d.gamma;
-    s.rotation = d.rotation; s.flipHorizontal = d.flipHorizontal; s.flipVertical = d.flipVertical;
     return s;
 }
 
@@ -98,38 +98,38 @@ FilterSettings WithEqPreset(FilterSettings s, int idx) {
 }
 
 bool HasEffect(const FilterChange& c) {
-    return c.videoRebuild || c.audioRebuild || c.reopen || c.presenterParamsChanged || !c.commands.empty();
+    return c.videoRebuild || c.audioRebuild || c.reopen;
 }
 
 ZoomState& Zoom() { static ZoomState z; return z; }
 
-std::wstring ZoomCropFilter(double a) {
+std::string ZoomCropFilter(double a) {
     if (!(a > 0.05) || !std::isfinite(a)) a = 16.0 / 9.0;
-    std::wstring A = wvp::FilterManager::Num(std::round(a * 10000) / 10000);
-    return std::wstring(kZoomInstance) + L"=w=min(iw\\,ih*" + A + L"/sar):h=min(ih\\,iw*sar/" + A + L")";
+    std::string A = wvp::FilterManager::Num(std::round(a * 10000) / 10000);
+    return std::string(kZoomInstance) + "=w=min(iw\\,ih*" + A + "/sar):h=min(ih\\,iw*sar/" + A + ")";
 }
 
-std::wstring StripZoom(const std::wstring& vf) {
-    std::wstring key = std::wstring(kZoomInstance) + L"=";
+std::string StripZoom(const std::string& vf) {
+    std::string key = std::string(kZoomInstance) + "=";
     size_t p = vf.find(key);
-    if (p == std::wstring::npos) return vf;
+    if (p == std::string::npos) return vf;
     size_t e = p + key.size();
     while (e < vf.size()) {
-        if (vf[e] == L'\\') { e += 2; continue; }
-        if (vf[e] == L',') break;
+        if (vf[e] == '\\') { e += 2; continue; }
+        if (vf[e] == ',') break;
         e++;
     }
     e = std::min(e, vf.size());
     size_t b = p;
     if (e < vf.size()) e++;
-    else if (b > 0 && vf[b - 1] == L',') b--;
+    else if (b > 0 && vf[b - 1] == ',') b--;
     return vf.substr(0, b) + vf.substr(e);
 }
 
-std::wstring ComposeCustomVideo(const std::wstring& user, bool zoomOn, double aspect) {
-    std::wstring u = StripZoom(user);
+std::string ComposeCustomVideo(const std::string& user, bool zoomOn, double aspect) {
+    std::string u = StripZoom(user);
     if (!zoomOn) return u;
-    return u.empty() ? ZoomCropFilter(aspect) : u + L"," + ZoomCropFilter(aspect);
+    return u.empty() ? ZoomCropFilter(aspect) : u + "," + ZoomCropFilter(aspect);
 }
 
 double VideoAreaAspect(float w, float h, float strip, bool full) {
@@ -149,7 +149,7 @@ FilterChange ApplyUser(wvp::FilterManager& fm, FilterSettings user, const ZoomSt
 }
 
 bool IsCycleableSubtitle(const wvp::StreamInfo& stream) {
-    return stream.Type == wvp::StreamType::Subtitle && stream.AribType != L"superimpose";
+    return stream.Type == wvp::StreamType::Subtitle && stream.AribType != "superimpose";
 }
 
 std::vector<wvp::StreamInfo> CycleableSubtitles(const std::vector<wvp::StreamInfo>& streams) {
@@ -171,7 +171,7 @@ int SelectedCycleableSubtitleIndex(const std::vector<wvp::StreamInfo>& streams) 
 
 bool ToggleAribCaptionVisibility(const wvp::MediaInfo& media, bool& visible) {
     const bool hasCaption = std::any_of(media.Streams.begin(), media.Streams.end(), [](const wvp::StreamInfo& stream) {
-        return stream.Type == wvp::StreamType::Subtitle && stream.AribType == L"caption";
+        return stream.Type == wvp::StreamType::Subtitle && stream.AribType == "caption";
     });
     if (!hasCaption) return false;
     visible = !visible;
@@ -188,25 +188,25 @@ int CyclesNeeded(const std::vector<wvp::StreamInfo>& streams, int target, bool s
     return ((tgt - cur) % states + states) % states;
 }
 
-std::wstring LanguageName(const std::wstring& c) {
-    struct L { const wchar_t* code; const wchar_t* name; };
+std::wstring LanguageName(const std::string& c) {
+    struct L { const char* code; const wchar_t* name; };
     static const L t[] = {
-        {L"eng", Tr(L"English", L"영어")}, {L"jpn", Tr(L"Japanese", L"일본어")}, {L"fre", Tr(L"French", L"프랑스어")}, {L"fra", Tr(L"French", L"프랑스어")}, {L"ger", Tr(L"German", L"독일어")},
-        {L"deu", Tr(L"German", L"독일어")}, {L"spa", Tr(L"Spanish", L"스페인어")}, {L"ita", Tr(L"Italian", L"이탈리아어")}, {L"kor", Tr(L"Korean", L"한국어")}, {L"chi", Tr(L"Chinese", L"중국어")},
-        {L"zho", Tr(L"Chinese", L"중국어")}, {L"por", Tr(L"Portuguese", L"포르투갈어")}, {L"rus", Tr(L"Russian", L"러시아어")}, {L"dut", Tr(L"Dutch", L"네덜란드어")}, {L"nld", Tr(L"Dutch", L"네덜란드어")},
-        {L"swe", Tr(L"Swedish", L"스웨덴어")}, {L"pol", Tr(L"Polish", L"폴란드어")}, {L"tur", Tr(L"Turkish", L"터키어")}, {L"ara", Tr(L"Arabic", L"아랍어")}, {L"hin", Tr(L"Hindi", L"힌디어")},
+        {"eng", Tr(L"English", L"영어")}, {"jpn", Tr(L"Japanese", L"일본어")}, {"fre", Tr(L"French", L"프랑스어")}, {"fra", Tr(L"French", L"프랑스어")}, {"ger", Tr(L"German", L"독일어")},
+        {"deu", Tr(L"German", L"독일어")}, {"spa", Tr(L"Spanish", L"스페인어")}, {"ita", Tr(L"Italian", L"이탈리아어")}, {"kor", Tr(L"Korean", L"한국어")}, {"chi", Tr(L"Chinese", L"중국어")},
+        {"zho", Tr(L"Chinese", L"중국어")}, {"por", Tr(L"Portuguese", L"포르투갈어")}, {"rus", Tr(L"Russian", L"러시아어")}, {"dut", Tr(L"Dutch", L"네덜란드어")}, {"nld", Tr(L"Dutch", L"네덜란드어")},
+        {"swe", Tr(L"Swedish", L"스웨덴어")}, {"pol", Tr(L"Polish", L"폴란드어")}, {"tur", Tr(L"Turkish", L"터키어")}, {"ara", Tr(L"Arabic", L"아랍어")}, {"hin", Tr(L"Hindi", L"힌디어")},
     };
-    std::wstring lc;
-    for (wchar_t ch : c) lc.push_back((wchar_t)std::towlower(ch));
-    if (lc.empty() || lc == L"und") return L"";
+    std::string lc;
+    for (char ch : c) lc.push_back((char)std::tolower((unsigned char)ch));
+    if (lc.empty() || lc == "und") return L"";
     for (auto& e : t) if (lc == e.code) return e.name;
     std::wstring up;
-    for (wchar_t ch : lc) up.push_back((wchar_t)std::towupper(ch));
+    for (char ch : lc) up.push_back((wchar_t)std::toupper((unsigned char)ch));
     return up;
 }
 
 std::wstring TrackName(const wvp::StreamInfo& s, int ordinal) {
-    if (!s.Title.empty()) return s.Title;
+    if (!s.Title.empty()) return wvp::ToWide(s.Title);
     std::wstring l = LanguageName(s.Language);
     if (!l.empty()) return l;
     return Tr(L"Track ", L"트랙 ") + std::to_wstring(ordinal);

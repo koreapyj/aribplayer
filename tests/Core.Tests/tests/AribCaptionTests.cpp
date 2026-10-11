@@ -1,4 +1,4 @@
-// ARIB media/settings contracts and a hidden-window libffplay fixture integration test.
+// ARIB media/settings contracts and a libffplay fixture integration test on the recording presenter.
 #include <chrono>
 #include <cstdint>
 #include <cstring>
@@ -9,31 +9,14 @@
 #include "wvp/AppSettings.h"
 #include "wvp/FfPlayer.h"
 #include "wvp/JsonLite.h"
-#include "wvp/Utf.h"
+#include "wvp/win32/Utf.h"
+#include "TestPlayer.h"
 #include "wvptest.h"
 
 using namespace wvp;
 namespace fs = std::filesystem;
 
 namespace {
-
-constexpr UINT kAribNotifyMsg = WM_APP + 69;
-
-LRESULT CALLBACK AribHostProc(HWND h, UINT m, WPARAM w, LPARAM l) {
-    if (m == kAribNotifyMsg) { FfPlayer::HandleNotify(w, l); return 0; }
-    return DefWindowProcW(h, m, w, l);
-}
-
-void EnsureAribHostClass() {
-    static ATOM a = [] {
-        WNDCLASSW wc{};
-        wc.lpfnWndProc = AribHostProc;
-        wc.hInstance = GetModuleHandleW(nullptr);
-        wc.lpszClassName = L"WvpAribTestHost";
-        return RegisterClassW(&wc);
-    }();
-    (void)a;
-}
 
 fs::path RepoRoot() {
     static fs::path root = [] {
@@ -54,25 +37,8 @@ fs::path RepoRoot() {
 fs::path AribFixture() { return RepoRoot() / L"testmedia" / L"arib" / L"tbs-captions.ts"; }
 fs::path AribFont() { return RepoRoot() / L"assets" / L"fonts" / L"WLCMARU2004ARIBU.TTF"; }
 
-void PumpAribMessages() {
-    MSG msg;
-    while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
-        TranslateMessage(&msg);
-        DispatchMessageW(&msg);
-    }
-}
-
 template <class F>
-bool WaitArib(F cond, double seconds = 10) {
-    auto end = std::chrono::steady_clock::now() + std::chrono::milliseconds((long long)(seconds * 1000));
-    while (std::chrono::steady_clock::now() < end) {
-        PumpAribMessages();
-        if (cond()) return true;
-        Sleep(15);
-    }
-    PumpAribMessages();
-    return cond();
-}
+bool WaitArib(F cond, double seconds = 10) { return wvptest::WaitFor(cond, seconds); }
 
 std::optional<double> FindNumber(const json::Value& v, std::string_view key) {
     if (v.kind == json::Value::Kind::Object) {
@@ -109,28 +75,14 @@ size_t DifferentPixels(const BgraFrame& a, const BgraFrame& b) {
     return changed;
 }
 
-struct AribHost {
-    HWND parent = nullptr, child = nullptr;
-    AribHost() {
-        EnsureAribHostClass();
-        HINSTANCE inst = GetModuleHandleW(nullptr);
-        parent = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, L"WvpAribTestHost", L"host", WS_POPUP,
-                                 -32000, -32000, 640, 360, nullptr, nullptr, inst, nullptr);
-        child = CreateWindowExW(0, L"STATIC", L"video", WS_CHILD | WS_VISIBLE, 0, 0, 640, 360,
-                                parent, nullptr, inst, nullptr);
-    }
-    ~AribHost() { if (parent) DestroyWindow(parent); }
-};
-
 struct AribSession {
-    AribHost host;
     std::unique_ptr<FfPlayer> player;
     int prepared = 0, errors = 0;
 
     AribSession() {
         int err = 0;
-        player = FfPlayer::CreateSync(host.child, host.parent, kAribNotifyMsg, &err);
-        REQUIRE_MSG(player != nullptr, "CreateSync failed: " + std::to_string(err));
+        player = wvptest::CreateTestPlayer(nullptr, &err);
+        REQUIRE_MSG(player != nullptr, "FfPlayer::Create failed: " + std::to_string(err));
         player->Prepared.add([this](const MediaPreparedInfo&) { prepared++; });
         player->Error.add([this](const PlayerErrorInfo&) { errors++; });
     }
@@ -139,11 +91,10 @@ struct AribSession {
     void OpenFixture() {
         int before = prepared;
         OpenOptions options = {
-            { L"presenter", L"sdl" },
-            { L"superimpose", L"0" },
-            { L"arib_font", AribFont().wstring() },
+            { "superimpose", "0" },
+            { "arib_font", AribFontOption(wvp::ToUtf8(AribFont().wstring())) },
         };
-        REQUIRE_MSG(player->Open(AribFixture().wstring(), options) == 0, "ARIB fixture open rejected");
+        REQUIRE_MSG(player->Open(wvp::ToUtf8(AribFixture().wstring()), options) == 0, "ARIB fixture open rejected");
         REQUIRE_MSG(WaitArib([&] { return prepared > before || errors > 0; }, 20), "fixture produced no PREPARED event");
         REQUIRE_MSG(errors == 0, "fixture open raised an error");
     }
@@ -167,9 +118,9 @@ TEST_CASE(Arib_media_info_preserves_caption_and_superimpose_classification) {
     REQUIRE(mi.has_value());
     const auto subs = mi->Of(StreamType::Subtitle);
     REQUIRE(subs.size() == 3);
-    CHECK_EQ(subs[0].AribType, std::wstring(L"caption"));
+    CHECK_EQ(subs[0].AribType, std::string("caption"));
     CHECK_EQ(subs[0].ComponentTag, 56);
-    CHECK_EQ(subs[1].AribType, std::wstring(L"superimpose"));
+    CHECK_EQ(subs[1].AribType, std::string("superimpose"));
     CHECK_EQ(subs[1].ComponentTag, 136);
     CHECK(subs[2].AribType.empty());
     CHECK_EQ(subs[2].ComponentTag, -1);
@@ -190,7 +141,7 @@ TEST_CASE(Arib_settings_default_on_migrate_and_round_trip) {
     AppSettings saved;
     saved.showCaptions = false;
     saved.showSuperimpose = false;
-    saved.aribFont = L"D:\\Fonts\\WLCMARU2004ARIBU.TTF";
+    saved.aribFont = "D:\\Fonts\\WLCMARU2004ARIBU.TTF";
     AppSettings restored;
     REQUIRE(SettingsStore::FromJson(SettingsStore::ToJson(saved), restored));
     CHECK_EQ(restored.showCaptions, false);
@@ -208,10 +159,10 @@ TEST_CASE_INTEGRATION(Arib_fixture_caption_classification_visibility_and_snapsho
     REQUIRE(mi.has_value());
     const StreamInfo* caption = nullptr;
     for (const auto& stream : mi->Streams) {
-        if (stream.Type == StreamType::Subtitle && stream.AribType == L"caption") { caption = &stream; break; }
+        if (stream.Type == StreamType::Subtitle && stream.AribType == "caption") { caption = &stream; break; }
     }
     REQUIRE_MSG(caption != nullptr, "media info did not classify an ARIB caption stream");
-    CHECK_EQ(caption->Codec, std::wstring(L"arib_caption"));
+    CHECK_EQ(caption->Codec, std::string("arib_caption"));
 
     bool decodedCue = WaitArib([&] {
         auto text = s.player->GetDebugInfoJson();

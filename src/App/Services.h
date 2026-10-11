@@ -10,6 +10,7 @@
 #include "wvp/AppSettings.h"
 #include "wvp/FilterManager.h"
 #include "wvp/PlaylistStore.h"
+#include "wvp/win32/Utf.h"
 
 namespace app {
 
@@ -17,8 +18,8 @@ struct Services {
     Services() = default;
     /// dataDir empty = %LOCALAPPDATA%\aribplayer (default paths).
     explicit Services(const std::wstring& dataDir)
-        : settingsStore(dataDir.empty() ? std::wstring{} : dataDir + L"\\settings.json"),
-          playlists(dataDir.empty() ? std::wstring{} : dataDir + L"\\Playlists") {}
+        : settingsStore(dataDir.empty() ? std::string{} : wvp::ToUtf8(dataDir + L"\\settings.json")),
+          playlists(dataDir.empty() ? std::string{} : wvp::ToUtf8(dataDir + L"\\Playlists")) {}
 
     wvp::SettingsStore settingsStore;
     wvp::AppSettings settings;

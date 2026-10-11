@@ -17,14 +17,15 @@
 #                series), `quilt push -a`, and print the authoring steps
 #                --no-git: never run git (cached builder-ffmpeg / jellyfin-ffmpeg.pristine checkouts are
 #                copied without .git and the build patches are applied with patch -p1 -F0)
-#   quilt ARGS...  run quilt inside the tree with builder's .quiltrc (e.g. `quilt new 1015-x.patch`)
+#   quilt ARGS...  run quilt inside the tree with builder's .quiltrc (e.g. `quilt new 1011-x.patch`)
 #   update       copy our quilt-refreshed patches (series entries beyond jellyfin's series and
 #                builder's source-patches) back to ffmpeg/source-patches/
 #   refresh      pop all, push up to builder's last source patch, then `quilt refresh` each of
 #                OUR patches in turn; then `update`
 #   build        incremental: sync files touched by our patches into the persistent dev
-#                container (image ffplay-dev:win64), `make && make install`, copy
-#                libffplay.dll/ffplay.exe/... into ffmpeg/dist/win64
+#                container (image ffplay-dev:win64; files our patches delete are removed there),
+#                `make && make install`, package libffplay.dll/... like patches/1001 into
+#                ffmpeg/dist/win64
 #   dev-shell    open a shell in the persistent dev container
 #   dev-reset    remove the persistent dev container (next `build` starts from the image)
 #   clean        remove the quilt tree
@@ -104,7 +105,7 @@ cmd_prepare() {
     cat <<EOF
 
 Tree ready: ${TREE}
-  author.sh quilt new 1015-name.patch ; author.sh quilt add <file> ; edit <file> in the tree ;
+  author.sh quilt new 1011-name.patch ; author.sh quilt add <file> ; edit <file> in the tree ;
   author.sh quilt refresh                 (existing patches: author.sh quilt push/pop <name>)
   author.sh build                         (incremental build -> ffmpeg/dist/win64)
   author.sh update                        (copy patches back to ffmpeg/source-patches/)
@@ -169,21 +170,30 @@ cmd_build() {
         done < <(qrun files "$p" 2>/dev/null || warn "patch ${p} is not applied in the tree (quilt push it)")
     done
     [ "${#files[@]}" -gt 0 ] || die "no files touched by our patches (is any pushed? author.sh quilt series -v)"
-    log "Syncing ${#files[@]} file(s) into ${WORK_CONTAINER}:/ffmpeg"
-    ( cd "${TREE}" && printf '%s\n' "${files[@]}" | sort -u | tar -cf - -T - ) \
+    local present=() gone=()
+    while IFS= read -r f; do
+        if [ -e "${TREE}/${f}" ]; then present+=("$f"); else gone+=("$f"); fi
+    done < <(printf '%s\n' "${files[@]}" | sort -u)
+    log "Syncing ${#present[@]} file(s) into ${WORK_CONTAINER}:/ffmpeg, removing ${#gone[@]} deleted by our patches"
+    ( cd "${TREE}" && printf '%s\n' "${present[@]}" | tar -cf - -T - ) \
         | docker exec -i "${WORK_CONTAINER}" tar -C /ffmpeg -xf -
+    [ "${#gone[@]}" -eq 0 ] || docker exec -w /ffmpeg "${WORK_CONTAINER}" rm -f "${gone[@]}"
     log "Incremental make (in container)"
     docker exec "${WORK_CONTAINER}" bash -c 'cd /ffmpeg && make -j"$(nproc)" && make install'
 
-    local dist="${FFP_ROOT}/dist/win64" tmp
-    tmp="$(mktemp -d)"
-    docker exec "${WORK_CONTAINER}" bash -c \
-        'cd /opt/ffmpeg && tar -cf - bin lib/libffplay.dll.a include/libffplay/ffplay.h 2>/dev/null' | tar -C "${tmp}" -xf -
+    # the package layout of patches/1001 (docker-build-win64.sh, "ffplay package")
+    local dist="${FFP_ROOT}/dist/win64"
+    docker exec "${WORK_CONTAINER}" bash -c 'set -e
+        pkg=/tmp/ffplay-pkg; rm -rf "${pkg}"; mkdir -p "${pkg}/include" "${pkg}/lib"
+        cp /opt/ffmpeg/bin/*.exe /opt/ffmpeg/bin/*.dll /opt/ffmpeg/lib/libffplay.dll.a /opt/ffmpeg/include/libffplay/ffplay.h "${pkg}/"
+        cp -r /opt/ffmpeg/include/libavutil "${pkg}/include/"
+        rm -f "${pkg}/include/libavutil/hwcontext_cuda.h"
+        def="$(ls /opt/ffmpeg/lib/avutil-*.def)"
+        "$(ls /usr/bin/llvm-dlltool-* | sort -V | tail -n1)" -m i386:x86-64 -d "${def}" -D "$(basename "${def}" .def).dll" \
+            -l "${pkg}/lib/avutil.lib"' || die "packaging in ${WORK_CONTAINER} failed"
     mkdir -p "${dist}"
-    cp -f "${tmp}"/bin/*.exe "${tmp}"/bin/*.dll "${dist}/"
-    [ -f "${tmp}/lib/libffplay.dll.a" ] && cp -f "${tmp}/lib/libffplay.dll.a" "${dist}/" || warn "libffplay.dll.a not installed (1009 install rule missing?)"
-    [ -f "${tmp}/include/libffplay/ffplay.h" ] && cp -f "${tmp}/include/libffplay/ffplay.h" "${dist}/" || warn "ffplay.h not installed"
-    rm -rf "${tmp}"
+    rm -rf "${dist}/include" "${dist}/lib"
+    docker exec -w /tmp/ffplay-pkg "${WORK_CONTAINER}" tar -cf - . | tar -C "${dist}" -xf -
     compute_digest > "${dist}/.stamp"
     : > "${dist}/.dev-build"
     [ -f "${dist}/libffplay.dll" ] || warn "libffplay.dll was not produced"

@@ -12,7 +12,9 @@
 #include "features/OpenFlows.h"
 #include "features/ListsCommon.h"
 #include "pui/Glyphs.h"
+#include "wvp/Platform.h"
 #include "wvp/PlaylistSort.h"
+#include "wvp/win32/Utf.h"
 
 #include <Windows.h>
 #include <shellapi.h>
@@ -31,7 +33,7 @@ constexpr float kIndexW = 16, kRowPadX = 12, kArrowW = 24;
 
 pui::Color WithAlpha(pui::Color c, int a) { return pui::Color((c.v & 0x00FFFFFFu) | ((uint32_t)a << 24)); }
 
-bool IsLocalPath(const std::wstring& url) { return url.find(L"://") == std::wstring::npos; }
+bool IsLocalPath(const std::string& url) { return url.find("://") == std::string::npos; }
 }
 
 /// IListSource over the viewed playlist (live controller queue or the snapshot).
@@ -41,7 +43,7 @@ public:
     int Count() const override { return (int)p_.Items().size(); }
     std::wstring Text(int row, int) const override {
         const auto& it = p_.Items();
-        return row >= 0 && row < (int)it.size() ? it[(size_t)row].DisplayTitle() : std::wstring();
+        return row >= 0 && row < (int)it.size() ? wvp::ToWide(it[(size_t)row].DisplayTitle()) : std::wstring();
     }
     bool IsCurrent(int row) const override { return row >= 0 && row == p_.CurrentRow(); }
 private:
@@ -237,14 +239,14 @@ void PlaylistPanel::ReloadSnapshot() {
 void PlaylistPanel::RefreshPlayed() {
     played_.clear();
     const auto& items = Items();
-    std::vector<std::wstring> urls;
+    std::vector<std::string> urls;
     urls.reserve(items.size());
     for (const auto& it : items) urls.push_back(it.url);
     const std::vector<bool> flags = ctx_.PlayedFlags(urls);
     for (size_t i = 0; i < urls.size() && i < flags.size(); i++) if (flags[i]) played_.insert(urls[i]);
 }
 
-void PlaylistPanel::OnItemPlayed(const std::wstring& url) {
+void PlaylistPanel::OnItemPlayed(const std::string& url) {
     if (!played_.insert(url).second) return;
     if (IsEffectivelyVisible()) Invalidate();
 }
@@ -275,7 +277,7 @@ void PlaylistPanel::Reload() {
     ScrollToCurrent();
 }
 
-void PlaylistPanel::SetViewed(const std::wstring& name) {
+void PlaylistPanel::SetViewed(const std::string& name) {
     viewed_ = name;
     ReloadSnapshot();
     list_->SetSelection({});
@@ -304,7 +306,7 @@ void PlaylistPanel::OnCurrentPlaylistChanged() {
     Refresh();
 }
 
-void PlaylistPanel::OnPlaylistRenamed(const std::wstring& from, const std::wstring& to) {
+void PlaylistPanel::OnPlaylistRenamed(const std::string& from, const std::string& to) {
     if (viewed_ == from) viewed_ = to;
     if (!IsEffectivelyVisible()) { stale_ = true; return; }
     Reload();
@@ -316,8 +318,8 @@ void PlaylistPanel::OnPlaylistsChanged() {
     if (!Live()) { ReloadSnapshot(); Changed(); }
 }
 
-void PlaylistPanel::OnPlaylistDeleted(const std::wstring& name) {
-    if (viewed_ == name) viewed_ = ctx_.CurrentPlaylistName() == name ? std::wstring() : ctx_.CurrentPlaylistName();
+void PlaylistPanel::OnPlaylistDeleted(const std::string& name) {
+    if (viewed_ == name) viewed_ = ctx_.CurrentPlaylistName() == name ? std::string() : ctx_.CurrentPlaylistName();
     if (!IsEffectivelyVisible()) { stale_ = true; return; }
     Reload();
 }
@@ -364,7 +366,7 @@ float PlaylistPanel::Px() const { return 1.f / std::max(0.25f, ctx_.Scale()); }
 void PlaylistPanel::RebuildChips() {
     for (TextButton* c : chips_) strip_->RemoveChild(c);
     chips_.clear(); chipNames_.clear(); chipReadOnly_.clear();
-    std::vector<std::pair<std::wstring, bool>> entries{{std::wstring(), false}};
+    std::vector<std::pair<std::string, bool>> entries{{std::string(), false}};
     for (const auto& info : ctx_.Svc().playlists.List()) entries.emplace_back(info.name, info.isReference);
     // a viewed playlist that no longer exists falls back to the current one
     bool found = false;
@@ -537,8 +539,7 @@ void PlaylistPanel::RemoveMissing() {
     const auto& items = Items();
     for (int i = 0; i < (int)items.size(); i++) {
         if (!IsLocalPath(items[(size_t)i].url)) continue;
-        std::error_code ec;
-        if (!std::filesystem::exists(std::filesystem::path(items[(size_t)i].url), ec) && !ec) missing.push_back(i);
+        if (!wvp::platform::Exists(items[(size_t)i].url)) missing.push_back(i);
     }
     RemoveRows(std::move(missing));
 }
@@ -648,37 +649,37 @@ bool PlaylistPanel::DropPaths(const std::vector<std::wstring>& paths, pui::Point
 
 void PlaylistPanel::NewAlbum() {
     auto name = lists::PromptPlaylistName(ctx_, Tr(L"New playlist", L"새 재생목록"), Tr(L"Playlist name", L"재생목록 이름"),
-                                          ctx_.Svc().playlists.CreateUniqueName(Tr(L"New playlist", L"새 재생목록")), Tr(L"Create", L"만들기"));
+                                          ctx_.Svc().playlists.CreateUniqueName(wvp::ToUtf8(Tr(L"New playlist", L"새 재생목록"))), Tr(L"Create", L"만들기"));
     if (!name) return;
     if (!ctx_.Svc().playlists.Save(*name, {})) {
-        ctx_.ShowInfoBar(InfoSeverity::Error, Tr(L"Could not create the playlist", L"재생목록을 만들 수 없습니다"), *name);
+        ctx_.ShowInfoBar(InfoSeverity::Error, Tr(L"Could not create the playlist", L"재생목록을 만들 수 없습니다"), wvp::ToWide(*name));
         return;
     }
     viewed_ = *name;
     Reload();
 }
 
-void PlaylistPanel::RenameAlbum(const std::wstring& name) {
+void PlaylistPanel::RenameAlbum(const std::string& name) {
     if (name.empty()) return;
     auto to = lists::PromptPlaylistName(ctx_, Tr(L"Rename playlist", L"재생목록 이름 바꾸기"), Tr(L"Playlist name", L"재생목록 이름"), name,
                                         Tr(L"Rename", L"이름 바꾸기"), name);
     if (!to || *to == name) return;
-    std::wstring err;
+    std::string err;
     if (!ctx_.Svc().playlists.Rename(name, *to, &err)) {
         ctx_.ShowInfoBar(InfoSeverity::Error, Tr(L"Could not rename the playlist", L"이름을 바꿀 수 없습니다"),
-                         err.empty() ? Tr(L"The playlist could not be renamed.", L"재생목록 이름을 바꿀 수 없습니다.") : err);
+                         err.empty() ? std::wstring(Tr(L"The playlist could not be renamed.", L"재생목록 이름을 바꿀 수 없습니다.")) : wvp::ToWide(err));
         return;
     }
     ctx_.PlaylistRenamed(name, *to);   // App forwards to every panel: viewed follows, chips refresh
 }
 
-void PlaylistPanel::AlbumAdded(const std::wstring& name) {
+void PlaylistPanel::AlbumAdded(const std::string& name) {
     ctx_.PlaylistsChanged();   // every panel instance rebuilds its chips
     viewed_ = name;
     Reload();
 }
 
-void PlaylistPanel::RefreshAlbum(const std::wstring& name) {
+void PlaylistPanel::RefreshAlbum(const std::string& name) {
     if (!ctx_.Svc().playlists.IsReference(name)) return;
     const std::weak_ptr<bool> weak = alive_;
     RefreshPlaylistReference(ctx_, name, [this, weak] {
@@ -689,31 +690,31 @@ void PlaylistPanel::RefreshAlbum(const std::wstring& name) {
     });
 }
 
-void PlaylistPanel::EditableCopyOfAlbum(const std::wstring& name) {
+void PlaylistPanel::EditableCopyOfAlbum(const std::string& name) {
     const std::weak_ptr<bool> weak = alive_;
-    ImportReferenceAsEditableCopy(ctx_, name, [this, weak](const std::wstring& copy) { if (auto a = weak.lock(); a && *a) AlbumAdded(copy); });
+    ImportReferenceAsEditableCopy(ctx_, name, [this, weak](const std::string& copy) { if (auto a = weak.lock(); a && *a) AlbumAdded(copy); });
 }
 
 void PlaylistPanel::SaveDefaultAsAlbum() {
-    auto items = ctx_.PlaylistItems(L"");
+    auto items = ctx_.PlaylistItems("");
     if (items.empty()) return;
     auto name = lists::PromptPlaylistName(ctx_, Tr(L"Save as playlist", L"재생목록으로 저장"), Tr(L"Playlist name", L"재생목록 이름"),
-                                          ctx_.Svc().playlists.CreateUniqueName(Tr(L"New playlist", L"새 재생목록")), Tr(L"Save", L"저장"));
+                                          ctx_.Svc().playlists.CreateUniqueName(wvp::ToUtf8(Tr(L"New playlist", L"새 재생목록"))), Tr(L"Save", L"저장"));
     if (!name) return;
     int start = 0;
-    if (ctx_.IsCurrentPlaylist(L""))
+    if (ctx_.IsCurrentPlaylist(""))
         if (auto* ctl = ctx_.Controller(); ctl && ctl->CurrentIndex() >= 0) start = ctl->CurrentIndex();
     if (!lists::NameUnnamedPlaylist(ctx_, *name, items, start)) return;
-    ctx_.ShowToast(TrW(L"Saved playlist " + *name, L"재생목록 " + *name + L" 저장함"));
+    ctx_.ShowToast(TrW(L"Saved playlist " + wvp::ToWide(*name), L"재생목록 " + wvp::ToWide(*name) + L" 저장함"));
     AlbumAdded(*name);
 }
 
-void PlaylistPanel::DeleteAlbum(const std::wstring& name) {
+void PlaylistPanel::DeleteAlbum(const std::string& name) {
     if (name.empty() || !Host()) return;
     lists::ShowConfirmDialog(*Host(), Tr(L"Delete this playlist?", L"이 앨범을 지울까요?"),
-                             std::wstring(L"\"") + name + L"\"", Tr(L"Delete", L"삭제"), [ctx = &ctx_, name] {
+                             std::wstring(L"\"") + wvp::ToWide(name) + L"\"", Tr(L"Delete", L"삭제"), [ctx = &ctx_, name] {
         if (!ctx->Svc().playlists.Delete(name)) {
-            ctx->ShowInfoBar(InfoSeverity::Error, Tr(L"Could not delete the playlist", L"재생목록을 지울 수 없습니다"), name);
+            ctx->ShowInfoBar(InfoSeverity::Error, Tr(L"Could not delete the playlist", L"재생목록을 지울 수 없습니다"), wvp::ToWide(name));
             return;
         }
         ctx->PlaylistDeleted(name);   // App forwards to every panel
@@ -737,17 +738,16 @@ void PlaylistPanel::ShowMenuForButton(GlyphButton* anchor, std::vector<pui::Menu
 void PlaylistPanel::ShowPlusMenu() {
     if (!Host()) return;
     const std::weak_ptr<bool> weak = alive_;
-    auto added = [this, weak](const std::wstring& name) { if (auto a = weak.lock(); a && *a) AlbumAdded(name); };
+    auto added = [this, weak](const std::string& name) { if (auto a = weak.lock(); a && *a) AlbumAdded(name); };
     std::vector<pui::MenuItemDesc> m;
     m.push_back(pui::MenuItemDesc::Item(Tr(L"New playlist…", L"새 재생목록…"), [this] { NewAlbum(); }, plp::AccelText(PanelAction::NewAlbum), G::Add));
     m.push_back(pui::MenuItemDesc::Item(Tr(L"Import playlist file…", L"재생목록 파일 가져오기…"), [this, added] { ImportPlaylist(ctx_, added); }, {}, G::OpenFile));
     m.push_back(pui::MenuItemDesc::Item(Tr(L"Import from URL…", L"URL에서 가져오기…"), [this, added] { AddPlaylistUrlFromPrompt(ctx_, added); }, {}, G::OpenUrl));
     m.push_back(pui::MenuItemDesc::Separator());
     m.push_back(pui::MenuItemDesc::Item(Tr(L"Open playlists folder", L"재생목록 폴더 열기"), [this] {
-        const std::wstring dir = ctx_.Svc().playlists.Dir();
-        std::error_code ec;
-        std::filesystem::create_directories(dir, ec);
-        if (!OsDialogsBlocked()) ShellExecuteW(nullptr, L"open", dir.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+        const std::string dir = ctx_.Svc().playlists.Dir();
+        wvp::platform::EnsureDirectory(dir);
+        if (!OsDialogsBlocked()) ShellExecuteW(nullptr, L"open", wvp::ToWide(dir).c_str(), nullptr, nullptr, SW_SHOWNORMAL);
     }, {}, G::OpenFolder));
     ShowMenuForButton(plus_, std::move(m));
 }
@@ -763,7 +763,7 @@ void PlaylistPanel::ShowSortMenu() {
 
 /// Playlist menu (chip right click, or empty list space): playlist-level items for the viewed playlist.
 std::vector<pui::MenuItemDesc> PlaylistPanel::BuildPlaylistMenu() {
-    const std::wstring name = viewed_;
+    const std::string name = viewed_;
     const bool unnamed = name.empty(), reference = !unnamed && ctx_.Svc().playlists.IsReference(name);
     std::vector<pui::MenuItemDesc> m;
     m.push_back(pui::MenuItemDesc::Item(Tr(L"Play playlist", L"재생목록 재생"), [this, name] { PlayPlaylistEntry(ctx_, name, 0, true); }, {}, G::Play));
@@ -783,7 +783,7 @@ std::vector<pui::MenuItemDesc> PlaylistPanel::BuildPlaylistMenu() {
     m.push_back(pui::MenuItemDesc::Separator());
     if (unnamed) {
         auto save = pui::MenuItemDesc::Item(Tr(L"Save as playlist…", L"재생목록으로 저장…"), [this] { SaveDefaultAsAlbum(); }, {}, G::Save);
-        if (ctx_.PlaylistItems(L"").empty()) save.Disabled();
+        if (ctx_.PlaylistItems("").empty()) save.Disabled();
         m.push_back(std::move(save));
     } else {
         m.push_back(pui::MenuItemDesc::Item(Tr(L"Rename…", L"이름 바꾸기…"), [this, name] { RenameAlbum(name); }, plp::AccelText(PanelAction::RenameAlbum), G::Rename));
@@ -921,7 +921,7 @@ void PlaylistPanel::PaintRow(pui::IRenderer& r, const pui::Theme& t, const pui::
     title.size = 14;
     title.weight = a.current ? 600 : 400;
     title.ellipsis = true;
-    const std::wstring titleText = item.DisplayTitle();
+    const std::wstring titleText = wvp::ToWide(item.DisplayTitle());
     const RectF titleRect{x, box.t, std::max(x, right), box.b};
     const pui::Color titleColor = a.current ? t.accent : played ? t.textTertiary : t.textPrimary;
     float scroll = -1.f;

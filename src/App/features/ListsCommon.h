@@ -19,11 +19,11 @@ namespace app::lists {
 
 /// "0 items", "1 item", "N items".
 std::wstring ItemCountText(int n);
-/// Trims leading/trailing whitespace and trailing dots/spaces (what a user typed into the name prompt).
-std::wstring TrimName(const std::wstring& name);
+/// Trims leading/trailing whitespace (what a user typed into the name prompt); UTF-8.
+std::string TrimName(const std::string& name);
 /// Error text for a playlist name, empty when acceptable. `renamingFrom` = the current name when renaming (the same name
 /// compared case-insensitively is accepted: it is a no-op / case change).
-std::wstring ValidatePlaylistName(const wvp::PlaylistStore& store, const std::wstring& name, const std::wstring& renamingFrom = {});
+std::wstring ValidatePlaylistName(const wvp::PlaylistStore& store, const std::string& name, const std::string& renamingFrom = {});
 
 struct ConfirmLayout {
     pui::RectF card, title, message, confirm, cancel;
@@ -53,15 +53,15 @@ ConfirmDialog* ShowConfirmDialog(pui::UiHost& host, const std::wstring& title, c
 
 
 /// Name prompt with validation (PromptText). nullopt = cancelled.
-std::optional<std::wstring> PromptPlaylistName(AppContext& ctx, const std::wstring& title, const std::wstring& label,
-                                               const std::wstring& initial, const std::wstring& okText,
-                                               const std::wstring& renamingFrom = {});
-bool SavePlaylistFile(AppContext& ctx, const std::wstring& name, const std::vector<wvp::MediaItem>& items);
+std::optional<std::string> PromptPlaylistName(AppContext& ctx, const std::wstring& title, const std::wstring& label,
+                                              const std::string& initial, const std::wstring& okText,
+                                              const std::string& renamingFrom = {});
+bool SavePlaylistFile(AppContext& ctx, const std::string& name, const std::vector<wvp::MediaItem>& items);
 /// Names the unnamed playlist, activates the named copy, then empties the single unnamed slot.
-bool NameUnnamedPlaylist(AppContext& ctx, const std::wstring& name, const std::vector<wvp::MediaItem>& items, int startIndex);
-bool AppendToPlaylist(AppContext& ctx, const std::wstring& name, const std::vector<wvp::MediaItem>& items);
+bool NameUnnamedPlaylist(AppContext& ctx, const std::string& name, const std::vector<wvp::MediaItem>& items, int startIndex);
+bool AppendToPlaylist(AppContext& ctx, const std::string& name, const std::vector<wvp::MediaItem>& items);
 /// "Copy" sub-menu content: every editable playlist except `exclude` (or a disabled "(No playlists)"), a separator and "New playlist…".
 std::vector<pui::MenuItemDesc> AddToPlaylistItems(AppContext& ctx, std::function<std::vector<wvp::MediaItem>()> getItems,
-                                                  const std::wstring& exclude = {});
+                                                  const std::string& exclude = {});
 
 }

@@ -1,15 +1,16 @@
 #pragma once
-// Video GPU selection: which adapter libffplay's presenter device (shared with d3d11va decode, the D3D11 filters and CUDA) runs on.
-// The UI device stays on Windows' default adapter; only the video side is chosen here.
+// Video GPU selection: which adapter the presenter (VideoPlatform::CreatePresenter) and its devices (shared with hardware
+// decoding and the GPU filters) run on. The adapters and their capabilities come from VideoPlatform (Adapters, Probe); the UI
+// stays on the platform's default adapter; only the video side is chosen here.
 //
-// Automatic: every candidate adapter (hardware, D3D11 video) gets its best plan for the current request from its own probed
-// capabilities. An adapter that does not drive the window's monitor costs one more copy per frame (Windows copies the presented
-// frames across adapters). That copy is counted as a device copy: it is a GPU-to-GPU transfer like an interop copy, so it never
+// Automatic: every candidate adapter gets its best plan for the current request from its own probed capabilities. An adapter
+// that does not drive the window's monitor costs one more copy per frame (the system copies the presented frames across
+// adapters). That copy is counted as a device copy: it is a GPU-to-GPU transfer like an interop copy, so it never
 // outweighs a host copy or the software-decode penalty (a dGPU that avoids software decoding still wins), but it breaks every
 // tie in favour of the display adapter. The cheapest total wins; on a tie the display adapter, then candidate order.
 // Manual: the preferred adapter always wins (matched by LUID, else by vendor + device id since LUIDs change across reboots); when
 // it is not present Automatic is used for the session (manualMissing).
-// Pure logic: no Win32, no libffplay.
+// Pure logic: no platform API, no libffplay.
 #include <optional>
 #include <string>
 #include <vector>
@@ -35,7 +36,7 @@ struct VideoGpuPref {
 };
 
 struct VideoGpuChoice {
-    int index = -1;                 // into the candidates; -1 = no hardware adapter (software decoding + SDL)
+    int index = -1;                 // into the candidates; -1 = no hardware adapter (software decoding, system frames)
     bool manual = false;            // the manual preference decided
     bool manualMissing = false;     // a manual preference is set but its adapter is not present: Automatic for this session
     bool crossAdapter = false;      // the chosen adapter does not drive the window's monitor
@@ -46,18 +47,19 @@ struct VideoGpuChoice {
     std::string reason;             // "automatic: display adapter, 0 copies" ...
 };
 
-/// One DXGI hardware adapter as enumerated: physical GPUs are identified by PCI location, not by LUID or name (one GPU can
-/// appear as several DXGI adapters, e.g. behind an indirect display driver; two identical cards are two GPUs).
+/// One hardware adapter as VideoPlatform::Adapters enumerates it: physical GPUs are identified by PCI location, not by adapter
+/// id or name (on Windows one GPU can appear as several DXGI adapters, e.g. behind an indirect display driver; two identical
+/// cards are two GPUs).
 struct AdapterEntry {
     std::string luid, name;
     int vendorId = 0, deviceId = 0;
-    bool hasPci = false;            // D3DKMT reported a PCI bus/device/function
+    bool hasPci = false;            // the platform reported a PCI bus/device/function
     int bus = 0, device = 0, function = 0;
-    bool hasOutputs = false;        // drives at least one monitor (DXGI outputs)
+    bool hasOutputs = false;        // drives at least one monitor
 };
 
 struct PhysicalGpu {
-    AdapterEntry canonical;               // the entry with outputs, else the first in DXGI order
+    AdapterEntry canonical;               // the entry with outputs, else the first in platform order
     std::vector<std::string> aliasLuids;  // every other entry of the same GPU
 };
 

@@ -73,7 +73,7 @@ struct ShellLayout {
     pui::RectF title, bar;
     pui::RectF panel;               // playlist panel beside the video (windowed player view, wide enough); empty otherwise
     pui::RectF contentLayer;        // region of the content surface (the title strip); empty in full screen
-    RectPx video;                   // device pixels, client coords (SDL child window); Empty = hidden
+    RectPx video;                   // device pixels, client coords (video child window); Empty = hidden
     RectPx contentPx, barPx, panelPx;
     RectPx splitterPx;              // the gap between video column and docked panel (resize handle, panel column height); Empty = none
     bool panelOverlay = false;      // panel wanted but the row is too narrow to dock it: it opens over the video instead

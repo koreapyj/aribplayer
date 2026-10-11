@@ -4,6 +4,7 @@
 #include <cmath>
 
 #include "App.h"
+#include "features/Logging.h"
 #include "features/MiniLogic.h"
 #include "features/PlaybackExtras.h"
 #include "pui/ToolTipStyle.h"
@@ -85,13 +86,6 @@ private:
     bool toast_;
     std::function<void(NoticeWidget*)> dismiss_;
 };
-}
-
-void PaintAudioContentLayer(pui::IRenderer& r, const pui::Theme& t, const pui::RectF& area, const std::wstring& title) {
-    // Opaque black first: the (translucent) bar and the title area must not show the SDL video child's own audio
-    // visualisation (waveform / spectrum) underneath the placeholder.
-    if (!area.Empty()) r.FillRect(area, pui::Color(0xFF000000));
-    PaintAudioOnlyPlaceholder(r, t, area, title);
 }
 
 ShellLayout App::ComputeLayout() const {
@@ -278,6 +272,16 @@ bool App::RenderLayer(Surf& s, uint64_t& lastHash, int x, int y, int w, int h, c
     return true;
 }
 
+bool App::SetPresenterBackdrop(const std::vector<wvp::win32::BackdropRegion>& regions) {
+    wvp::Presenter* p = player_ ? player_->CurrentPresenter() : nullptr;
+    if (!p) return false;
+    std::string error;
+    // every presenter of the Windows platform is a D3D11Presenter
+    if (static_cast<wvp::win32::D3D11Presenter*>(p)->SetBackdropRegions(regions, &error)) return true;
+    log::Event("acrylic", "backdrop regions refused: " + error, log::kWarning);
+    return false;
+}
+
 void App::UpdateAcrylicState(bool forceSystemCheck) {
     const uint64_t now = Now();
     if (forceSystemCheck || now >= acrylicSystemCheckNextMs_) {
@@ -318,7 +322,7 @@ void App::UpdateAcrylicState(bool forceSystemCheck) {
     if (reason == acrylic::FallbackReason::None && acrylicApiUnsupported_)
         reason = acrylic::FallbackReason::PresenterUnavailable;
 
-    std::vector<wvp::BackdropRegion> desired;
+    std::vector<wvp::win32::BackdropRegion> desired;
     if (reason == acrylic::FallbackReason::None) {
         const auto popupSurfaces = host_.AcrylicPopupSurfaces();
         const bool hasTooltip = host_.ToolTipVisible();
@@ -364,8 +368,7 @@ void App::UpdateAcrylicState(bool forceSystemCheck) {
 
     if (reason == acrylic::FallbackReason::None && player_ && !acrylicApiUnsupported_ &&
         (acrylicNeedsApply_ || !acrylicApiReady_ || !acrylic::SameRegions(acrylicAppliedRegions_, desired))) {
-        const int rc = player_->SetBackdropRegions(desired.empty() ? nullptr : desired.data(), (int)desired.size());
-        if (rc == 0) {
+        if (SetPresenterBackdrop(desired)) {
             acrylicApiReady_ = true;
             acrylicNeedsApply_ = false;
             acrylicAppliedRegions_ = desired;
@@ -379,7 +382,7 @@ void App::UpdateAcrylicState(bool forceSystemCheck) {
         }
     } else if (reason != acrylic::FallbackReason::None) {
         if (player_ && acrylicApiReady_ && !acrylicAppliedRegions_.empty())
-            if (player_->SetBackdropRegions(nullptr, 0) != 0) acrylicApiReady_ = false;
+            if (!SetPresenterBackdrop({})) acrylicApiReady_ = false;
         acrylicAppliedRegions_.clear();
         acrylicNeedsApply_ = false;
     }
@@ -408,19 +411,10 @@ void App::RenderLayers(bool force) {
     ShellMode mode = modes_.Mode();
     int strip = S(kStripDip), W = cw_;
 
-    if (AudioOnly().audioOnly) {
-        // The placeholder covers exactly the video rect (the docked bar and the gutters keep the window backdrop).
-        const RectPx& v = layout_.video;
-        int w = std::max(1, v.w()), h = std::max(1, v.h());
-        sContent_.visual->SetOffsetX((float)v.l);
-        sContent_.visual->SetOffsetY((float)v.t);
-        std::wstring title = AudioOnly().title;
-        changed |= RenderLayer(sContent_, hContent_, v.l, v.t, w, h, [&](LayerRenderer& r) {
-            PaintAudioContentLayer(r, th, pui::RectF::XYWH(0, 0, w / scale_, h / scale_), title);
-        }, force);
-    } else if (mode == ShellMode::FullScreen && !MediaActive()) {
-        // Idle full screen: the video child has nothing to render and its GDI black is transparent over the extended DWM
-        // frame (windows behind show through the translucent bar), so cover the video rect with opaque black.
+    if (AudioOnlyMedia() || (mode == ShellMode::FullScreen && !MediaActive())) {
+        // Audio-only media and idle full screen: the video child has nothing to render and its GDI black is transparent over
+        // the extended DWM frame (windows behind show through the translucent bar), so cover the video rect with opaque black
+        // (the docked bar and the gutters keep the window backdrop).
         const RectPx& v = layout_.video;
         int w = std::max(1, v.w()), h = std::max(1, v.h());
         sContent_.visual->SetOffsetX((float)v.l);
@@ -531,7 +525,6 @@ void App::Flush() {
 void App::Tick() {
     if (!shell_ || destroyed_) return;
     uint64_t now = Now();
-    EnsureVideoDropHook();
     bool more = host_.Tick();
     AutoHideTick(now);
     ChipsTick(now);

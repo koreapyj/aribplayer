@@ -8,6 +8,7 @@
 #include "LogicTest.h"
 #include "Localize.h"
 #include "wvp/MediaUri.h"
+#include "wvp/win32/Utf.h"
 
 namespace app::open {
 
@@ -53,17 +54,17 @@ bool IsPlaylistFile(const std::wstring& path) {
     return e == L".m3u" || e == L".m3u8";
 }
 
-std::wstring PlaylistName(const std::wstring& source, const std::wstring& title) {
+std::string PlaylistName(const std::string& source, const std::string& title) {
     if (!title.empty()) return title;
     auto uri = wvp::MediaUri::Parse(source);
-    std::wstring s = uri.localPath ? *uri.localPath : source;
-    size_t q = s.find_first_of(L"?#");
-    if (q != std::wstring::npos) s.resize(q);
-    size_t slash = s.find_last_of(L"\\/");
-    std::wstring name = slash == std::wstring::npos ? s : s.substr(slash + 1);
-    size_t dot = name.find_last_of(L'.');
-    if (dot != std::wstring::npos && dot > 0) name.resize(dot);
-    return name.empty() ? L"Playlist" : name;
+    std::string s = uri.localPath ? *uri.localPath : source;
+    size_t q = s.find_first_of("?#");
+    if (q != std::string::npos) s.resize(q);
+    size_t slash = s.find_last_of("\\/");
+    std::string name = slash == std::string::npos ? s : s.substr(slash + 1);
+    size_t dot = name.find_last_of('.');
+    if (dot != std::string::npos && dot > 0) name.resize(dot);
+    return name.empty() ? "Playlist" : name;
 }
 
 bool NaturalLess(const std::wstring& a, const std::wstring& b) {
@@ -114,11 +115,11 @@ std::vector<std::wstring> ListMediaFiles(const std::wstring& folder) {
 }
 
 std::wstring ValidateUrl(const std::wstring& text) {
-    auto info = wvp::MediaUri::Parse(text);
+    auto info = wvp::MediaUri::Parse(wvp::ToUtf8(text));
     if (info.kind == wvp::MediaSourceKind::Empty) return Tr(L"Enter a web address or stream URL.", L"웹 주소 또는 스트림 주소를 입력하세요.");
     if (info.IsLocal()) return Tr(L"Enter a web address (http://, https://, rtmp://, rtsp://, udp://). Use Open file for local files.", L"웹 주소(http://, https://, rtmp://, rtsp://, udp://)를 입력하세요. 로컬 파일은 파일 열기를 사용하세요.");
     if (info.IsRemote()) {
-        const std::wstring& s = info.original;
+        const std::wstring s = wvp::ToWide(info.original);
         size_t p = s.find(L"://");
         if (p == std::wstring::npos || p + 3 >= s.size()) return Tr(L"The address is incomplete.", L"주소가 완전하지 않습니다.");
         for (wchar_t c : s)
@@ -189,9 +190,9 @@ LOGIC_TEST(open_media_filter_and_patterns) {
 }
 
 LOGIC_TEST(open_playlist_name_prefers_m3u_title_then_source_name) {
-    LT_CHECK_EQ(PlaylistName(L"C:\\lists\\news.m3u", L"News list"), std::wstring(L"News list"));
-    LT_CHECK_EQ(PlaylistName(L"C:\\lists\\news.m3u"), std::wstring(L"news"));
-    LT_CHECK_EQ(PlaylistName(L"https://example.test/feeds/current.m3u8?token=secret"), std::wstring(L"current"));
+    LT_CHECK_EQ(PlaylistName("C:\\lists\\news.m3u", "News list"), std::string("News list"));
+    LT_CHECK_EQ(PlaylistName("C:\\lists\\news.m3u"), std::string("news"));
+    LT_CHECK_EQ(PlaylistName("https://example.test/feeds/current.m3u8?token=secret"), std::string("current"));
 }
 
 LOGIC_TEST(open_natural_sort) {

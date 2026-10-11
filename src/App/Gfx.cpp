@@ -1,8 +1,6 @@
 #include "Gfx.h"
 
 #include <d2d1helper.h>
-#include <winternl.h>   // NTSTATUS for d3dkmthk.h
-#include <d3dkmthk.h>
 
 #include <cstdio>
 
@@ -65,7 +63,7 @@ HRESULT Gfx::Init(HWND hwnd, const StepFn& step, bool forceWarp) {
     hr = DCompositionCreateDevice3(dxgi.Get(), __uuidof(IDCompositionDesktopDevice), reinterpret_cast<void**>(desk.GetAddressOf()));
     step("dcomp_device3", hr);
     if (FAILED(hr)) return hr;
-    hr = desk->CreateTargetForHwnd(hwnd, TRUE, &target);   // topmost: composes above child windows (SDL video)
+    hr = desk->CreateTargetForHwnd(hwnd, TRUE, &target);   // topmost: composes above child windows (the presenter's video)
     step("dcomp_target_for_hwnd_topmost", hr);
     if (FAILED(hr)) return hr;
     hr = desk->CreateVisual(&root);
@@ -199,54 +197,3 @@ ComPtr<IDCompositionAnimation> Gfx::MakeAnim(float v0, float v1, float dur, bool
     return a;
 }
 
-std::vector<HwAdapter> EnumHardwareAdapters() {
-    std::vector<HwAdapter> out;
-    ComPtr<IDXGIFactory1> f;
-    if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&f)))) return out;
-    ComPtr<IDXGIAdapter1> a;
-    for (UINT i = 0; f->EnumAdapters1(i, &a) != DXGI_ERROR_NOT_FOUND; i++, a.Reset()) {
-        DXGI_ADAPTER_DESC1 d{};
-        if (FAILED(a->GetDesc1(&d)) || (d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) || d.VendorId == 0x1414) continue;
-        HwAdapter h{LuidText(d.AdapterLuid), d.Description, d.VendorId, d.DeviceId};
-        D3DKMT_OPENADAPTERFROMLUID open{};
-        open.AdapterLuid = d.AdapterLuid;
-        if (D3DKMTOpenAdapterFromLuid(&open) == 0) {
-            D3DKMT_ADAPTERADDRESS addr{};
-            D3DKMT_QUERYADAPTERINFO q{};
-            q.hAdapter = open.hAdapter;
-            q.Type = KMTQAITYPE_ADAPTERADDRESS;
-            q.pPrivateDriverData = &addr;
-            q.PrivateDriverDataSize = sizeof addr;
-            // a virtual adapter (indirect display) answers with all-ones: no PCI location
-            if (D3DKMTQueryAdapterInfo(&q) == 0 && addr.BusNumber != 0xFFFFFFFFu) {
-                h.hasPci = true;
-                h.bus = addr.BusNumber; h.device = addr.DeviceNumber; h.function = addr.FunctionNumber;
-            }
-            D3DKMT_CLOSEADAPTER close{};
-            close.hAdapter = open.hAdapter;
-            D3DKMTCloseAdapter(&close);
-        }
-        ComPtr<IDXGIOutput> o;
-        h.hasOutputs = a->EnumOutputs(0, &o) != DXGI_ERROR_NOT_FOUND;
-        out.push_back(std::move(h));
-    }
-    return out;
-}
-
-std::string DisplayAdapterLuid(HWND hwnd) {
-    HMONITOR mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
-    ComPtr<IDXGIFactory1> f;
-    if (!mon || FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&f)))) return {};
-    ComPtr<IDXGIAdapter1> a;
-    for (UINT i = 0; f->EnumAdapters1(i, &a) != DXGI_ERROR_NOT_FOUND; i++, a.Reset()) {
-        ComPtr<IDXGIOutput> o;
-        for (UINT k = 0; a->EnumOutputs(k, &o) != DXGI_ERROR_NOT_FOUND; k++, o.Reset()) {
-            DXGI_OUTPUT_DESC od{};
-            if (SUCCEEDED(o->GetDesc(&od)) && od.Monitor == mon) {
-                DXGI_ADAPTER_DESC1 d{};
-                if (SUCCEEDED(a->GetDesc1(&d))) return LuidText(d.AdapterLuid);
-            }
-        }
-    }
-    return {};
-}

@@ -1,8 +1,8 @@
 #pragma once
-// Composes presets and raw strings into one video filter string and one audio filter string in a deterministic order:
-//   video: deinterlace (On: yadif for priority Efficiency, bwdif for Quality; or ivtc), rotate/flip, eq@color, setpts (speed), then the custom raw string
-//   audio: dynaudnorm, superequalizer, atempo chain (speed), then the custom raw string
-// Raw mode: custom strings are APPENDED to the presets; with advancedMode they REPLACE the presets.
+// The filter settings and the pipeline plan made from them. Video: the PipelinePlanner turns the settings (deinterlace, speed,
+// the custom raw string) into the plan once capabilities are set; there is no video filter without a plan. Audio: presets and
+// the raw string composed in a deterministic order: dynaudnorm, superequalizer, atempo chain (speed), then the custom raw
+// string (appended to the presets; with advancedMode it replaces them).
 // Not thread-safe.
 #include <array>
 #include <cstddef>
@@ -27,22 +27,21 @@ public:
     static constexpr std::array<int, 18> kSuperEqHz = { 65, 92, 131, 185, 262, 370, 523, 740, 1047, 1480, 2093, 2960, 4186, 5920, 8372, 11840, 16744, 20000 };
     static constexpr double kMinSpeed = filters::kMinSpeed, kMaxSpeed = filters::kMaxSpeed;
     static constexpr std::array<double, 8> kSpeedPresets = filters::kSpeedPresets;
-    static constexpr const wchar_t* kEqInstance = filters::kEqInstance;
 
     FilterManager();
 
     const FilterSettings& Settings() const { return s_; }
 
-    /// Clamps `next`, makes it the current state and returns the minimal live change: only eq commands for
-    /// eq-value-only changes (while eq stays present), rebuild flags + new strings for structural changes,
-    /// an all-false/empty change for no-ops. videoFilter/audioFilter in the result always hold the current strings.
+    /// Clamps `next`, makes it the current state and returns the minimal live change: rebuild flags + new strings for
+    /// changed strings, an all-false change for no-ops. videoFilter/audioFilter in the result always hold the current strings.
     FilterChange Apply(const FilterSettings& next);
 
     /// Back to defaults (presets and raw strings). IVTC tuning is kept.
     FilterChange Reset();
 
-    std::wstring VideoFilter() const { return PlannerActive() ? plan_.videoFilter : Compose(true, false); }
-    std::wstring AudioFilter() const { return Compose(false, false); }
+    /// The vf of the current plan ("" without a plan).
+    std::string VideoFilter() const { return PlannerActive() ? plan_.videoFilter : std::string(); }
+    std::string AudioFilter() const { return ComposeAudio(); }
 
     /// Provider for PlaybackController::SetFilters. Captures `this`: the manager must outlive the controller use.
     FilterProvider Provider();
@@ -50,23 +49,20 @@ public:
     const IvtcTuning& Ivtc() const { return tuning_; }
     FilterChange SetIvtcTuning(const IvtcTuning& t);
 
-    // Without capabilities, uses legacy filter composition.
-    // With capabilities every setter replans (PlanPolicy::Cost) and returns a FilterChange whose video part comes from
-    // PipelinePlanner::Diff(old, new): videoRebuild for a graph rebuild, reopen (+ videoRebuild) when the decoder, presenter,
-    // hwframes mode or filter device changed, presenterParamsChanged when only presenter-applied parameters changed.
-    // Switching legacy <-> planner mode compares against the legacy plan (reopen when the open options differ).
-    FilterChange SetCapabilities(std::optional<CapabilitySet> caps);
-    FilterChange SetPlanPreferences(DecoderPref decoder, std::string forcedDecoder, PresenterPref presenter);
+    // Before capabilities are set there is no plan (and no video part in a FilterChange). With capabilities every setter
+    // replans and returns a FilterChange whose video part comes from PipelinePlanner::Diff(old, new): videoRebuild for a graph
+    // rebuild, reopen (+ videoRebuild) when the decoder, hwframes mode or filter device changed, or a plan appeared or vanished.
+    FilterChange SetCapabilities(CapabilitySet caps);
+    bool HasCapabilities() const { return planner_ != nullptr; }
+    FilterChange SetPlanPreferences(DecoderPref decoder, std::string forcedDecoder);
     FilterChange SetContent(const ContentInfo& content);
-    /// Adds a runtime-failure key ("hwaccel:cuda", "filter:ivtc_cuda", "hwframes_keep", ...) and replans.
+    /// Adds a runtime-failure key ("hwaccel:d3d11va", "filter:ivtc_d3d11", "hwframes_keep", ...) and replans.
     FilterChange Blacklist(const std::string& key);
-    /// The presenter refused `rejected` (SetPresenterParams error): blacklists "absorb:eq", "absorb:rotate" or "absorb:flip" (first
-    /// absorbed one not yet excluded) so that operation moves into the graph, and returns the resulting change. A no-op change
-    /// when nothing is left to exclude.
-    FilterChange PresenterParamsRejected(const PresenterParams& rejected);
     FilterChange ClearBlacklist();
-    /// The current plan; nullptr in legacy mode (no caps, or the planner found no valid pipeline).
+    /// The current plan; nullptr without capabilities or when the planner found no valid pipeline (PlanError says why).
     const Plan* CurrentPlan() const { return PlannerActive() ? &plan_ : nullptr; }
+    /// Why there is no plan although capabilities are set; "" otherwise.
+    std::string PlanError() const { return planner_ && !plan_.ok ? plan_.error : std::string(); }
     /// The request the planner is given (settings, tuning, content, preferences, blacklist).
     PlanRequest Request() const;
     bool PlannerActive() const { return planner_ && plan_.ok; }
@@ -76,30 +72,26 @@ public:
     /// 10 UI bands (dB) -> superequalizer's 18 band multipliers (log-frequency interpolation, 4 decimals).
     static std::array<double, 18> MapEqualizer(const std::array<double, 10>& gainsDb);
     /// atempo only accepts 0.5..2 reliably: other speeds are split into a chain.
-    static std::vector<std::wstring> AtempoChain(double speed);
+    static std::vector<std::string> AtempoChain(double speed);
     /// Backslash-escapes \ ' : , ; = [ ] and whitespace for use as a filter option value.
-    static std::wstring Escape(const std::wstring& value);
+    static std::string Escape(const std::string& value);
     /// Culture-invariant "0.######" number formatting.
-    static std::wstring Num(double d);
+    static std::string Num(double d);
 
 private:
-    std::wstring Compose(bool video, bool structure) const;
-    bool EqActive() const;
-    FilterChange Flush(const Plan* before = nullptr);
-    FilterChange Commit();   // replans (planner mode) and flushes against the previous plan
+    std::string ComposeAudio() const;
+    FilterChange Flush(const Plan& before);
+    FilterChange Commit();   // replans and flushes against the previous plan
     void Replan();
-    Plan LegacyPlanFor(const Plan& target) const;
 
     FilterSettings s_;
     IvtcTuning tuning_;
-    std::wstring lastVfStructure_, lastAfStructure_;
-    double lastB_ = 0, lastC_ = 1, lastS_ = 1, lastG_ = 1;
+    std::string lastAf_;
 
-    std::shared_ptr<const PipelinePlanner> planner_;   // null = legacy
+    std::shared_ptr<const PipelinePlanner> planner_;   // null until capabilities are set
     Plan plan_;
     DecoderPref decoder_ = DecoderPref::Auto;
     std::string forcedDecoder_;
-    PresenterPref presenter_ = PresenterPref::Auto;
     ContentInfo content_;
     std::set<std::string> blacklist_;
 };

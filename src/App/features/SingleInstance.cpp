@@ -4,6 +4,8 @@
 #include "LogicTest.h"
 #include "features/OpenFlows.h"
 #include "wvp/MediaUri.h"
+#include "wvp/Platform.h"
+#include "wvp/win32/Utf.h"
 
 namespace app {
 
@@ -82,7 +84,7 @@ std::vector<std::wstring> ResolveArgs(const std::wstring& cwd, const std::vector
             out.push_back(a);
             continue;
         }
-        out.push_back(wvp::WinPath::Combine(cwd, a));
+        out.push_back(wvp::ToWide(wvp::platform::Combine(wvp::ToUtf8(cwd), wvp::ToUtf8(a))));
     }
     return out;
 }

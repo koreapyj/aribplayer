@@ -12,13 +12,11 @@ namespace app {
 
 /// Display size of a video stream: SAR-corrected (the width is scaled, the height kept), rotated by 90/270 when
 /// `swapAxes`. nullopt when there is no picture (no video stream / zero size).
-inline std::optional<PxSize> VideoDisplaySize(int width, int height, int sarNum, int sarDen, bool swapAxes) {
+inline std::optional<PxSize> VideoDisplaySize(int width, int height, int sarNum, int sarDen) {
     if (width <= 0 || height <= 0) return std::nullopt;
     double w = width;
     if (sarNum > 0 && sarDen > 0 && sarNum != sarDen) w = width * (double)sarNum / sarDen;
-    PxSize s{(int)std::lround(w), height};
-    if (swapAxes) std::swap(s.w, s.h);
-    return s;
+    return PxSize{(int)std::lround(w), height};
 }
 
 /// Minimum size of the normal (not mini) window in DIP: WM_GETMINMAXINFO and the 1-5 keys both use it (one source of truth).

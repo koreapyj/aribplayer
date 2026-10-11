@@ -12,12 +12,13 @@
 #include "pui/Geometry.h"
 #include "wvp/MediaItem.h"
 #include "wvp/PlaybackController.h"
+#include "wvp/win32/Utf.h"
 
 namespace app::plp {
 
 /// The unnamed (persistent) playlist has no file name: its chip reads "Default playlist".
 inline std::wstring DefaultPlaylistLabel() { return Tr(L"Default playlist", L"기본 재생목록"); }
-inline std::wstring ChipLabel(const std::wstring& playlistName) { return playlistName.empty() ? DefaultPlaylistLabel() : playlistName; }
+inline std::wstring ChipLabel(const std::string& playlistName) { return playlistName.empty() ? DefaultPlaylistLabel() : wvp::ToWide(playlistName); }
 
 /// Sum of the known (finite, positive) durations in seconds; unknown ones are excluded.
 inline double TotalKnownDuration(const std::vector<wvp::MediaItem>& items) {
@@ -49,7 +50,7 @@ inline std::wstring SummaryText(int count, double totalSeconds) {
 inline bool FilterMatches(const wvp::MediaItem& item, const std::wstring& query) {
     if (query.empty()) return true;
     auto lower = [](std::wstring s) { for (auto& c : s) c = (wchar_t)std::towlower(c); return s; };
-    return lower(item.DisplayTitle()).find(lower(query)) != std::wstring::npos;
+    return lower(wvp::ToWide(item.DisplayTitle())).find(lower(query)) != std::wstring::npos;
 }
 
 /// Row text style: the current item keeps its accent look, a played one is dimmed, the rest is normal.

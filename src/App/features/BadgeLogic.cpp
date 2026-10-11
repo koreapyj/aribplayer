@@ -75,13 +75,13 @@ std::vector<Chip> BuildChips(const wvp::DebugInfo& debug, const wvp::MediaInfo& 
         chips.push_back({ChipKind::HwSw, HardwareDecoding(debug.Video) ? L"H/W" : L"S/W"});
     if (hasVideo) {
         // FourCC from libffplay (MPG2, H264, HEVC ...); the codec name when the container has none
-        std::wstring name = Upper(vs && !vs->FourCC.empty() ? vs->FourCC : vs ? vs->Codec : Widen(debug.Video.Codec));
-        if (vs && (vs->ColorTransfer == L"smpte2084" || vs->ColorTransfer == L"arib-std-b67"))
+        std::wstring name = Upper(Widen(vs && !vs->FourCC.empty() ? vs->FourCC : vs ? vs->Codec : debug.Video.Codec));
+        if (vs && (vs->ColorTransfer == "smpte2084" || vs->ColorTransfer == "arib-std-b67"))
             chips.push_back({ChipKind::Hdr, L"HDR"});
         if (!name.empty()) chips.push_back({ChipKind::VideoCodec, name});
     }
     if (hasAudio) {
-        std::wstring name = AudioCodecName(as ? as->Codec : Widen(debug.Audio.Codec));
+        std::wstring name = AudioCodecName(Widen(as ? as->Codec : debug.Audio.Codec));
         if (!name.empty()) chips.push_back({ChipKind::AudioCodec, name});
         int ch = as && as->Channels > 0 ? as->Channels : debug.Audio.Channels.value_or(0);
         std::wstring ct = ChannelsText(ch);

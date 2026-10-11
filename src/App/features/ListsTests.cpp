@@ -18,6 +18,8 @@
 #pragma comment(lib, "Ws2_32.lib")
 
 #include "LogicTest.h"
+#include "wvp/FilterManager.h"
+#include "wvp/CapabilitySet.h"
 #include "features/NativeMenu.h"
 #include "features/OpenFlows.h"
 #include "features/ListsCommon.h"
@@ -25,29 +27,32 @@
 #include "pui/Glyphs.h"
 #include "wvp/M3uWriter.h"
 #include "wvp/PlaylistLoader.h"
+#include "wvp/win32/Utf.h"
 
 using namespace app;
 using namespace app::lists;
 
 namespace {
 
-std::wstring TempDir(const wchar_t* tag) {
+std::string TempDir(const char* tag) {
     static unsigned n = 0;
     std::filesystem::path p = std::filesystem::temp_directory_path() /
-                              (std::wstring(L"aribplayer-lists-") + tag + L"-" + std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(++n));
+                              (L"aribplayer-lists-" + wvp::ToWide(tag) + L"-" + std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(++n));
     std::filesystem::remove_all(p);
     std::filesystem::create_directories(p);
-    return p.wstring();
+    return wvp::ToUtf8(p.wstring());
 }
 
-std::vector<wvp::MediaItem> MakeItems(int n, const wchar_t* prefix = L"C:\\media\\clip") {
+void RemoveDir(const std::string& dir) { std::filesystem::remove_all(std::filesystem::path(wvp::ToWide(dir))); }
+
+std::vector<wvp::MediaItem> MakeItems(int n, const char* prefix = "C:\\media\\clip") {
     std::vector<wvp::MediaItem> v;
-    for (int i = 0; i < n; i++) v.emplace_back(std::wstring(prefix) + std::to_wstring(i) + L".mp4", L"Clip " + std::to_wstring(i), 10.0 + i);
+    for (int i = 0; i < n; i++) v.emplace_back(std::string(prefix) + std::to_string(i) + ".mp4", "Clip " + std::to_string(i), 10.0 + i);
     return v;
 }
 
-std::vector<std::wstring> Urls(const std::vector<wvp::MediaItem>& v) {
-    std::vector<std::wstring> o;
+std::vector<std::string> Urls(const std::vector<wvp::MediaItem>& v) {
+    std::vector<std::string> o;
     for (auto& i : v) o.push_back(i.url);
     return o;
 }
@@ -55,7 +60,7 @@ std::vector<std::wstring> Urls(const std::vector<wvp::MediaItem>& v) {
 class FakePlayer final : public wvp::IMediaPlayer {
 public:
     int opens = 0, stops = 0;
-    std::vector<std::wstring> openedUrls;
+    std::vector<std::string> openedUrls;
     std::vector<wvp::OpenOptions> openedOptions;
     wvp::PlayerState State() const override { return wvp::PlayerState::Playing; }
     int Volume() const override { return 100; }
@@ -64,7 +69,7 @@ public:
     void SetMuted(bool) override {}
     double Position() override { return 0; }
     double Duration() override { return 0; }
-    int Open(const std::wstring& url, const wvp::OpenOptions& options = {}) override {
+    int Open(const std::string& url, const wvp::OpenOptions& options = {}) override {
         opens++;
         openedUrls.push_back(url);
         openedOptions.push_back(options);
@@ -76,9 +81,9 @@ public:
     int TogglePause() override { return 0; }
     int Seek(double, bool) override { return 0; }
     int CycleStream(wvp::StreamType) override { return 0; }
-    int SetVideoFilter(const std::wstring&) override { return 0; }
-    int SetAudioFilter(const std::wstring&) override { return 0; }
-    int SendFilterCommand(const std::wstring&, const std::wstring&, const std::wstring&) override { return 0; }
+    int SetVideoFilter(const std::string&) override { return 0; }
+    int SetAudioFilter(const std::string&) override { return 0; }
+    int SendFilterCommand(const std::string&, const std::string&, const std::string&) override { return 0; }
     std::optional<wvp::MediaInfo> GetMediaInfo() override { return std::nullopt; }
     std::optional<wvp::BgraFrame> Snapshot() override { return std::nullopt; }
 };
@@ -113,7 +118,7 @@ public:
         if (worker_.joinable()) worker_.join();
         if (started_) WSACleanup();
     }
-    std::wstring Url() const { return L"http://127.0.0.1:" + std::to_wstring(port_) + L"/list.m3u"; }
+    std::string Url() const { return "http://127.0.0.1:" + std::to_string(port_) + "/list.m3u"; }
     void SetResponse(int status, std::string body) {
         std::lock_guard<std::mutex> lock(mutex_);
         status_ = status;
@@ -170,8 +175,8 @@ bool WaitFor(Fn&& fn, DWORD timeoutMs = 10000) {
     return fn();
 }
 
-bool WritePlaylistText(const std::wstring& path, const std::string& text) {
-    std::ofstream file(std::filesystem::path(path), std::ios::binary | std::ios::trunc);
+bool WritePlaylistText(const std::string& path, const std::string& text) {
+    std::ofstream file(std::filesystem::path(wvp::ToWide(path)), std::ios::binary | std::ios::trunc);
     file.write(text.data(), (std::streamsize)text.size());
     return file.good();
 }
@@ -197,8 +202,12 @@ int FindMenuItem(const MenuProbe& menu, const std::wstring& text) {
 
 class StubContext final : public AppContext {
 public:
-    explicit StubContext(const std::wstring& dataDir, bool withController = false) : svc(dataDir) {
-        if (withController) ctl = std::make_unique<wvp::PlaybackController>(player);
+    explicit StubContext(const std::string& dataDir, bool withController = false) : svc(wvp::ToWide(dataDir)) {
+        if (withController) {
+            ctl = std::make_unique<wvp::PlaybackController>(player);
+            svc.filters.SetCapabilities(wvp::fakecaps::None());
+            ctl->SetFilters(svc.filters.Provider());
+        }
     }
     HWND MainHwnd() const override { return nullptr; }
     pui::UiHost& Ui() override { return host; }
@@ -206,33 +215,33 @@ public:
     wvp::FfPlayer* Player() override { return nullptr; }
     Services& Svc() override { return svc; }
     pui::IRenderer& Measurer() override { return measurer; }
-    std::wstring CurrentPlaylistName() const override { return currentName; }
-    std::vector<wvp::MediaItem> PlaylistItems(const std::wstring& name) override {
+    std::string CurrentPlaylistName() const override { return currentName; }
+    std::vector<wvp::MediaItem> PlaylistItems(const std::string& name) override {
         if (name == currentName && ctl) return ctl->Items();
         if (name.empty()) return unnamedItems;
         return svc.playlists.Load(name);
     }
-    bool SavePlaylistItems(const std::wstring& name, const std::vector<wvp::MediaItem>& items) override {
+    bool SavePlaylistItems(const std::string& name, const std::vector<wvp::MediaItem>& items) override {
         bool saved = name.empty() ? (unnamedItems = items, true) : svc.playlists.Save(name, items);
         if (name == currentName && ctl) {
-            std::wstring current = ctl->Current() ? ctl->Current()->url : std::wstring();
+            std::string current = ctl->Current() ? ctl->Current()->url : std::string();
             int index = -1;
             for (size_t i = 0; i < items.size(); i++) if (!current.empty() && items[i].url == current) { index = (int)i; break; }
             ctl->SetQueue(items, index, false);
         }
         return saved;
     }
-    void PlayPlaylist(const std::wstring& name, const std::vector<wvp::MediaItem>& items, int start) override {
+    void PlayPlaylist(const std::string& name, const std::vector<wvp::MediaItem>& items, int start) override {
         PlayPlaylistAtPosition(name, items, start, -1);
     }
-    void PlayPlaylistAtPosition(const std::wstring& name, const std::vector<wvp::MediaItem>& items, int start, double position) override {
+    void PlayPlaylistAtPosition(const std::string& name, const std::vector<wvp::MediaItem>& items, int start, double position) override {
         currentName = name; played = items; playStart = start; playPosition = position; playReplace = true;
         if (ctl) ctl->SetQueue(items, start, true, position);
     }
-    void AppendPlaylistItems(const std::wstring& name, const std::vector<wvp::MediaItem>& items) override {
+    void AppendPlaylistItems(const std::string& name, const std::vector<wvp::MediaItem>& items) override {
         AppendItems(name, items, false);
     }
-    void AppendItems(const std::wstring& name, const std::vector<wvp::MediaItem>& items, bool startIfIdle) {
+    void AppendItems(const std::string& name, const std::vector<wvp::MediaItem>& items, bool startIfIdle) {
         if (name == currentName) {
             enqueued.insert(enqueued.end(), items.begin(), items.end());
             if (ctl) {
@@ -254,8 +263,8 @@ public:
         currentName.clear(); unnamedItems = items; played = items; playStart = 0; playReplace = true;
         if (ctl) ctl->SetQueue(items, 0, true);
     }
-    void PlaylistRenamed(const std::wstring& from, const std::wstring& to) override { if (currentName == from) currentName = to; }
-    void PlaylistDeleted(const std::wstring& name) override { if (currentName == name) currentName.clear(); }
+    void PlaylistRenamed(const std::string& from, const std::string& to) override { if (currentName == from) currentName = to; }
+    void PlaylistDeleted(const std::string& name) override { if (currentName == name) currentName.clear(); }
     void SetFullscreen(bool) override {}
     bool IsFullscreen() const override { return false; }
     void SetMiniPlayer(bool) override {}
@@ -283,7 +292,7 @@ public:
     pui::UiHost host;
     pui::NullMeasurer measurer;
     pui::Theme theme;
-    std::wstring currentName;
+    std::string currentName;
     std::vector<wvp::MediaItem> unnamedItems;
     std::vector<wvp::MediaItem> played, enqueued;
     int playStart = -1;
@@ -311,97 +320,97 @@ LOGIC_TEST(lists_item_count_text) {
 }
 
 LOGIC_TEST(lists_name_validation_messages) {
-    std::wstring dir = TempDir(L"names");
+    std::string dir = TempDir("names");
     wvp::PlaylistStore store(dir);
-    LT_CHECK(ValidatePlaylistName(store, L"Road trip").empty());
-    LT_CHECK(!ValidatePlaylistName(store, L"").empty());
-    LT_CHECK(!ValidatePlaylistName(store, L"   ").empty());
-    LT_CHECK(!ValidatePlaylistName(store, L"a/b").empty());
-    LT_CHECK(!ValidatePlaylistName(store, L"what?").empty());
-    LT_CHECK(!ValidatePlaylistName(store, std::wstring(101, L'x')).empty());
-    LT_CHECK(store.Save(L"Road trip", MakeItems(2)));
-    LT_CHECK_EQ(ValidatePlaylistName(store, L"Road trip"), L"A playlist with this name already exists.");
-    LT_CHECK_EQ(ValidatePlaylistName(store, L"  road trip "), L"A playlist with this name already exists.");
-    LT_CHECK(ValidatePlaylistName(store, L"Road trip", L"Road trip").empty());
-    LT_CHECK(ValidatePlaylistName(store, L"ROAD TRIP", L"Road trip").empty());
-    LT_CHECK(ValidatePlaylistName(store, L"Other", L"Road trip").empty());
-    LT_CHECK_EQ(TrimName(L"  x y \t"), L"x y");
-    std::filesystem::remove_all(dir);
+    LT_CHECK(ValidatePlaylistName(store, "Road trip").empty());
+    LT_CHECK(!ValidatePlaylistName(store, "").empty());
+    LT_CHECK(!ValidatePlaylistName(store, "   ").empty());
+    LT_CHECK(!ValidatePlaylistName(store, "a/b").empty());
+    LT_CHECK(!ValidatePlaylistName(store, "what?").empty());
+    LT_CHECK(!ValidatePlaylistName(store, std::string(101, 'x')).empty());
+    LT_CHECK(store.Save("Road trip", MakeItems(2)));
+    LT_CHECK_EQ(ValidatePlaylistName(store, "Road trip"), L"A playlist with this name already exists.");
+    LT_CHECK_EQ(ValidatePlaylistName(store, "  road trip "), L"A playlist with this name already exists.");
+    LT_CHECK(ValidatePlaylistName(store, "Road trip", "Road trip").empty());
+    LT_CHECK(ValidatePlaylistName(store, "ROAD TRIP", "Road trip").empty());
+    LT_CHECK(ValidatePlaylistName(store, "Other", "Road trip").empty());
+    LT_CHECK_EQ(TrimName("  x y \t"), "x y");
+    RemoveDir(dir);
 }
 
 LOGIC_TEST(lists_overview_row_drop_appends_to_that_active_playlist) {
-    std::wstring dir = TempDir(L"rowdrop");
+    std::string dir = TempDir("rowdrop");
     {
         StubContext ctx(dir, true);
-        auto existing = MakeItems(1, L"C:\\mix\\");
-        LT_CHECK(ctx.svc.playlists.Save(L"Mix", existing));
-        ctx.currentName = L"Mix";
+        auto existing = MakeItems(1, "C:\\mix\\");
+        LT_CHECK(ctx.svc.playlists.Save("Mix", existing));
+        ctx.currentName = "Mix";
         ctx.ctl->SetQueue(existing, 0, true);
-        const std::wstring target = L"Mix";
+        const std::string target = "Mix";
         int opens = ctx.player.opens;
         auto done = std::make_shared<std::promise<void>>();
         auto complete = done->get_future();
         DropPathsToPlaylist(ctx, {L"C:\\drop\\added.mp4"}, target, [done] { done->set_value(); });
         LT_CHECK(complete.wait_for(std::chrono::seconds(10)) == std::future_status::ready);
-        auto saved = ctx.svc.playlists.Load(L"Mix");
+        auto saved = ctx.svc.playlists.Load("Mix");
         LT_CHECK_EQ((int)saved.size(), 2);
-        LT_CHECK_EQ(saved.back().url, L"C:\\drop\\added.mp4");
+        LT_CHECK_EQ(saved.back().url, "C:\\drop\\added.mp4");
         LT_CHECK_EQ((int)ctx.ctl->Items().size(), 2);
         LT_CHECK_EQ(ctx.ctl->CurrentIndex(), 0);
         LT_CHECK_EQ(ctx.player.opens, opens);   // appending on the overview row does not interrupt playback
         auto done2 = std::make_shared<std::promise<void>>();
         auto complete2 = done2->get_future();
-        DropPathsToPlaylist(ctx, {L"C:\\drop\\details.mp4"}, L"Mix", [done2] { done2->set_value(); });
+        DropPathsToPlaylist(ctx, {L"C:\\drop\\details.mp4"}, "Mix", [done2] { done2->set_value(); });
         LT_CHECK(complete2.wait_for(std::chrono::seconds(10)) == std::future_status::ready);
-        saved = ctx.svc.playlists.Load(L"Mix");
+        saved = ctx.svc.playlists.Load("Mix");
         LT_CHECK_EQ((int)saved.size(), 3);
-        LT_CHECK_EQ(saved.back().url, L"C:\\drop\\details.mp4");
+        LT_CHECK_EQ(saved.back().url, "C:\\drop\\details.mp4");
         LT_CHECK_EQ(ctx.player.opens, opens);   // a details-view drop appends to the named playlist without a restart
     }
-    std::filesystem::remove_all(dir);
+    RemoveDir(dir);
 }
 
 LOGIC_TEST(lists_playlist_view_drops_never_start_playback) {
-    std::wstring dir = TempDir(L"dropnoplay");
+    std::string dir = TempDir("dropnoplay");
     {
         StubContext ctx(dir, true);   // current = the unnamed playlist, nothing has played
-        LT_CHECK(ctx.svc.playlists.Save(L"Mix", MakeItems(1, L"C:\\mix\\")));
+        LT_CHECK(ctx.svc.playlists.Save("Mix", MakeItems(1, "C:\\mix\\")));
         LT_CHECK_EQ(ctx.ctl->CurrentIndex(), -1);
-        auto drop = [&](const std::wstring& target, const wchar_t* path) {
+        auto drop = [&](const std::string& target, const wchar_t* path) {
             auto done = std::make_shared<std::promise<void>>();
             auto f = done->get_future();
             DropPathsToPlaylist(ctx, {path}, target, [done] { done->set_value(); });
             LT_CHECK(f.wait_for(std::chrono::seconds(10)) == std::future_status::ready);
         };
-        drop(L"", L"C:\\drop\\a.mp4");
+        drop("", L"C:\\drop\\a.mp4");
         drop(ctx.CurrentPlaylistName(), L"C:\\drop\\b.mp4");
-        drop(L"", L"C:\\drop\\c.mp4");
-        drop(L"Mix", L"C:\\drop\\d.mp4");
+        drop("", L"C:\\drop\\c.mp4");
+        drop("Mix", L"C:\\drop\\d.mp4");
         LT_CHECK_EQ(ctx.player.opens, 0);
         LT_CHECK_EQ(ctx.ctl->CurrentIndex(), -1);
         LT_CHECK_EQ((int)ctx.ctl->Items().size(), 3);           // a, b, c appended to the current (unnamed) playlist
-        LT_CHECK_EQ((int)ctx.svc.playlists.Load(L"Mix").size(), 2);
+        LT_CHECK_EQ((int)ctx.svc.playlists.Load("Mix").size(), 2);
         // An Open appends and, with nothing played, starts the first item
-        ctx.AppendToCurrentPlaylist(MakeItems(1, L"C:\\open\\"));
+        ctx.AppendToCurrentPlaylist(MakeItems(1, "C:\\open\\"));
         LT_CHECK_EQ(ctx.ctl->CurrentIndex(), 0);
         LT_CHECK(ctx.player.opens > 0);
         // something playing: a drop on the current playlist's details keeps the current item and does not reopen
         int opens = ctx.player.opens;
-        const std::wstring cur = ctx.ctl->Current()->url;
-        drop(L"", L"C:\\drop\\e.mp4");
+        const std::string cur = ctx.ctl->Current()->url;
+        drop("", L"C:\\drop\\e.mp4");
         LT_CHECK_EQ(ctx.player.opens, opens);
         LT_CHECK_EQ(ctx.ctl->Current()->url, cur);
     }
-    std::filesystem::remove_all(dir);
+    RemoveDir(dir);
 }
 
 LOGIC_TEST(lists_video_drop_replaces_unnamed_playlist_and_plays) {
-    std::wstring dir = TempDir(L"homedrop");
+    std::string dir = TempDir("homedrop");
     {
         StubContext ctx(dir, true);
-        auto named = MakeItems(2, L"C:\\named\\");
-        LT_CHECK(ctx.svc.playlists.Save(L"Mix", named));
-        ctx.currentName = L"Mix";
+        auto named = MakeItems(2, "C:\\named\\");
+        LT_CHECK(ctx.svc.playlists.Save("Mix", named));
+        ctx.currentName = "Mix";
         ctx.ctl->SetQueue(named, 0, true);
         const int opens = ctx.player.opens;
         auto done = std::make_shared<std::promise<void>>();
@@ -411,26 +420,26 @@ LOGIC_TEST(lists_video_drop_replaces_unnamed_playlist_and_plays) {
         LT_CHECK(complete.wait_for(std::chrono::seconds(10)) == std::future_status::ready);
         LT_CHECK(ctx.currentName.empty());
         LT_CHECK_EQ((int)ctx.unnamedItems.size(), 1);
-        LT_CHECK_EQ(ctx.unnamedItems[0].url, L"C:\\drop\\home.mp4");
+        LT_CHECK_EQ(ctx.unnamedItems[0].url, "C:\\drop\\home.mp4");
         LT_CHECK_EQ((int)ctx.ctl->Items().size(), 1);
         LT_CHECK_EQ(ctx.ctl->CurrentIndex(), 0);
-        LT_CHECK(ctx.ctl->Current() && ctx.ctl->Current()->url == L"C:\\drop\\home.mp4");
+        LT_CHECK(ctx.ctl->Current() && ctx.ctl->Current()->url == "C:\\drop\\home.mp4");
         LT_CHECK_EQ(ctx.player.opens, opens + 1);
         LT_CHECK(ctx.playStart == 0 && ctx.playReplace);
         LT_CHECK(ctx.infoBars.empty() && ctx.toasts.empty());
-        LT_CHECK_EQ((int)ctx.svc.playlists.Load(L"Mix").size(), 2);
+        LT_CHECK_EQ((int)ctx.svc.playlists.Load("Mix").size(), 2);
     }
-    std::filesystem::remove_all(dir);
+    RemoveDir(dir);
 }
 
 LOGIC_TEST(lists_open_videos_replace_unnamed_like_video_view_drop) {
-    std::wstring dir = TempDir(L"openvideoreplace");
+    std::string dir = TempDir("openvideoreplace");
     {
         StubContext ctx(dir, true);
-        auto named = MakeItems(2, L"C:\\named\\");
-        auto oldUnnamed = MakeItems(3, L"C:\\old\\");
-        LT_CHECK(ctx.svc.playlists.Save(L"Mix", named));
-        ctx.currentName = L"Mix";
+        auto named = MakeItems(2, "C:\\named\\");
+        auto oldUnnamed = MakeItems(3, "C:\\old\\");
+        LT_CHECK(ctx.svc.playlists.Save("Mix", named));
+        ctx.currentName = "Mix";
         ctx.unnamedItems = oldUnnamed;
         ctx.ctl->SetQueue(named, 1, true);
         const int opens = ctx.player.opens;
@@ -440,59 +449,59 @@ LOGIC_TEST(lists_open_videos_replace_unnamed_like_video_view_drop) {
         LT_CHECK(complete.wait_for(std::chrono::seconds(10)) == std::future_status::ready);
         LT_CHECK(ctx.currentName.empty());
         LT_CHECK_EQ((int)ctx.unnamedItems.size(), 1);
-        LT_CHECK_EQ(ctx.unnamedItems[0].url, L"C:\\open\\video.mp4");
-        LT_CHECK(Urls(ctx.svc.playlists.Load(L"Mix")) == Urls(named));
-        LT_CHECK(ctx.ctl->Current() && ctx.ctl->Current()->url == L"C:\\open\\video.mp4");
+        LT_CHECK_EQ(ctx.unnamedItems[0].url, "C:\\open\\video.mp4");
+        LT_CHECK(Urls(ctx.svc.playlists.Load("Mix")) == Urls(named));
+        LT_CHECK(ctx.ctl->Current() && ctx.ctl->Current()->url == "C:\\open\\video.mp4");
         LT_CHECK_EQ(ctx.ctl->CurrentIndex(), 0);
         LT_CHECK_EQ(ctx.player.opens, opens + 1);
         LT_CHECK(ctx.playStart == 0 && ctx.playReplace);
     }
-    std::filesystem::remove_all(dir);
+    RemoveDir(dir);
 }
 
 LOGIC_TEST(lists_mixed_open_and_video_drop_expand_playlists_in_order) {
-    std::wstring dir = TempDir(L"mixedopen");
+    std::string dir = TempDir("mixedopen");
     {
         StubContext ctx(dir, true);
-        const std::wstring source = dir + L"\\source.m3u";
-        auto nested = std::vector<wvp::MediaItem>{wvp::MediaItem(L"C:\\list\\one.mp4", L"One"), wvp::MediaItem(L"C:\\list\\two.mp4", L"Two")};
+        const std::string source = dir + "\\source.m3u";
+        auto nested = std::vector<wvp::MediaItem>{wvp::MediaItem("C:\\list\\one.mp4", "One"), wvp::MediaItem("C:\\list\\two.mp4", "Two")};
         LT_CHECK(wvp::M3uWriter::Save(source, nested, false));
         auto runMixed = [&](bool drop) {
             auto done = std::make_shared<std::promise<void>>();
             auto complete = done->get_future();
-            std::vector<std::wstring> inputs{L"C:\\before.mp4", source, L"C:\\after.mp4"};
+            std::vector<std::wstring> inputs{L"C:\\before.mp4", wvp::ToWide(source), L"C:\\after.mp4"};
             if (drop) DropPathsOnVideoView(ctx, inputs, [done] { done->set_value(); });
             else OpenPaths(ctx, inputs, [done] { done->set_value(); });
             LT_CHECK(complete.wait_for(std::chrono::seconds(10)) == std::future_status::ready);
-            LT_CHECK(Urls(ctx.unnamedItems) == (std::vector<std::wstring>{L"C:\\before.mp4", L"C:\\list\\one.mp4", L"C:\\list\\two.mp4", L"C:\\after.mp4"}));
+            LT_CHECK(Urls(ctx.unnamedItems) == (std::vector<std::string>{"C:\\before.mp4", "C:\\list\\one.mp4", "C:\\list\\two.mp4", "C:\\after.mp4"}));
             LT_CHECK(ctx.currentName.empty());
             LT_CHECK_EQ(ctx.ctl->CurrentIndex(), 0);
-            LT_CHECK_EQ(ctx.ctl->Current()->url, L"C:\\before.mp4");
+            LT_CHECK_EQ(ctx.ctl->Current()->url, "C:\\before.mp4");
             LT_CHECK(ctx.svc.playlists.List().empty());  // mixed batches are not turned into reference entries
         };
         runMixed(false);
         runMixed(true);
     }
-    std::filesystem::remove_all(dir);
+    RemoveDir(dir);
 }
 
 LOGIC_TEST(lists_playlist_only_open_creates_and_reuses_reference_entry) {
-    std::wstring dir = TempDir(L"refopen");
+    std::string dir = TempDir("refopen");
     {
         StubContext ctx(dir, true);
-        const std::wstring source = dir + L"\\named-source.m3u";
-        const std::wstring secondSource = dir + L"\\later.m3u8";
-        auto nested = std::vector<wvp::MediaItem>{wvp::MediaItem(L"C:\\list\\first.mp4", L"First"), wvp::MediaItem(L"C:\\list\\second.mp4", L"Second")};
+        const std::string source = dir + "\\named-source.m3u";
+        const std::string secondSource = dir + "\\later.m3u8";
+        auto nested = std::vector<wvp::MediaItem>{wvp::MediaItem("C:\\list\\first.mp4", "First"), wvp::MediaItem("C:\\list\\second.mp4", "Second")};
         LT_CHECK(wvp::M3uWriter::Save(source, nested, false));
-        LT_CHECK(wvp::M3uWriter::Save(secondSource, {wvp::MediaItem(L"C:\\list\\later.mp4", L"Later")}, false));
+        LT_CHECK(wvp::M3uWriter::Save(secondSource, {wvp::MediaItem("C:\\list\\later.mp4", "Later")}, false));
         auto open = [&] {
             auto done = std::make_shared<std::promise<void>>();
             auto complete = done->get_future();
-            OpenPaths(ctx, {source, secondSource}, [done] { done->set_value(); });
+            OpenPaths(ctx, {wvp::ToWide(source), wvp::ToWide(secondSource)}, [done] { done->set_value(); });
             LT_CHECK(complete.wait_for(std::chrono::seconds(10)) == std::future_status::ready);
         };
         open();
-        LT_CHECK_EQ(ctx.currentName, L"named-source");
+        LT_CHECK_EQ(ctx.currentName, "named-source");
         auto entry = ctx.svc.playlists.FindReferenceByName(ctx.currentName);
         LT_CHECK(entry.has_value());
         LT_CHECK(entry && entry->source == source);
@@ -502,112 +511,114 @@ LOGIC_TEST(lists_playlist_only_open_creates_and_reuses_reference_entry) {
         LT_CHECK(refs[0].isReference && refs[1].isReference);
         open();
         LT_CHECK_EQ(ctx.svc.playlists.List().size(), (size_t)2);
-        LT_CHECK_EQ(ctx.currentName, L"named-source");
+        LT_CHECK_EQ(ctx.currentName, "named-source");
     }
-    std::filesystem::remove_all(dir);
+    RemoveDir(dir);
 }
 
 LOGIC_TEST(lists_unnamed_playlist_persists_and_restores_without_autoplay) {
-    std::wstring dir = TempDir(L"unnamedroundtrip");
-    auto items = MakeItems(3, L"C:\\scratch\\");
-    std::wstring path = dir + L"\\unnamed.m3u8";
+    std::string dir = TempDir("unnamedroundtrip");
+    auto items = MakeItems(3, "C:\\scratch\\");
+    std::string path = dir + "\\unnamed.m3u8";
     LT_CHECK(wvp::M3uWriter::Save(path, items, false));
     auto loaded = wvp::PlaylistLoader().Load(path).items;
     LT_CHECK(Urls(loaded) == Urls(items));
     FakePlayer player;
     wvp::PlaybackController ctl(player);
+    wvp::FilterManager fm;
+    fm.SetCapabilities(wvp::fakecaps::None());
+    ctl.SetFilters(fm.Provider());
     ctl.SetQueue(loaded, -1, false);
     LT_CHECK_EQ(player.opens, 0);
     LT_CHECK_EQ(ctl.CurrentIndex(), -1);
     LT_CHECK(ctl.PlayAt(0));
     LT_CHECK_EQ(player.opens, 1);
     LT_CHECK_EQ(ctl.Current()->url, items[0].url);
-    std::filesystem::remove_all(dir);
+    RemoveDir(dir);
 }
 
 LOGIC_TEST(openflows_playlist_resume_and_row_play_use_controller_resolution) {
-    std::wstring dir = TempDir(L"playlistresume");
+    std::string dir = TempDir("playlistresume");
     {
         StubContext ctx(dir, true);
-        const std::vector<wvp::MediaItem> items{wvp::MediaItem(L"C:\\resume\\first.mp4", L"First", 120.0),
-                                                wvp::MediaItem(L"C:\\resume\\second.mp4", L"Second", 120.0)};
-        LT_CHECK(ctx.svc.playlists.Save(L"Mix", items));
-        LT_CHECK(ctx.svc.playlists.SavePlaybackState(L"Mix", items[1].url, 42, 120, false, true, 1));
+        const std::vector<wvp::MediaItem> items{wvp::MediaItem("C:\\resume\\first.mp4", "First", 120.0),
+                                                wvp::MediaItem("C:\\resume\\second.mp4", "Second", 120.0)};
+        LT_CHECK(ctx.svc.playlists.Save("Mix", items));
+        LT_CHECK(ctx.svc.playlists.SavePlaybackState("Mix", items[1].url, 42, 120, false, true, 1));
         ctx.ctl->resolveResumePosition = [&ctx](const wvp::MediaItem& item, double requested) {
             auto state = ctx.svc.playlists.GetItemPlaybackState(item.url);
             state.position = requested >= 0 ? requested : state.position;
             if (state.duration <= 0) state.duration = item.duration.value_or(0.0);
             return wvp::PlaylistStore::ResumePosition(state);
         };
-        PlayPlaylistEntry(ctx, L"Mix", 0, true);       // playlist resume selects item + its saved offset
+        PlayPlaylistEntry(ctx, "Mix", 0, true);       // playlist resume selects item + its saved offset
         LT_CHECK_EQ(ctx.playStart, 1);
         LT_CHECK_EQ(ctx.playPosition, 42.0);
         LT_CHECK_EQ(ctx.ctl->Current()->url, items[1].url);
         LT_CHECK_EQ(ctx.player.openedUrls.back(), items[1].url);
-        LT_CHECK_EQ(ctx.player.openedOptions.back().front().first, L"hwaccel");
         auto getSs = [](const wvp::OpenOptions& options) {
-            for (const auto& item : options) if (item.first == L"ss") return item.second;
-            return std::wstring();
+            for (const auto& item : options) if (item.first == "ss") return item.second;
+            return std::string();
         };
-        LT_CHECK_EQ(getSs(ctx.player.openedOptions.back()), L"42.000000");
+        LT_CHECK_EQ(getSs(ctx.player.openedOptions.back()), "42.000000");
 
-        LT_CHECK(ctx.svc.playlists.SavePlaybackState(L"Mix", items[0].url, 30, 120, false, true, 0));
-        PlayPlaylistEntry(ctx, L"Mix", 0, false);      // row play supplies no preferred time; controller resolves item history
+        LT_CHECK(ctx.svc.playlists.SavePlaybackState("Mix", items[0].url, 30, 120, false, true, 0));
+        PlayPlaylistEntry(ctx, "Mix", 0, false);      // row play supplies no preferred time; controller resolves item history
         LT_CHECK_EQ(ctx.playStart, 0);
         LT_CHECK_EQ(ctx.playPosition, -1.0);
         LT_CHECK_EQ(ctx.ctl->Current()->url, items[0].url);
         LT_CHECK_EQ(ctx.player.openedUrls.back(), items[0].url);
-        LT_CHECK_EQ(getSs(ctx.player.openedOptions.back()), L"30.000000");
+        LT_CHECK_EQ(getSs(ctx.player.openedOptions.back()), "30.000000");
     }
-    std::filesystem::remove_all(dir);
+    RemoveDir(dir);
 }
 
 LOGIC_TEST(lists_name_unnamed_playlist_promotes_named_and_empties_unnamed) {
-    std::wstring dir = TempDir(L"nameunnamed");
+    std::string dir = TempDir("nameunnamed");
     {
         StubContext ctx(dir, true);
         auto items = MakeItems(3);
         ctx.unnamedItems = items;
         ctx.ctl->SetQueue(items, 1, true);
         int opens = ctx.player.opens;
-        LT_CHECK(NameUnnamedPlaylist(ctx, L"Road trip", items, 1));
-        LT_CHECK_EQ(ctx.currentName, L"Road trip");
-        LT_CHECK(ctx.svc.playlists.Exists(L"Road trip"));
-        LT_CHECK(Urls(ctx.svc.playlists.Load(L"Road trip")) == Urls(items));
+        LT_CHECK(NameUnnamedPlaylist(ctx, "Road trip", items, 1));
+        LT_CHECK_EQ(ctx.currentName, "Road trip");
+        LT_CHECK(ctx.svc.playlists.Exists("Road trip"));
+        LT_CHECK(Urls(ctx.svc.playlists.Load("Road trip")) == Urls(items));
         LT_CHECK(ctx.unnamedItems.empty());
         LT_CHECK_EQ(ctx.ctl->CurrentIndex(), 1);
         LT_CHECK_EQ(ctx.ctl->Current()->url, items[1].url);
         LT_CHECK_EQ(ctx.player.opens, opens + 1);
     }
-    std::filesystem::remove_all(dir);
+    RemoveDir(dir);
 }
 
 LOGIC_TEST(lists_video_view_drop_replaces_only_unnamed_and_plays_first) {
-    std::wstring dir = TempDir(L"videodrop");
+    std::string dir = TempDir("videodrop");
     {
         StubContext ctx(dir, true);
-        auto named = MakeItems(2, L"C:\\named\\");
-        auto oldUnnamed = MakeItems(3, L"C:\\unnamed\\");
-        auto dropped = MakeItems(2, L"C:\\drop\\");
-        LT_CHECK(ctx.svc.playlists.Save(L"Mix", named));
-        ctx.currentName = L"Mix";
+        auto named = MakeItems(2, "C:\\named\\");
+        auto oldUnnamed = MakeItems(3, "C:\\unnamed\\");
+        auto dropped = MakeItems(2, "C:\\drop\\");
+        LT_CHECK(ctx.svc.playlists.Save("Mix", named));
+        ctx.currentName = "Mix";
         ctx.unnamedItems = oldUnnamed;
         ctx.ctl->SetQueue(named, 1, true);
         int opens = ctx.player.opens;
         ctx.ReplaceUnnamedPlaylistAtPosition(dropped, -1);
         LT_CHECK(ctx.currentName.empty());
         LT_CHECK(Urls(ctx.unnamedItems) == Urls(dropped));
-        LT_CHECK(Urls(ctx.svc.playlists.Load(L"Mix")) == Urls(named));
+        LT_CHECK(Urls(ctx.svc.playlists.Load("Mix")) == Urls(named));
         LT_CHECK(Urls(ctx.ctl->Items()) == Urls(dropped));
         LT_CHECK_EQ(ctx.ctl->CurrentIndex(), 0);
         LT_CHECK_EQ(ctx.ctl->Current()->url, dropped[0].url);
         LT_CHECK_EQ(ctx.player.opens, opens + 1);
     }
-    std::filesystem::remove_all(dir);
+    RemoveDir(dir);
 }
 
 LOGIC_TEST(lists_confirm_dialog_escape_closes_modal) {
-    std::wstring dir = TempDir(L"dlg");
+    std::string dir = TempDir("dlg");
     {
         StubContext ctx(dir);
         ctx.host.SetSize({800, 600});
@@ -622,17 +633,17 @@ LOGIC_TEST(lists_confirm_dialog_escape_closes_modal) {
         LT_CHECK(confirmed);
         LT_CHECK_EQ((int)ctx.host.PopupCount(), 0);
     }
-    std::filesystem::remove_all(dir);
+    RemoveDir(dir);
 }
 
 
 LOGIC_TEST(lists_rejected_drop_has_no_side_effects) {
-    std::wstring dir = TempDir(L"rejecteddrop");
+    std::string dir = TempDir("rejecteddrop");
     {
         StubContext ctx(dir, true);
-        auto beforeItems = MakeItems(3, L"C:\\playing\\");
+        auto beforeItems = MakeItems(3, "C:\\playing\\");
         ctx.ctl->SetQueue(beforeItems, 1, true);
-        const auto current = ctx.ctl->Current() ? ctx.ctl->Current()->url : std::wstring();
+        const auto current = ctx.ctl->Current() ? ctx.ctl->Current()->url : std::string();
         const int index = ctx.ctl->CurrentIndex();
         const int opens = ctx.player.opens;
         const auto route = RouteDrop(false, false, false, false);   // outside the video, bar and title
@@ -645,7 +656,7 @@ LOGIC_TEST(lists_rejected_drop_has_no_side_effects) {
         LT_CHECK(ctx.played.empty() && ctx.enqueued.empty());
         LT_CHECK(ctx.infoBars.empty() && ctx.toasts.empty());
     }
-    std::filesystem::remove_all(dir);
+    RemoveDir(dir);
 }
 
 namespace {
@@ -664,7 +675,7 @@ std::vector<std::wstring> MenuTexts(const MenuProbe& m) {
 }
 
 LOGIC_TEST(lists_panel_plus_button_opens_the_playlist_menu) {
-    std::wstring dir = TempDir(L"plusmenu");
+    std::string dir = TempDir("plusmenu");
     {
         StubContext ctx(dir);
         PlaylistPanel* panel = MakePanel(ctx);
@@ -678,15 +689,15 @@ LOGIC_TEST(lists_panel_plus_button_opens_the_playlist_menu) {
         }
         ctx.host.SetRoot(nullptr);
     }
-    std::filesystem::remove_all(dir);
+    RemoveDir(dir);
 }
 
 LOGIC_TEST(lists_panel_chip_menus_follow_the_playlist_kind) {
-    std::wstring dir = TempDir(L"chipmenu");
+    std::string dir = TempDir("chipmenu");
     {
         StubContext ctx(dir);
-        LT_CHECK(ctx.svc.playlists.Save(L"Alpha", MakeItems(2)));
-        const std::wstring reference = ctx.svc.playlists.AddOrUpdateReference(L"https://example.test/list.m3u", L"Feed", MakeItems(1), true);
+        LT_CHECK(ctx.svc.playlists.Save("Alpha", MakeItems(2)));
+        const std::string reference = ctx.svc.playlists.AddOrUpdateReference("https://example.test/list.m3u", "Feed", MakeItems(1), true);
         PlaylistPanel* panel = MakePanel(ctx);
         LT_CHECK_EQ(panel->ChipCount(), 3);
         LT_CHECK(!panel->ChipReadOnly(0) && !panel->ChipReadOnly(1) && panel->ChipReadOnly(2));
@@ -730,14 +741,14 @@ LOGIC_TEST(lists_panel_chip_menus_follow_the_playlist_kind) {
         if (menu) LT_CHECK(FindMenuItem(*menu, L"Play playlist") == 0 && FindMenuItem(*menu, L"Play") < 0);
         ctx.host.SetRoot(nullptr);
     }
-    std::filesystem::remove_all(dir);
+    RemoveDir(dir);
 }
 
 LOGIC_TEST(lists_panel_item_menu_has_copy_delete_and_move) {
-    std::wstring dir = TempDir(L"rowmenu");
+    std::string dir = TempDir("rowmenu");
     {
         StubContext ctx(dir);
-        LT_CHECK(ctx.svc.playlists.Save(L"Alpha", MakeItems(3)));
+        LT_CHECK(ctx.svc.playlists.Save("Alpha", MakeItems(3)));
         PlaylistPanel* panel = MakePanel(ctx);
         panel->Chip(1)->onRightClick();
         ShownMenu();   // drop the chip menu
@@ -764,7 +775,7 @@ LOGIC_TEST(lists_panel_item_menu_has_copy_delete_and_move) {
             if (copy.size() == 3) LT_CHECK(!copy[0].enabled && copy[2].enabled);
             // Delete items above removes row 0 only
             nativemenu::InvokeItem(del, L"Delete items above");
-            LT_CHECK_EQ(ctx.svc.playlists.Load(L"Alpha").size(), (size_t)2);
+            LT_CHECK_EQ(ctx.svc.playlists.Load("Alpha").size(), (size_t)2);
         }
         // the topmost selected item is row 0: nothing above, the entry is disabled
         panel->List()->onContextMenu(0, pui::PointF{0, 0}, false);
@@ -776,15 +787,15 @@ LOGIC_TEST(lists_panel_item_menu_has_copy_delete_and_move) {
         }
         ctx.host.SetRoot(nullptr);
     }
-    std::filesystem::remove_all(dir);
+    RemoveDir(dir);
 }
 
 LOGIC_TEST(lists_panel_item_menu_copy_lists_other_playlists) {
-    std::wstring dir = TempDir(L"copymenu");
+    std::string dir = TempDir("copymenu");
     {
         StubContext ctx(dir);
-        LT_CHECK(ctx.svc.playlists.Save(L"Alpha", MakeItems(2)));
-        LT_CHECK(ctx.svc.playlists.Save(L"Beta", MakeItems(1)));
+        LT_CHECK(ctx.svc.playlists.Save("Alpha", MakeItems(2)));
+        LT_CHECK(ctx.svc.playlists.Save("Beta", MakeItems(1)));
         PlaylistPanel* panel = MakePanel(ctx);
         panel->Chip(1)->onRightClick();
         ShownMenu();
@@ -795,19 +806,19 @@ LOGIC_TEST(lists_panel_item_menu_copy_lists_other_playlists) {
             auto copy = menu->Item(1).sub;
             LT_CHECK(MenuTexts(MenuProbe{copy}) == (std::vector<std::wstring>{L"Beta", L"", L"New playlist…"}));
             nativemenu::InvokeItem(copy, L"Beta");
-            LT_CHECK_EQ(ctx.svc.playlists.Load(L"Beta").size(), (size_t)2);
-            LT_CHECK_EQ(ctx.svc.playlists.Load(L"Alpha").size(), (size_t)2);
+            LT_CHECK_EQ(ctx.svc.playlists.Load("Beta").size(), (size_t)2);
+            LT_CHECK_EQ(ctx.svc.playlists.Load("Alpha").size(), (size_t)2);
         }
         ctx.host.SetRoot(nullptr);
     }
-    std::filesystem::remove_all(dir);
+    RemoveDir(dir);
 }
 
 LOGIC_TEST(lists_panel_read_only_item_menu_disables_delete_and_move) {
-    std::wstring dir = TempDir(L"romenu");
+    std::string dir = TempDir("romenu");
     {
         StubContext ctx(dir);
-        ctx.svc.playlists.AddOrUpdateReference(L"https://example.test/list.m3u", L"Feed", MakeItems(2), true);
+        ctx.svc.playlists.AddOrUpdateReference("https://example.test/list.m3u", "Feed", MakeItems(2), true);
         PlaylistPanel* panel = MakePanel(ctx);
         panel->Chip(1)->onRightClick();
         ShownMenu();
@@ -820,14 +831,14 @@ LOGIC_TEST(lists_panel_read_only_item_menu_disables_delete_and_move) {
         }
         ctx.host.SetRoot(nullptr);
     }
-    std::filesystem::remove_all(dir);
+    RemoveDir(dir);
 }
 
 LOGIC_TEST(lists_panel_delete_asks_for_confirmation) {
-    std::wstring dir = TempDir(L"chipdelete");
+    std::string dir = TempDir("chipdelete");
     {
         StubContext ctx(dir);
-        LT_CHECK(ctx.svc.playlists.Save(L"Alpha", MakeItems(2)));
+        LT_CHECK(ctx.svc.playlists.Save("Alpha", MakeItems(2)));
         PlaylistPanel* panel = MakePanel(ctx);
         panel->Chip(1)->onRightClick();
         auto* menu = ShownMenu();
@@ -842,7 +853,7 @@ LOGIC_TEST(lists_panel_delete_asks_for_confirmation) {
             LT_CHECK(ctx.host.Focused() == cancel);   // focus starts on the safe button
             cancel->Invoke();
         }
-        LT_CHECK(ctx.svc.playlists.Exists(L"Alpha"));
+        LT_CHECK(ctx.svc.playlists.Exists("Alpha"));
         LT_CHECK_EQ((int)ctx.host.PopupCount(), 0);
         panel->Chip(1)->onRightClick();
         menu = ShownMenu();
@@ -850,20 +861,20 @@ LOGIC_TEST(lists_panel_delete_asks_for_confirmation) {
         auto* confirm = PopupButton(ctx, L"Delete");
         LT_CHECK(confirm != nullptr);
         if (confirm) confirm->Invoke();
-        LT_CHECK(!ctx.svc.playlists.Exists(L"Alpha"));
+        LT_CHECK(!ctx.svc.playlists.Exists("Alpha"));
         ctx.host.SetRoot(nullptr);
     }
-    std::filesystem::remove_all(dir);
+    RemoveDir(dir);
 }
 
 LOGIC_TEST(lists_panel_reference_menu_makes_fresh_local_copy) {
-    std::wstring dir = TempDir(L"refcopylocal");
-    const std::wstring source = dir + L"\\source.m3u";
+    std::string dir = TempDir("refcopylocal");
+    const std::string source = dir + "\\source.m3u";
     {
         LT_CHECK(WritePlaylistText(source, "#EXTM3U\n#PLAYLIST:Old Feed\n#EXTINF:10,Old item\nold.mp4\n"));
         StubContext ctx(dir);
         const auto cached = wvp::PlaylistLoader().Load(source).items;
-        const std::wstring reference = ctx.svc.playlists.AddOrUpdateReference(source, L"Local source", cached, false);
+        const std::string reference = ctx.svc.playlists.AddOrUpdateReference(source, "Local source", cached, false);
         LT_CHECK(!reference.empty());
         LT_CHECK(WritePlaylistText(source, "#EXTM3U\n#PLAYLIST:Fresh Feed\n#EXTINF:22,Fresh item\nfresh.mp4\n"));
         PlaylistPanel* panel = MakePanel(ctx);
@@ -878,32 +889,32 @@ LOGIC_TEST(lists_panel_reference_menu_makes_fresh_local_copy) {
         ctx.onToast = [&completed] { completed.set_value(); };
         if (menu && copy >= 0) menu->ActivateIndex(copy);
         LT_CHECK(completion.wait_for(std::chrono::seconds(10)) == std::future_status::ready);
-        LT_CHECK(WaitFor([&] { return ctx.svc.playlists.Exists(L"Fresh Feed"); }));
-        auto imported = ctx.svc.playlists.Load(L"Fresh Feed");
+        LT_CHECK(WaitFor([&] { return ctx.svc.playlists.Exists("Fresh Feed"); }));
+        auto imported = ctx.svc.playlists.Load("Fresh Feed");
         LT_CHECK_EQ(imported.size(), (size_t)1);
         if (!imported.empty()) {
-            LT_CHECK_EQ(imported[0].title, L"Fresh item");
-            LT_CHECK(imported[0].url.find(L"fresh.mp4") != std::wstring::npos);
+            LT_CHECK_EQ(imported[0].title, "Fresh item");
+            LT_CHECK(imported[0].url.find("fresh.mp4") != std::string::npos);
         }
-        LT_CHECK(!ctx.svc.playlists.IsReference(L"Fresh Feed"));
+        LT_CHECK(!ctx.svc.playlists.IsReference("Fresh Feed"));
         const auto refreshedReference = ctx.svc.playlists.Load(reference);
         LT_CHECK_EQ(refreshedReference.size(), (size_t)1);
-        if (!refreshedReference.empty()) LT_CHECK_EQ(refreshedReference[0].title, L"Fresh item"); // reference cache was freshly re-read too
+        if (!refreshedReference.empty()) LT_CHECK_EQ(refreshedReference[0].title, "Fresh item"); // reference cache was freshly re-read too
         LT_CHECK(ctx.currentName.empty());
         LT_CHECK(ctx.played.empty() && ctx.enqueued.empty());
-        LT_CHECK(WaitFor([&] { return panel->ChipCount() == 3 && panel->Viewed() == L"Fresh Feed" && !panel->ViewedReadOnly(); }));   // the panel shows the copy
+        LT_CHECK(WaitFor([&] { return panel->ChipCount() == 3 && panel->Viewed() == "Fresh Feed" && !panel->ViewedReadOnly(); }));   // the panel shows the copy
         ctx.host.SetRoot(nullptr);
     }
-    std::filesystem::remove_all(dir);
+    RemoveDir(dir);
 }
 
 LOGIC_TEST(lists_panel_reference_menu_copies_cached_items_offline) {
-    std::wstring dir = TempDir(L"refcopyoffline");
+    std::string dir = TempDir("refcopyoffline");
     LocalHttpServer server("offline", 503);
     {
         StubContext ctx(dir, true);
-        const auto cached = std::vector<wvp::MediaItem>{wvp::MediaItem(L"https://cdn.test/cached.mp4", L"Cached item", 45.0)};
-        const std::wstring reference = ctx.svc.playlists.AddOrUpdateReference(server.Url(), L"Remote cache", cached, true);
+        const auto cached = std::vector<wvp::MediaItem>{wvp::MediaItem("https://cdn.test/cached.mp4", "Cached item", 45.0)};
+        const std::string reference = ctx.svc.playlists.AddOrUpdateReference(server.Url(), "Remote cache", cached, true);
         PlaylistPanel* panel = MakePanel(ctx);
         panel->Chip(1)->onRightClick();
         auto* menu = ShownMenu();
@@ -915,84 +926,84 @@ LOGIC_TEST(lists_panel_reference_menu_copies_cached_items_offline) {
         ctx.onToast = [&completed] { completed.set_value(); };
         if (menu && copy >= 0) menu->ActivateIndex(copy);
         LT_CHECK(completion.wait_for(std::chrono::seconds(10)) == std::future_status::ready);
-        LT_CHECK(WaitFor([&] { return ctx.svc.playlists.Exists(L"Remote cache (2)"); }));
-        const auto imported = ctx.svc.playlists.Load(L"Remote cache (2)");
+        LT_CHECK(WaitFor([&] { return ctx.svc.playlists.Exists("Remote cache (2)"); }));
+        const auto imported = ctx.svc.playlists.Load("Remote cache (2)");
         LT_CHECK_EQ(imported.size(), (size_t)1);
         if (!imported.empty()) {
             LT_CHECK_EQ(imported[0].url, cached[0].url);
             LT_CHECK_EQ(imported[0].title, cached[0].title);
             LT_CHECK_EQ(imported[0].duration.value_or(0), cached[0].duration.value_or(0));
         }
-        LT_CHECK(!ctx.svc.playlists.IsReference(L"Remote cache (2)"));
+        LT_CHECK(!ctx.svc.playlists.IsReference("Remote cache (2)"));
         LT_CHECK(!ctx.infoBars.empty());
         LT_CHECK(ctx.infoBars.back().find(L"offline fallback") != std::wstring::npos);
         LT_CHECK_EQ(server.Requests(), 1);
         LT_CHECK(ctx.currentName.empty());
         LT_CHECK_EQ(ctx.player.opens, 0);
-        LT_CHECK(WaitFor([&] { return panel->Viewed() == L"Remote cache (2)"; }));
+        LT_CHECK(WaitFor([&] { return panel->Viewed() == "Remote cache (2)"; }));
         ctx.host.SetRoot(nullptr);
     }
-    std::filesystem::remove_all(dir);
+    RemoveDir(dir);
 }
 
 LOGIC_TEST(lists_panel_import_from_url_creates_a_read_only_reference) {
-    std::wstring dir = TempDir(L"urlref");
+    std::string dir = TempDir("urlref");
     LocalHttpServer server("#EXTM3U\n#PLAYLIST:Weekly Mix\n#EXTINF:33,Episode One\nrelative/one.mp4\n");
     {
         StubContext ctx(dir, true);
-        ctx.currentName = L"Keep current";
+        ctx.currentName = "Keep current";
         LT_CHECK(ctx.svc.playlists.Save(ctx.currentName, MakeItems(1)));
-        std::promise<std::wstring> completed;
+        std::promise<std::string> completed;
         auto result = completed.get_future();
-        AddPlaylistUrl(ctx, server.Url(), [&completed](const std::wstring& name) { completed.set_value(name); });
+        AddPlaylistUrl(ctx, wvp::ToWide(server.Url()), [&completed](const std::string& name) { completed.set_value(name); });
         LT_CHECK(result.wait_for(std::chrono::seconds(10)) == std::future_status::ready);
-        const std::wstring name = result.wait_for(std::chrono::seconds(0)) == std::future_status::ready ? result.get() : std::wstring();
-        LT_CHECK_EQ(name, L"Weekly Mix");
+        const std::string name = result.wait_for(std::chrono::seconds(0)) == std::future_status::ready ? result.get() : std::string();
+        LT_CHECK_EQ(name, "Weekly Mix");
         LT_CHECK(ctx.svc.playlists.IsReference(name));
         auto items = ctx.svc.playlists.Load(name);
         LT_CHECK_EQ(items.size(), (size_t)1);
         if (!items.empty()) {
-            LT_CHECK_EQ(items[0].title, L"Episode One");
-            LT_CHECK_EQ(items[0].url, server.Url().substr(0, server.Url().find_last_of(L'/') + 1) + L"relative/one.mp4");
+            LT_CHECK_EQ(items[0].title, "Episode One");
+            LT_CHECK_EQ(items[0].url, server.Url().substr(0, server.Url().find_last_of('/') + 1) + "relative/one.mp4");
         }
-        LT_CHECK_EQ(ctx.currentName, L"Keep current");   // adding a reference never starts playback
+        LT_CHECK_EQ(ctx.currentName, "Keep current");   // adding a reference never starts playback
         LT_CHECK_EQ(ctx.player.opens, 0);
         const auto ref = ctx.svc.playlists.FindReferenceByName(name);
         LT_CHECK(ref && ref->isRemote && ref->source == server.Url());
         // adding the same URL again refreshes the same reference instead of creating a second one
-        std::promise<std::wstring> again;
+        std::promise<std::string> again;
         auto againResult = again.get_future();
-        AddPlaylistUrl(ctx, server.Url(), [&again](const std::wstring& n) { again.set_value(n); });
+        AddPlaylistUrl(ctx, wvp::ToWide(server.Url()), [&again](const std::string& n) { again.set_value(n); });
         LT_CHECK(againResult.wait_for(std::chrono::seconds(10)) == std::future_status::ready);
         LT_CHECK_EQ(againResult.get(), name);
         int references = 0;
         for (const auto& info : ctx.svc.playlists.List()) references += info.isReference ? 1 : 0;
         LT_CHECK_EQ(references, 1);
     }
-    std::filesystem::remove_all(dir);
+    RemoveDir(dir);
 }
 
 LOGIC_TEST(lists_panel_import_from_url_refuses_hls_media_and_master_playlists) {
-    std::wstring dir = TempDir(L"urlhls");
+    std::string dir = TempDir("urlhls");
     LocalHttpServer server("#EXTM3U\n#EXT-X-TARGETDURATION:10\n#EXT-X-MEDIA-SEQUENCE:0\n");
     {
         StubContext ctx(dir);
         std::promise<void> deniedMedia;
         auto mediaResult = deniedMedia.get_future();
         ctx.onInfoBar = [&deniedMedia] { deniedMedia.set_value(); };
-        AddPlaylistUrl(ctx, server.Url());
+        AddPlaylistUrl(ctx, wvp::ToWide(server.Url()));
         LT_CHECK(mediaResult.wait_for(std::chrono::seconds(10)) == std::future_status::ready);
         LT_CHECK(ctx.infoBars.back().find(L"HLS") != std::wstring::npos);
         std::promise<void> deniedMaster;
         auto masterResult = deniedMaster.get_future();
         ctx.onInfoBar = [&deniedMaster] { deniedMaster.set_value(); };
         server.SetResponse(200, "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=100000\nvariant.m3u8\n");
-        AddPlaylistUrl(ctx, server.Url());
+        AddPlaylistUrl(ctx, wvp::ToWide(server.Url()));
         LT_CHECK(masterResult.wait_for(std::chrono::seconds(10)) == std::future_status::ready);
         LT_CHECK(ctx.infoBars.back().find(L"HLS") != std::wstring::npos);
         LT_CHECK(ctx.svc.playlists.List().empty());
         LT_CHECK(ctx.toasts.empty());
         LT_CHECK_EQ(server.Requests(), 2);
     }
-    std::filesystem::remove_all(dir);
+    RemoveDir(dir);
 }

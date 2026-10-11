@@ -38,17 +38,15 @@ struct DebugAcrylic {
     std::optional<double> BlurMs;
 };
 
-// "presenter" object; Present == false when absent.
+// "presenter" object; Present == false when absent. Name / Error / FramesDirect / FramesUploaded are the engine's; the rest
+// comes from the presenter's own "stats" object (FFPPresenter.stats_json; the D3D11 presenter's members below).
 struct DebugPresenter {
     bool Present = false;
-    std::string Name;                      // presenter in use: "d3d11" | "sdl"
-    std::string Requested;                 // as requested at open
-    std::string Error;                     // non-empty after a presenter failure (fell back to sdl)
-    std::string Params;                    // raw JSON of "params" ("" when absent)
+    std::string Name;                      // the presenter's FFPPresenter name ("d3d11", "metal")
+    std::string Error;                     // non-empty after the presenter failed for this open
     std::optional<std::int64_t> FramesDirect, FramesUploaded;
     DebugAcrylic Acrylic;
-    // CUDA presenter import counters; nullopt when absent.
-    std::optional<std::int64_t> FramesCudaZeroCopy, FramesCudaCopied;
+    std::string Renderer;                  // the drawing path in use ("d3d11:videoprocessor", "d3d11:shader", ...; "" when absent)
     std::string Route;                     // "vp" | "shader" ("" when absent)
     std::optional<std::int64_t> FramesShader, FramesD3d11Copied;
     // The presenter's adapter ("adapter": name, vendor_id, luid "HHHHHHHH:LLLLLLLL"); empty when absent.
@@ -57,6 +55,11 @@ struct DebugPresenter {
     std::optional<bool> DebugLayer;        // d3d11_debug: the debug layer is active
     std::optional<std::int64_t> DebugMessages;
     std::vector<std::string> Fallbacks;    // "decoder_pool_no_srv", "p010_vp_unsupported:shader", "force_caps:p010=0", ...
+    // "frame_stats": DXGI frame statistics of the swap chain and GPU timing of the presenter's draws.
+    std::optional<bool> DxgiValid;
+    std::optional<std::int64_t> DxgiPresentCount, DxgiPresentRefreshCount, DxgiSyncRefreshCount;
+    std::optional<std::int64_t> DxgiSyncQpcTime, DxgiSyncGpuTime;
+    std::optional<std::int64_t> D3dGpuTotalUs, D3dGpuFrames, D3dGpuLastUs;
 };
 
 struct DebugAudio {
@@ -137,20 +140,13 @@ struct DebugFrameEvent {
     std::string Kind;
     std::optional<std::int64_t> Count, Serial, AtUs;
     std::optional<double> Pts;
-    std::optional<bool> DxgiValid;
-    std::optional<std::int64_t> DxgiPresentCount, DxgiSyncRefreshCount, DxgiSyncQpcTime, DxgiSyncGpuTime;
-    std::optional<std::int64_t> D3dGpuTotalUs, D3dGpuFrames, D3dGpuLastUs;
 };
 
 // FFmpeg presentation trace; Present == false when absent.
 struct DebugFrameTrace {
     bool Present = false;
-    DebugFrameMark Decoded, Filtered, Presented, EarlyDrop, LateDrop, PresenterDrop;
+    DebugFrameMark Decoded, Filtered, Presented, EarlyDrop, LateDrop;
     std::vector<DebugFrameEvent> Events;
-    std::optional<bool> DxgiValid;
-    std::optional<std::int64_t> DxgiPresentCount, DxgiPresentRefreshCount, DxgiSyncRefreshCount;
-    std::optional<std::int64_t> DxgiSyncQpcTime, DxgiSyncGpuTime;
-    std::optional<std::int64_t> D3dGpuTotalUs, D3dGpuFrames, D3dGpuLastUs;
 };
 
 struct DebugQueue {
@@ -189,7 +185,6 @@ struct DebugInfo {
     DebugFrameTrace FrameTrace;
     DebugPresenter Presenter;
     DebugQueue AudioQueue, VideoQueue, SubtitleQueue;
-    std::string Renderer;                  // "vulkan" | "sdl:<name>" of the renderer object actually created
 };
 
 // Never throws; invalid JSON yields a default DebugInfo with Valid == false.

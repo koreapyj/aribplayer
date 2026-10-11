@@ -75,9 +75,9 @@ void PrintToConsole(const std::wstring& text);
 /// Level libffplay is told to use: explicit, else info while any sink is active (stats forces at least info), else warning.
 int EffectiveLevel();
 /// `<folder of settings.json>\logs` (the log folder next to a settings file; tests pass temp paths).
-std::wstring LogsDir(const std::wstring& settingsFilePath);
+std::string LogsDir(const std::string& settingsFilePath);
 /// Settings > Advanced > Debug logging: opens/closes `<logsDir>\aribplayer-YYYYMMDD.log`.
-void ApplyDebugLogging(bool on, const std::wstring& logsDir);
+void ApplyDebugLogging(bool on, const std::string& logsDir);
 /// Installs the av_log callback + level (after libffplay.dll is loaded) when the sink is active; removes it otherwise.
 void InstallEngineHooks();
 void RemoveEngineHooks();

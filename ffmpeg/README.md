@@ -1,8 +1,11 @@
 # ffmpeg/ - ffplay / libffplay build
 
-Builds `libffplay.dll`, `ffplay.exe`, `ffmpeg.exe`, `ffprobe.exe`, `ffcapsdump.exe` and the `av*/sw*` DLLs for
+Builds `libffplay.dll`, `ffmpeg.exe`, `ffprobe.exe`, `ffcapsdump.exe` and the `av*/sw*` DLLs for
 win64 from [builder-ffmpeg](https://github.com/koreapyj/builder-ffmpeg) (pinned in `builder.lock`) on top of
-jellyfin-ffmpeg `v8.1.3-1` (FFmpeg 8.1), with our patches layered on top. The result lands in `dist/win64/`.
+jellyfin-ffmpeg `v8.1.3-1` (FFmpeg 8.1), with our patches layered on top. The result lands in `dist/win64/`, together with what the
+host's presenter library builds against: the libavutil headers (`include/libavutil/`, incl. the generated
+`avconfig.h`), and an MSVC import library of avutil
+(`lib/avutil.lib`).
 The build is GPL (jellyfin enables `--enable-gpl`); fdk-aac is dropped so it can be redistributed.
 
 ## Layout
@@ -11,7 +14,7 @@ The build is GPL (jellyfin enables `--enable-gpl`); fdk-aac is dropped so it can
 builder.lock                 builder-ffmpeg URL + pinned commit, jellyfin FF_REPO/FF_REF
 patches/                     build/dependency/packaging patches (git apply, after builder's 0001-*), ours: 1001-1002
 source-patches/              ffmpeg-source patches (appended to debian/patches/series, applied last
-                             via quilt), ours: 1002-1017 (+1006a), grouped by concern:
+                             via quilt), ours: 1002-1010 (+1006a), grouped by concern:
                              FFmpeg library changes (separate from libffplay integration)
                                1002-libaribcaption-clear-and-type.patch = clear events yield an empty subtitle, caption_type option
                                1003-libaribcaption-runtime-rerender.patch = runtime canvas_size, caption history (10 min / 5 MiB) and re-render
@@ -23,28 +26,22 @@ source-patches/              ffmpeg-source patches (appended to debian/patches/s
                                                                       (sorts between 1006 and 1007 in the C-locale series order; there is no free number there)
                                1007-libavcodec-d3d11va-decoder-bind-flags.patch = AVD3D11VADeviceContext.decoder_bind_flags[_p010] (per format), pool retry without
                                                                       the extra bits (decoder_bind_fallbacks, test knob)
-                               1008-libavutil-cuda-pool-hook.patch = optional CUDA frame-pool allocator hook + buffer recycle predicate
-                             libffplay (fftools/ffplay*.c, ffplay.h)
-                               1009-libffplay-core-api.patch = ffplay.c as a library: API, hosted-window resize, debug info + fps stats,
-                                                              hwaccel fix, ffp_probe_caps / hwframes open option
-                               1010-libffplay-presenters.patch = presenter vtable (SDL), D3D11 VideoProcessor presenter,
-                                                                presenter input, hw sink for uploaded system frames, adapter (LUID) /
-                                                                debug layer / force_caps open options, ffp_probe_caps_opts, device loss
-                               1011-libffplay-d3d11-cuda-shader.patch = CUDA import (zero-copy / per-plane copy, remap retirement),
-                                                                       D3D11VA/system shader route, per-format decoder SRV probe, P010 /
-                                                                       other-format fallbacks, d3d11_route
-                               1012-libffplay-captions.patch = ARIB caption / superimpose streams, overlay and re-render
-                               1013-libffplay-acrylic-backdrop.patch = D3D11 Acrylic backdrop regions
-                               1014-libffplay-playback-control.patch = frame step, time seek, post-seek sync, pause latency
-                               1015-libffplay-static-caps.patch = ffcapsdump (what the build fixes: filters, the decoder of
-                                                                 each hwaccel, build features; compiled into the app), the
-                                                                 runtime probe keeps only machine-dependent results, no API version
-                               1016-libffplay-arib-audio.patch = ARIB audio model: audio 1 / audio 2 decoded in parallel (tsreadex roles, rebind on PMT change),
-                                                              selector with preference + coverage + 1 s hold + 5 ms crossfade, starvation, silence fill,
-                                                              ffp_set_audio_preference (ffplay_arib_audio.h = the pure decisions, ffmpeg/tests/ = table tests)
-                               1017-libffplay-keyframe-seek.patch = ffp_seek_keyframe: previous / next keyframe relative to the displayed frame (key packets read with a
-                                                              private demuxer, landing on the exact adjacent key packet), FFP_EVENT_KEYSEEK_DONE;
-                                                              ffp_skip + every timed seek (ffp_seek, seek bar, ss) land on the key packet closest to the target
+                             libffplay (fftools/ffplay*, ffcapsdump.c, Makefile): net patches of the final tree, split by file
+                             (ffplay.c is a near-complete rewrite of upstream, so its concerns cannot be split into separate hunks)
+                               1008-libffplay-arib-audio-model.patch = ffplay_arib_audio.h: the pure decisions of the ARIB audio model
+                                                              (tsreadex roles, selector with preference + coverage + 1 s hold + 5 ms
+                                                              crossfade, starvation), table-tested by ffmpeg/tests/
+                               1009-libffplay-engine.patch = ffplay.c as the libffplay engine + its C API ffplay.h + the Makefile
+                                                              integration (libffplay.dll / .dll.a / ffplay.h on make install; no ffplay
+                                                              program): presenter interface (FFPPresenter / FFPOutput, ffp_create,
+                                                              ffp_set_output; pictures, overlays and devices go to the host's presenter,
+                                                              SDL is used for audio only), events, debug info + fps stats, hwaccel /
+                                                              hwframes open options, ffp_probe_caps(devices, n), ARIB caption /
+                                                              superimpose layers with re-render, frame step, timed and keyframe seek
+                                                              (ffp_seek_keyframe / ffp_skip land on the exact key packet), start_paused,
+                                                              ARIB audio 1 / audio 2 decoded in parallel with ffp_set_audio_preference
+                               1010-libffplay-ffcapsdump.patch = ffcapsdump (what the build fixes: filters, the decoder of each hwaccel,
+                                                              build features; compiled into the app) + its Makefile rules
 scripts/build-ffplay.sh      the build (Linux/WSL), mirrors builder's CI `build-windows` job
 scripts/author.sh            quilt authoring flow + incremental build
 scripts/lib.sh               shared helpers
@@ -60,23 +57,26 @@ dist/win64/  (ignored)       output + .stamp
   * `1001-win64-enable-ffplay-sdl2.patch` builds SDL2 2.32.8 statically (cmake, into `${FF_DEPS_PREFIX}`),
     flips `--enable-ffplay --enable-sdl2`, replaces `--enable-libfdk-aac` with `--disable-libfdk-aac` (the
     fdk-aac build is removed), and adds a second zip `jellyfin-ffmpeg_*-ffplay_win64.zip` with all exe/dll
-    plus `libffplay.dll.a` and `ffplay.h` (taken from `${FF_PREFIX}/lib` and `${FF_PREFIX}/include/libffplay`).
+    plus `libffplay.dll.a` and `ffplay.h` (taken from `${FF_PREFIX}/lib` and `${FF_PREFIX}/include/libffplay`),
+    `include/libavutil/` (`${FF_PREFIX}/include`, without `hwcontext_cuda.h`) and
+    `lib/avutil.lib` (`llvm-dlltool` from `avutil-*.def`). `author.sh build` packages the same layout.
   * `1002-libaribcaption-directwrite-file-font.patch` patches the external libaribcaption dependency
     before it is built, adding DirectWrite `file:` font support. It also pins libaribcaption v1.1.1 with
     `-DARIBCC_USE_FREETYPE=ON` (fontconfig stays off) instead of builder's DirectWrite-only v1.1.2: the FreeType
-    renderer of v1.1.1 is what the Android app uses, and v1.1.2 moves glyphs (new ideographic baseline). It complements source patch
+    renderer of v1.1.1 matches the reference rendering, and v1.1.2 moves glyphs (new ideographic baseline). It complements source patch
     `1004-libaribcaption-directwrite-file-font.patch`, which selects the font provider and renderer
     in FFmpeg's libaribcaption wrapper.
 * `source-patches/*.patch` - ffmpeg source patches. Appended to `debian/patches/series` after jellyfin's
   (and builder's `0002`, `0003`, `0005`-`0007`), so they apply last. Authored with quilt (see below). The library changes
   and libffplay integration are grouped separately, but the series is ordered and may have
   dependencies between patches; individual patches are not guaranteed to apply or build alone.
-* Build patches (`1001-1002`) and source patches (`1002-1017`) use separate numbering namespaces.
+* Build patches (`1001-1002`) and source patches (`1002-1010`) use separate numbering namespaces.
   The `1000+` range keeps our patches separate from builder's patches.
 
-For win64, `1009-libffplay-core-api.patch` provides the build/install integration for
-`$(BINDIR)/libffplay.dll`, `$(BINDIR)/ffplay.exe`, `$(LIBDIR)/libffplay.dll.a` and
-`$(INCDIR)/libffplay/ffplay.h` on `make install`.
+For win64, `1009-libffplay-engine.patch` provides the build/install integration for
+`$(BINDIR)/libffplay.dll`, `$(LIBDIR)/libffplay.dll.a` and `$(INCDIR)/libffplay/ffplay.h` on `make install`
+(`1010-libffplay-ffcapsdump.patch` adds `$(BINDIR)/ffcapsdump.exe`). `--enable-ffplay` builds libffplay instead of an
+ffplay program.
 
 ## Build
 
@@ -118,7 +118,7 @@ fixes (filters, the decoder of each hwaccel, libffplay features) into the app (`
 
 ```bash
 scripts/author.sh prepare [--no-git]       # fresh tree, all patches staged and pushed (quilt); --no-git reuses the cached clones without running git
-scripts/author.sh quilt new 1015-foo.patch # or: quilt push/pop <existing patch>
+scripts/author.sh quilt new 1011-foo.patch # or: quilt push/pop <existing patch>
 scripts/author.sh quilt add fftools/ffplay.c
 $EDITOR ~/.cache/windows-video-player/ffmpeg81/quilt-tree/fftools/ffplay.c   # <work dir>/quilt-tree
 scripts/author.sh quilt refresh
@@ -131,6 +131,6 @@ scripts/author.sh refresh                  # rebase our patches against current 
 Once, after a full build: `build-ffplay.sh --keep-dev-image` commits the finished build container as docker
 image `ffplay-dev:win64` (deps in `/opt/ffdeps`, built ffmpeg tree in `/ffmpeg`). Then
 `scripts/author.sh build` copies the files touched by our patches into a persistent container
-(`ffplay-dev-work`), runs `make && make install` there (only changed files recompile) and copies the
-results to `dist/win64` (marked `.dev-build`). `author.sh dev-reset` discards the container's state,
+(`ffplay-dev-work`; files our patches delete are removed there), runs `make && make install` there (only changed
+files recompile) and packages the results into `dist/win64` in the layout of patch 1001 (marked `.dev-build`, which `build-ffplay` never takes as up to date). `author.sh dev-reset` discards the container's state,
 `author.sh dev-shell` opens a shell in it. After the loop, run the normal full build to validate.

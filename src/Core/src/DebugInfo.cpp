@@ -206,17 +206,6 @@ void FrameTrace(const Value& root, DebugInfo& out) {
     FrameMark(*v, "presented", t.Presented);
     FrameMark(*v, "early_drop", t.EarlyDrop);
     FrameMark(*v, "late_drop", t.LateDrop);
-    FrameMark(*v, "presenter_drop", t.PresenterDrop);
-    if (const Value* valid = v->Find("dxgi_valid"); valid && valid->kind == Value::Kind::Bool)
-        t.DxgiValid = valid->b;
-    t.DxgiPresentCount = NumL(*v, "dxgi_present_count");
-    t.DxgiPresentRefreshCount = NumL(*v, "dxgi_present_refresh_count");
-    t.DxgiSyncRefreshCount = NumL(*v, "dxgi_sync_refresh_count");
-    t.DxgiSyncQpcTime = NumL(*v, "dxgi_sync_qpc_time");
-    t.DxgiSyncGpuTime = NumL(*v, "dxgi_sync_gpu_time");
-    t.D3dGpuTotalUs = NumL(*v, "gpu_total_us");
-    t.D3dGpuFrames = NumL(*v, "gpu_frames");
-    t.D3dGpuLastUs = NumL(*v, "gpu_last_us");
     if (const Value* events = v->Find("events"); events && events->IsArray()) {
         for (const Value& event : events->arr) {
             if (!event.IsObject()) continue;
@@ -226,15 +215,6 @@ void FrameTrace(const Value& root, DebugInfo& out) {
             e.Pts = Num(event, "pts");
             e.Serial = NumL(event, "serial");
             e.AtUs = NumL(event, "at_us");
-            if (const Value* valid = event.Find("dxgi_valid"); valid && valid->kind == Value::Kind::Bool)
-                e.DxgiValid = valid->b;
-            e.DxgiPresentCount = NumL(event, "dxgi_present_count");
-            e.DxgiSyncRefreshCount = NumL(event, "dxgi_sync_refresh_count");
-            e.DxgiSyncQpcTime = NumL(event, "dxgi_sync_qpc_time");
-            e.DxgiSyncGpuTime = NumL(event, "dxgi_sync_gpu_time");
-            e.D3dGpuTotalUs = NumL(event, "gpu_total_us");
-            e.D3dGpuFrames = NumL(event, "gpu_frames");
-            e.D3dGpuLastUs = NumL(event, "gpu_last_us");
             t.Events.emplace_back(std::move(e));
         }
     }
@@ -349,19 +329,32 @@ DebugInfo ParseDebugInfo(const std::string& text) {
     if (const Value* v = Section(r, "presenter")) {
         DebugPresenter& o = d.Presenter;
         o.Present = true;
-        o.Name = v->Str("name"); o.Requested = v->Str("requested"); o.Error = v->Str("error");
-        if (const Value* pv = v->Find("params")) o.Params = Dump(*pv);
+        o.Name = v->Str("name"); o.Error = v->Str("error");
         o.FramesDirect = NumL(*v, "frames_direct"); o.FramesUploaded = NumL(*v, "frames_uploaded");
-        o.FramesCudaZeroCopy = NumL(*v, "frames_cuda_zero_copy"); o.FramesCudaCopied = NumL(*v, "frames_cuda_copied");
-        o.Route = v->Str("route");
-        o.FramesShader = NumL(*v, "frames_shader"); o.FramesD3d11Copied = NumL(*v, "frames_d3d11_copied");
-        if (const Value* a = Section(*v, "adapter")) {
+        const Value empty;
+        const Value* st = Section(*v, "stats");
+        const Value& s = st ? *st : empty;
+        o.Renderer = s.Str("renderer");
+        o.Route = s.Str("route");
+        o.FramesShader = NumL(s, "frames_shader"); o.FramesD3d11Copied = NumL(s, "frames_d3d11_copied");
+        if (const Value* a = Section(s, "adapter")) {
             o.AdapterName = a->Str("name"); o.AdapterLuid = a->Str("luid"); o.AdapterVendor = NumI(*a, "vendor_id");
         }
-        if (const Value* b = v->Find("debug_layer"); b && b->kind == Value::Kind::Bool) o.DebugLayer = b->b;
-        o.DebugMessages = NumL(*v, "debug_messages");
-        o.Fallbacks = StrArray(*v, "fallbacks");
-        if (const Value* a = Section(*v, "acrylic")) {
+        if (const Value* b = s.Find("debug_layer"); b && b->kind == Value::Kind::Bool) o.DebugLayer = b->b;
+        o.DebugMessages = NumL(s, "debug_messages");
+        o.Fallbacks = StrArray(s, "fallbacks");
+        if (const Value* f = Section(s, "frame_stats")) {
+            if (const Value* valid = f->Find("dxgi_valid"); valid && valid->kind == Value::Kind::Bool) o.DxgiValid = valid->b;
+            o.DxgiPresentCount = NumL(*f, "dxgi_present_count");
+            o.DxgiPresentRefreshCount = NumL(*f, "dxgi_present_refresh_count");
+            o.DxgiSyncRefreshCount = NumL(*f, "dxgi_sync_refresh_count");
+            o.DxgiSyncQpcTime = NumL(*f, "dxgi_sync_qpc_time");
+            o.DxgiSyncGpuTime = NumL(*f, "dxgi_sync_gpu_time");
+            o.D3dGpuTotalUs = NumL(*f, "gpu_total_us");
+            o.D3dGpuFrames = NumL(*f, "gpu_frames");
+            o.D3dGpuLastUs = NumL(*f, "gpu_last_us");
+        }
+        if (const Value* a = Section(s, "acrylic")) {
             o.Acrylic.Present = true;
             o.Acrylic.Regions = NumI(*a, "regions");
             o.Acrylic.FramesBlurred = NumL(*a, "frames_blurred");
@@ -369,7 +362,6 @@ DebugInfo ParseDebugInfo(const std::string& text) {
             o.Acrylic.BlurMs = Num(*a, "blur_ms");
         }
     }
-    d.Renderer = r.Str("renderer");
     if (const Value* v = Section(r, "queues")) {
         Queue(*v, "audio", d.AudioQueue);
         Queue(*v, "video", d.VideoQueue);

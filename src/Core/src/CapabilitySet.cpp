@@ -16,7 +16,7 @@ struct DomName { FrameDomain d; const char* name; };
 constexpr DomName kDomains[] = {
     {FrameDomain::System, "system"}, {FrameDomain::Cuda, "cuda"}, {FrameDomain::D3D11, "d3d11"}, {FrameDomain::D3D12, "d3d12"},
     {FrameDomain::OpenCl, "opencl"}, {FrameDomain::Qsv, "qsv"}, {FrameDomain::Dxva2, "dxva2"}, {FrameDomain::Vulkan, "vulkan"},
-    {FrameDomain::Any, "any"},
+    {FrameDomain::VideoToolbox, "videotoolbox"}, {FrameDomain::Any, "any"},
 };
 
 std::vector<std::string> StrArray(const Value& o, const char* key) {
@@ -36,10 +36,6 @@ int ClampInt(double d) {
 int IntOf(const Value& o, const char* key, int def) {
     const Value* v = o.Find(key);
     return v && IsNum(*v) ? ClampInt(v->n) : def;
-}
-void Range(const Value& o, const char* key, double& mn, double& mx) {
-    const Value* v = o.Find(key);
-    if (v && v->IsArray() && v->arr.size() >= 2 && IsNum(v->arr[0]) && IsNum(v->arr[1])) { mn = v->arr[0].n; mx = v->arr[1].n; }
 }
 const Value* ObjectOf(const Value& o, const char* key) {
     const Value* v = o.Find(key);
@@ -85,6 +81,7 @@ std::optional<FrameDomain> DomainFromName(const std::string& name) {
     if (name == "d3d11va") return FrameDomain::D3D11;
     if (name == "d3d12va") return FrameDomain::D3D12;
     if (name == "dxva2_vld") return FrameDomain::Dxva2;
+    if (name == "videotoolbox_vld") return FrameDomain::VideoToolbox;
     for (auto& e : kDomains) if (name == e.name) return e.d;
     for (char c : name)
         if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_')) return std::nullopt;
@@ -94,11 +91,11 @@ std::optional<FrameDomain> DomainFromName(const std::string& name) {
 std::optional<FrameDomain> DomainOfDeviceType(const std::string& t) {
     if (t == "d3d11va") return FrameDomain::D3D11;
     if (t == "d3d12va") return FrameDomain::D3D12;
-    if (t == "cuda") return FrameDomain::Cuda;
     if (t == "dxva2") return FrameDomain::Dxva2;
     if (t == "qsv") return FrameDomain::Qsv;
     if (t == "opencl") return FrameDomain::OpenCl;
     if (t == "vulkan") return FrameDomain::Vulkan;
+    if (t == "videotoolbox") return FrameDomain::VideoToolbox;
     return std::nullopt;
 }
 
@@ -106,11 +103,11 @@ std::string DeviceTypeOfDomain(FrameDomain d) {
     switch (d) {
     case FrameDomain::D3D11: return "d3d11va";
     case FrameDomain::D3D12: return "d3d12va";
-    case FrameDomain::Cuda: return "cuda";
     case FrameDomain::Dxva2: return "dxva2";
     case FrameDomain::Qsv: return "qsv";
     case FrameDomain::OpenCl: return "opencl";
     case FrameDomain::Vulkan: return "vulkan";
+    case FrameDomain::VideoToolbox: return "videotoolbox";
     default: return "";
     }
 }
@@ -152,6 +149,23 @@ CapabilitySet MergeBuildCapabilities(const CapabilitySet& runtime, const Capabil
         const DecoderCap* s = build.Decoder(d.codec, d.hwaccel);
         if (s && s->decoder == d.decoder) c.decoders.push_back(d);
     }
+    return c;
+}
+
+CapabilitySet MergePlatformCapabilities(const CapabilitySet& platform, const CapabilitySet& engine) {
+    CapabilitySet c = platform;
+    if (c.ffmpegVersion.empty()) c.ffmpegVersion = engine.ffmpegVersion;
+    for (const HwDeviceCap& e : engine.devices) {
+        auto it = std::find_if(c.devices.begin(), c.devices.end(), [&](const HwDeviceCap& d) { return d.type == e.type; });
+        if (it == c.devices.end()) { c.devices.push_back(e); continue; }
+        if (it->ok && !e.ok) { it->ok = false; it->error = e.error; }
+    }
+    for (DecoderCap& d : c.decoders)
+        if (d.decoder.empty())
+            if (const DecoderCap* e = engine.Decoder(d.codec, d.hwaccel)) d.decoder = e->decoder;
+    c.interop = engine.interop;
+    for (const std::string& f : engine.features)
+        if (std::find(c.features.begin(), c.features.end(), f) == c.features.end()) c.features.push_back(f);
     return c;
 }
 
@@ -199,12 +213,8 @@ std::optional<CapabilitySet> ParseCapabilities(const std::string& text) {
         PresenterCap p; p.name = e.Str("name"); p.ok = e.Bool("ok"); p.error = e.Str("error");
         for (auto& s : StrArray(e, "inputs"))
             if (auto d = DomainFromName(s)) p.inputs.push_back(*d);
-        if (const Value* im = ObjectOf(e, "import")) { p.importCuda = im->Bool("cuda"); p.importCudaZeroCopy = im->Bool("cuda_zero_copy"); }
         if (const Value* vp = ObjectOf(e, "vp")) {
-            p.vpRotate = vp->Bool("rotate"); p.vpMirror = vp->Bool("mirror"); p.vpProcamp = vp->Bool("procamp"); p.vpTelecine = vp->Bool("telecine");
-            Range(*vp, "brightness", p.vpBrightnessMin, p.vpBrightnessMax);
-            Range(*vp, "contrast", p.vpContrastMin, p.vpContrastMax);
-            Range(*vp, "saturation", p.vpSaturationMin, p.vpSaturationMax);
+            p.vpTelecine = vp->Bool("telecine");
             p.vpDeinterlace = StrArray(*vp, "deinterlace");
             if (vp->Find("p010")) p.vpP010 = vp->Bool("p010");
         }
@@ -266,12 +276,7 @@ std::string CapabilitiesToJson(const CapabilitySet& c) {
         w.Key("inputs").BeginArray();
         for (auto d : p.inputs) w.String(std::string_view(DomainName(d)));
         w.EndArray();
-        w.Key("import").BeginObject().Prop("cuda", p.importCuda).Prop("cuda_zero_copy", p.importCudaZeroCopy).EndObject();
         w.Key("vp").BeginObject();
-        w.Prop("rotate", p.vpRotate).Prop("mirror", p.vpMirror).Prop("procamp", p.vpProcamp);
-        w.Key("brightness").BeginArray().Number(p.vpBrightnessMin).Number(p.vpBrightnessMax).EndArray();
-        w.Key("contrast").BeginArray().Number(p.vpContrastMin).Number(p.vpContrastMax).EndArray();
-        w.Key("saturation").BeginArray().Number(p.vpSaturationMin).Number(p.vpSaturationMax).EndArray();
         WriteStrArray(w, "deinterlace", p.vpDeinterlace);
         w.Prop("telecine", p.vpTelecine).Prop("p010", p.vpP010);
         w.EndObject();
@@ -341,26 +346,25 @@ void AddDecoders(CapabilitySet& c, const char* hwaccel, bool dxva2Only) {
     }
 }
 
-PresenterCap Sdl() {
-    PresenterCap p; p.name = "sdl"; p.ok = true; p.inputs = {FrameDomain::System};
+// The D3D11 presenter without a hardware device (WARP): system frames, shader route.
+PresenterCap SystemPresenter() {
+    PresenterCap p; p.name = "d3d11"; p.ok = true; p.inputs = {FrameDomain::System};
+    p.shader = true;
     return p;
 }
 
-PresenterCap D3D11Presenter(bool importCuda, bool cudaZeroCopy = false) {
+PresenterCap D3D11Presenter() {
     PresenterCap p; p.name = "d3d11"; p.ok = true; p.inputs = {FrameDomain::D3D11, FrameDomain::System};
-    p.importCuda = importCuda; p.importCudaZeroCopy = importCuda && cudaZeroCopy;
-    p.vpRotate = p.vpMirror = p.vpProcamp = true; p.vpTelecine = false;
-    p.vpBrightnessMin = -100; p.vpBrightnessMax = 100; p.vpContrastMin = 0; p.vpContrastMax = 10; p.vpSaturationMin = 0; p.vpSaturationMax = 10;
+    p.vpTelecine = false;
     p.vpDeinterlace = {"bob", "adaptive"};
     p.shader = true;
     return p;
 }
 
-// Intel / AMD: VideoProcessor with rotate, mirror, procamp and P010 input, the shader route, decoder SRV for NV12 and P010,
-// no CUDA import.
-PresenterCap D3D11PresenterIntelAmd(double contrastMax, double saturationMax) {
-    PresenterCap p = D3D11Presenter(false);
-    p.vpContrastMax = contrastMax; p.vpSaturationMax = saturationMax;
+// Intel / AMD: VideoProcessor with P010 input (also motion-compensated deinterlacing), the shader route, decoder SRV for
+// NV12 and P010.
+PresenterCap D3D11PresenterIntelAmd() {
+    PresenterCap p = D3D11Presenter();
     p.vpDeinterlace = {"bob", "adaptive", "motion"};
     return p;
 }
@@ -371,44 +375,40 @@ CapabilitySet Base(const char* source) {
     return c;
 }
 
-void CommonHw(CapabilitySet& c, bool d3d11Presenter) {
+void CommonHw(CapabilitySet& c) {
     c.features = {"hwframes_keep"};
-    if (d3d11Presenter) c.features.push_back("presenter_d3d11");
-    c.features.push_back("presenter_params");
 }
 
-CapabilitySet MakeNvidia(bool presenterD3D11, bool presenterCudaImport, bool futureIvtc, bool cudaZeroCopy = false) {
-    CapabilitySet c = Base(futureIvtc ? "fake:nvidia_future_ivtc" : "fake:nvidia");
-    c.adapter.name = "NVIDIA GeForce RTX 5070"; c.adapter.luid = "00000000:0001d2c4"; c.adapter.driver = "32.0.15.8129"; c.adapter.vendorId = 0x10DE;
-    CommonHw(c, presenterD3D11);
-    for (const char* t : {"cuda", "d3d11va", "d3d12va", "dxva2"}) AddDevice(c, t, true, c.adapter.name);
-    AddDecoders(c, "d3d11va", false); AddDecoders(c, "cuda", false); AddDecoders(c, "d3d12va", false); AddDecoders(c, "dxva2", true);
-    AddSoftwareFilters(c);
-    AddD3D11Filters(c);
+// CUDA filters an FFmpeg build may carry: their frames live in a domain no device, decoder, interop or presenter of the
+// player provides, so they are never planned.
+void AddCudaFilters(CapabilitySet& c) {
     const std::vector<std::string> cu = {"cuda"};
     c.filters.push_back(F("bwdif_cuda", Fm::List, cu, {"mode", "parity", "deint"}, true, true));
     c.filters.push_back(F("yadif_cuda", Fm::List, cu, {"mode", "parity", "deint"}, true, true));
     c.filters.push_back(F("scale_cuda", Fm::List, cu, {}, false, true));
-    c.filters.push_back(F("transpose_cuda", Fm::List, cu, {"dir", "passthrough"}, true, true));
-    c.filters.push_back(F("tonemap_cuda", Fm::List, cu, {}, false, true));
     c.filters.push_back(F("ivtc_cuda", Fm::List, cu, kIvtcOpts, true, true));
-    if (futureIvtc) c.filters.push_back(F("ivtc_npp", Fm::Dynamic, {}, {}, false, true));
-    c.presenters.push_back(Sdl());
-    if (presenterD3D11) c.presenters.push_back(D3D11Presenter(presenterCudaImport, cudaZeroCopy));
+    c.filters.push_back(F("scale_npp", Fm::Dynamic, {}, {}, false, true));
+}
+
+}
+
+CapabilitySet Nvidia(bool presenterD3D11) {
+    CapabilitySet c = Base("fake:nvidia");
+    c.adapter.name = "NVIDIA GeForce RTX 5070"; c.adapter.luid = "00000000:0001d2c4"; c.adapter.driver = "32.0.15.8129"; c.adapter.vendorId = 0x10DE;
+    CommonHw(c);
+    for (const char* t : {"d3d11va", "d3d12va", "dxva2"}) AddDevice(c, t, true, c.adapter.name);
+    AddDecoders(c, "d3d11va", false); AddDecoders(c, "d3d12va", false); AddDecoders(c, "dxva2", true);
+    AddSoftwareFilters(c);
+    AddD3D11Filters(c);
+    AddCudaFilters(c);
+    c.presenters.push_back(presenterD3D11 ? D3D11Presenter() : SystemPresenter());
     return c;
 }
-
-}
-
-CapabilitySet Nvidia(bool presenterD3D11, bool presenterCudaImport, bool presenterCudaZeroCopy) {
-    return MakeNvidia(presenterD3D11, presenterCudaImport, false, presenterCudaZeroCopy);
-}
-CapabilitySet NvidiaFutureIvtcVariant() { return MakeNvidia(true, true, true); }
 
 CapabilitySet Intel() {
     CapabilitySet c = Base("fake:intel");
     c.adapter.name = "Intel(R) Arc(TM) Graphics"; c.adapter.luid = "00000000:0000a1b2"; c.adapter.driver = "32.0.101.6000"; c.adapter.vendorId = 0x8086;
-    CommonHw(c, true);
+    CommonHw(c);
     for (const char* t : {"d3d11va", "d3d12va", "dxva2", "qsv"}) AddDevice(c, t, true, c.adapter.name);
     AddDecoders(c, "d3d11va", false); AddDecoders(c, "d3d12va", false); AddDecoders(c, "dxva2", true);
     AddSoftwareFilters(c);
@@ -416,36 +416,39 @@ CapabilitySet Intel() {
     c.filters.push_back(F("scale_qsv", Fm::List, {"qsv"}, {"w", "h", "format", "mode", "async_depth"}, true, true));
     InteropCap b; b.from = FrameDomain::D3D11; b.to = FrameDomain::Qsv; b.method = "map"; b.ok = true;
     c.interop = {b};
-    c.presenters.push_back(Sdl());
-    c.presenters.push_back(D3D11PresenterIntelAmd(10, 10));
+    c.presenters.push_back(D3D11PresenterIntelAmd());
     return c;
 }
 
 CapabilitySet Amd() {
     CapabilitySet c = Base("fake:amd");
     c.adapter.name = "AMD Radeon RX 7800 XT"; c.adapter.luid = "00000000:0000c3d4"; c.adapter.driver = "32.0.12033.1030"; c.adapter.vendorId = 0x1002;
-    CommonHw(c, true);
+    CommonHw(c);
     for (const char* t : {"d3d11va", "d3d12va", "dxva2"}) AddDevice(c, t, true, c.adapter.name);
     AddDecoders(c, "d3d11va", false); AddDecoders(c, "d3d12va", false); AddDecoders(c, "dxva2", true);
     AddSoftwareFilters(c);
     AddD3D11Filters(c);
-    c.presenters.push_back(Sdl());
-    c.presenters.push_back(D3D11PresenterIntelAmd(2, 2));
+    c.presenters.push_back(D3D11PresenterIntelAmd());
     return c;
 }
 
 CapabilitySet None() {
     CapabilitySet c = Base("fake:none");
     AddSoftwareFilters(c);
-    c.presenters.push_back(Sdl());
+    c.presenters.push_back(SystemPresenter());
     return c;
 }
 
-CapabilitySet Legacy() {
-    CapabilitySet c = Base("legacy");
-    c.ffmpegVersion.clear();
+CapabilitySet Mac() {
+    CapabilitySet c = Base("fake:mac");
+    c.adapter.name = "Apple M3"; c.adapter.luid = "apple-m3";
+    c.features = {"hwframes_keep"};
+    AddDevice(c, "videotoolbox", true, c.adapter.name);
+    AddDecoders(c, "videotoolbox", false);
     AddSoftwareFilters(c);
-    c.presenters.push_back(Sdl());
+    PresenterCap p; p.name = "metal"; p.ok = true; p.inputs = {FrameDomain::VideoToolbox, FrameDomain::System};
+    p.shader = true;
+    c.presenters.push_back(p);
     return c;
 }
 

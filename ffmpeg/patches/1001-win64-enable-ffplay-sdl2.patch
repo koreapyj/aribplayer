@@ -1,7 +1,7 @@
 diff --git a/docker-build-win64.sh b/docker-build-win64.sh
 --- a/docker-build-win64.sh
 +++ b/docker-build-win64.sh
-@@ -498,20 +498,34 @@ meson setup dav1d dav1d_build \
+@@ -501,20 +501,34 @@
  meson configure dav1d_build
  ninja -j$(nproc) -C dav1d_build install
  
@@ -16,7 +16,7 @@ diff --git a/docker-build-win64.sh b/docker-build-win64.sh
 -    --enable-static \
 -    CFLAGS="-O3 -DNDEBUG" \
 -    CXXFLAGS="-O3 -DNDEBUG"
-+# SDL2 (static; needed by ffplay/libffplay)
++# SDL2 (static; needed by libffplay)
 +# HAVE_CTYPE_H=OFF: SDL would call msvcrt-missing isblank() (undefined __imp_isblank at link)
 +sdl2_ver="2.32.8"
 +sdl2_link="https://github.com/libsdl-org/SDL/releases/download/release-${sdl2_ver}/SDL2-${sdl2_ver}.tar.gz"
@@ -47,7 +47,7 @@ diff --git a/docker-build-win64.sh b/docker-build-win64.sh
  
  # OpenCL headers
  git clone -b v2023.04.17 --depth=1 https://github.com/KhronosGroup/OpenCL-Headers.git
-@@ -602,10 +616,10 @@ fi
+@@ -605,10 +619,10 @@
      ${FF_TARGET_FLAGS} \
      --extra-version=Jellyfin \
      --disable-unstable \
@@ -60,7 +60,7 @@ diff --git a/docker-build-win64.sh b/docker-build-win64.sh
      --disable-w32threads \
      --enable-pthreads \
      --enable-shared \
-@@ -637,7 +651,7 @@ fi
+@@ -640,7 +654,7 @@
      --enable-libx265 \
      --enable-libsvtav1 \
      --enable-libdav1d \
@@ -69,23 +69,23 @@ diff --git a/docker-build-win64.sh b/docker-build-win64.sh
      --enable-opencl \
      --enable-dxva2 \
      --enable-d3d11va \
-@@ -659,6 +673,21 @@ mkdir -p ${ARTIFACT_DIR}/zip
+@@ -662,6 +676,21 @@
  pushd ${FF_PREFIX}/bin
  ffpackage="jellyfin-ffmpeg_${ffversion}-portable_win64"
  zip -9 -r ${ARTIFACT_DIR}/zip/${ffpackage}.zip ./*.{exe,dll}
 +popd
 +
-+# ffplay package: libffplay.dll + import lib + header, ffplay.exe and every
-+# av*/sw* dll (consumed by the windows-video-player build).
++# ffplay package: libffplay.dll + import lib + header, every exe / av*/sw* dll, the libavutil headers
++# and an MSVC import library of avutil (consumed by the windows-video-player build).
 +ffplay_pkgdir="$(mktemp -d)"
 +cp ${FF_PREFIX}/bin/*.exe ${FF_PREFIX}/bin/*.dll "${ffplay_pkgdir}/"
-+for f in ${FF_PREFIX}/lib/libffplay.dll.a ${FF_PREFIX}/include/libffplay/ffplay.h; do
-+    if [[ -f "${f}" ]]; then
-+        cp "${f}" "${ffplay_pkgdir}/"
-+    else
-+        echo "WARNING: ${f} missing (source patch 1009-libffplay-core-api not applied?)"
-+    fi
-+done
++cp ${FF_PREFIX}/lib/libffplay.dll.a ${FF_PREFIX}/include/libffplay/ffplay.h "${ffplay_pkgdir}/"
++mkdir -p "${ffplay_pkgdir}/include" "${ffplay_pkgdir}/lib"
++cp -r ${FF_PREFIX}/include/libavutil "${ffplay_pkgdir}/include/" && rm -f "${ffplay_pkgdir}/include/libavutil/hwcontext_cuda.h"
++avutil_def="$(ls ${FF_PREFIX}/lib/avutil-*.def)"
++llvm_dlltool="$(ls /usr/bin/llvm-dlltool-* | sort -V | tail -n1)"
++"${llvm_dlltool}" -m i386:x86-64 -d "${avutil_def}" -D "$(basename "${avutil_def}" .def).dll" \
++    -l "${ffplay_pkgdir}/lib/avutil.lib"
 +pushd "${ffplay_pkgdir}"
 +zip -9 -r ${ARTIFACT_DIR}/zip/jellyfin-ffmpeg_${ffversion}-ffplay_win64.zip ./*
  pushd ${ARTIFACT_DIR}/zip

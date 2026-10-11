@@ -14,8 +14,8 @@ std::wstring MediaFilterPattern();
 std::wstring PlaylistFilterPattern();
 bool IsMediaFile(const std::wstring& path);      // by extension, case-insensitive
 bool IsPlaylistFile(const std::wstring& path);   // .m3u / .m3u8
-/// #PLAYLIST title when present, otherwise the source filename/URL segment without extension or query.
-std::wstring PlaylistName(const std::wstring& source, const std::wstring& title = {});
+/// #PLAYLIST title when present, otherwise the source filename/URL segment without extension or query (UTF-8).
+std::string PlaylistName(const std::string& source, const std::string& title = {});
 
 /// Case-insensitive natural order: digit runs compare by value ("a2" < "a10").
 bool NaturalLess(const std::wstring& a, const std::wstring& b);

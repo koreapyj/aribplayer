@@ -22,6 +22,13 @@ FFmpeg
   https://github.com/koreapyj/builder-ffmpeg
 
 
+Libraries included in ARIB Player
+
+- curl (libcurl) 8.22.0 - curl License, Copyright (c) 1996 - 2026, Daniel
+  Stenberg, <daniel@haxx.se>, and many contributors
+  https://curl.se/
+
+
 Libraries included in the FFmpeg DLLs
 
 - AMF headers 1.5.2 - MIT, Copyright (c) Advanced Micro Devices, Inc.

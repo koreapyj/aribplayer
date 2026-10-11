@@ -3,6 +3,8 @@
 
 #include <unordered_map>
 
+#include "wvp/win32/Utf.h"
+
 namespace app::fx {
 
 namespace {
@@ -80,42 +82,42 @@ std::wstring AvErrorText(int code) {
     return L"";
 }
 
-std::wstring FirstFilterName(const std::wstring& graph) {
+std::string FirstFilterName(const std::string& graph) {
     // "[in]name@label=args,next" -> "name"; empty when the graph chains several filters (the culprit is then unknown).
     int depth = 0, pieces = 0;
-    std::wstring first;
-    std::wstring cur;
+    std::string first;
+    std::string cur;
     for (size_t i = 0; i <= graph.size(); i++) {
-        wchar_t ch = i < graph.size() ? graph[i] : L',';
-        if (i < graph.size() && ch == L'\\') { cur.push_back(ch); if (i + 1 < graph.size()) cur.push_back(graph[++i]); continue; }
-        if (i < graph.size() && ch == L'[') depth++;
-        if (i < graph.size() && ch == L']' && depth > 0) depth--;
-        if ((ch == L',' || ch == L';') && depth == 0) {
-            if (cur.find_first_not_of(L" \t") != std::wstring::npos) {
+        char ch = i < graph.size() ? graph[i] : ',';
+        if (i < graph.size() && ch == '\\') { cur.push_back(ch); if (i + 1 < graph.size()) cur.push_back(graph[++i]); continue; }
+        if (i < graph.size() && ch == '[') depth++;
+        if (i < graph.size() && ch == ']' && depth > 0) depth--;
+        if ((ch == ',' || ch == ';') && depth == 0) {
+            if (cur.find_first_not_of(" \t") != std::string::npos) {
                 if (++pieces == 1) first = cur;
             }
             cur.clear();
         } else cur.push_back(ch);
     }
-    if (pieces != 1) return L"";
+    if (pieces != 1) return "";
     size_t b = 0;
-    while (b < first.size() && (first[b] == L'[' || first[b] == L' ')) {
-        if (first[b] == L'[') { size_t e = first.find(L']', b); if (e == std::wstring::npos) return L""; b = e + 1; }
+    while (b < first.size() && (first[b] == '[' || first[b] == ' ')) {
+        if (first[b] == '[') { size_t e = first.find(']', b); if (e == std::string::npos) return ""; b = e + 1; }
         else b++;
     }
-    size_t e = first.find_first_of(L"=@[ ", b);
-    return first.substr(b, e == std::wstring::npos ? std::wstring::npos : e - b);
+    size_t e = first.find_first_of("=@[ ", b);
+    return first.substr(b, e == std::string::npos ? std::string::npos : e - b);
 }
 
 std::wstring FormatFilterError(const wvp::FilterErrorInfo& e) {
-    std::wstring t = e.Type == L"audio" ? Tr(L"Audio filter failed", L"소리 필터 실패") : Tr(L"Video filter failed", L"영상 필터 실패");
+    std::wstring t = e.Type == "audio" ? Tr(L"Audio filter failed", L"소리 필터 실패") : Tr(L"Video filter failed", L"영상 필터 실패");
     std::wstring what = AvErrorText(e.Code);
-    if (what.empty()) what = e.Message;
+    if (what.empty()) what = wvp::ToWide(e.Message);
     bool known = !what.empty();
     if (known) {
         t += L": " + what;
         if ((e.Code == FfTag(0xF8, 'F', 'I', 'L') || e.Code == FfTag(0xF8, 'O', 'P', 'T'))) {
-            std::wstring n = FirstFilterName(e.Filter);
+            std::wstring n = wvp::ToWide(FirstFilterName(e.Filter));
             if (!n.empty()) t += L" ('" + n + L"')";
         }
     }

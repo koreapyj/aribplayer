@@ -1,6 +1,6 @@
 #pragma once
 // Layer split (DirectComposition visuals under ONE topmost target, bottom to top; all drawn with D2D into surfaces):
-//   1. content  - audio-only placeholder / idle full-screen black cover, redrawn on change
+//   1. content  - opaque black cover for audio-only media / idle full screen, redrawn on change
 //      panel    - PlaylistPanel (windowed player view, docked beside the video); surface = the panel rect only
 //      debug    - the Tab overlay
 //   2. title    - TitleBar (slides/fades with the bar in full screen; static in windowed video modes)
@@ -37,43 +37,37 @@
 #include "wvp/CapabilitySet.h"
 #include "wvp/FrameStepLogic.h"
 #include "wvp/PipelineSession.h"
+#include "wvp/Platform.h"
 #include "wvp/VideoGpu.h"
+#include "wvp/VideoPlatform.h"
 #include "pui/Uia.h"
+#include "wvp/win32/WindowsVideoPlatform.h"
 #include "shell/ShellRoot.h"
 
 namespace app {
 
 class SettingsWindow;
 
-/// Content layer of audio-only media in Now playing / full screen / mini: opaque black + music-note placeholder + title.
-void PaintAudioContentLayer(pui::IRenderer& r, const pui::Theme& t, const pui::RectF& area, const std::wstring& title);
-
 struct AppOptions {
     std::vector<std::wstring> inputs;
     bool headless = false;
     bool stats = false;               // --stats: BaseOptions stats=1 (ffplay status line through the log callback)
-    bool plannerOff = false;          // --planner=off: no capability probe, the GPU pipeline planner stays off
-    // Test / diagnostic switches, default off. Passed to libffplay's opens and to the capability probe child.
-    bool d3d11Debug = false;          // --d3d11-debug: d3d11_debug=1 (debug layer, ID3D11InfoQueue messages in the log)
-    std::wstring d3d11ForceCaps;      // --d3d11-force-caps=p010=0,decoder_srv=0,...: d3d11_force_caps
-    std::wstring d3d11Route;          // --d3d11-route=vp|shader: d3d11_route
-    bool noCuda = false;              // --no-cuda: the planner sees no CUDA device (capabilities masked after the probe)
+    wvp::win32::PresenterOptions video;   // --d3d11-debug, --d3d11-force-caps=, --d3d11-route=: the presenter and its probe
     int testUiLossMs = -1;            // --test-ui-device-loss=<ms>: simulate one UI device loss that long after playback starts
     std::wstring resultPath;
 };
 
-/// libffplay open options for the UI adapter (d3d11_adapter_luid; "" = none, libffplay's default adapter) and the test switches.
-std::vector<std::pair<std::wstring, std::wstring>> LibffplayDeviceOptions(const std::wstring& adapterLuid, const AppOptions& o);
-/// The same as an ffp_probe_caps_opts string ('\n'-separated): d3d11_adapter_luid, d3d11_force_caps, d3d11_debug.
-std::wstring ProbeOptions(const std::wstring& adapterLuid, const AppOptions& o);
-/// The capabilities the planner sees under --no-cuda: CUDA devices not ok, no CUDA decoders, no CUDA import.
-wvp::CapabilitySet WithoutCuda(wvp::CapabilitySet caps);
 void LogCaps(const wvp::CapabilitySet& caps);
-/// " --adapter-luid=... --d3d11-debug ..." switches of the --probe-gpu child for one adapter.
-std::wstring ProbeSwitches(const std::wstring& adapterLuid, const AppOptions& o);
-/// Probes the given adapters in parallel child processes; each answer is merged with BuildCapabilities.
-/// Adapters whose probe failed or has no usable d3d11va device are left out.
-std::vector<wvp::AdapterCandidate> ProbeAdapters(const std::vector<HwAdapter>& adapters, const AppOptions& o);
+/// Probes the given adapters in parallel (VideoPlatform::Probe); each answer is merged with BuildCapabilities. Adapters whose
+/// probe failed or that have no usable hardware device are left out.
+std::vector<wvp::AdapterCandidate> ProbeAdapters(wvp::VideoPlatform& platform, const std::vector<wvp::AdapterEntry>& adapters);
+
+/// Mouse input on the video child (VideoProc). x / y are video-child client pixels; button 1 left, 2 middle, 3 right.
+struct VideoInput {
+    enum class Kind { Move, Down, Up, DoubleClick };
+    Kind kind = Kind::Move;
+    int x = 0, y = 0, button = 0;
+};
 
 class App final : public AppContext {
     friend class AppDropTarget;
@@ -84,7 +78,7 @@ public:
     int RunGui();
     int RunHeadlessCheck();
 
-    static constexpr UINT WM_NOTIFY_PLAYER = WM_APP + 1, WM_RUN_QUEUE = WM_APP + 2, WM_REDRAW = WM_APP + 3;
+    static constexpr UINT WM_RUN_QUEUE = WM_APP + 1, WM_REDRAW = WM_APP + 2;
 
     HWND MainHwnd() const override { return hwnd_; }
     pui::UiHost& Ui() override { return host_; }
@@ -98,20 +92,20 @@ public:
     void ApplyWindowTopmost() override;
     bool IsMiniPlayer() const override { return modes_.mini; }
     ShellMode Mode() const override { return modes_.Mode(); }
-    std::wstring CurrentPlaylistName() const override { return currentPlaylistName_; }
-    std::vector<wvp::MediaItem> PlaylistItems(const std::wstring& name) override;
-    bool SavePlaylistItems(const std::wstring& name, const std::vector<wvp::MediaItem>& items) override;
-    void PlayPlaylist(const std::wstring& name, const std::vector<wvp::MediaItem>& items, int start) override;
-    void PlayPlaylistAtPosition(const std::wstring& name, const std::vector<wvp::MediaItem>& items, int start, double position) override;
-    void AppendPlaylistItems(const std::wstring& name, const std::vector<wvp::MediaItem>& items) override;
+    std::string CurrentPlaylistName() const override { return currentPlaylistName_; }
+    std::vector<wvp::MediaItem> PlaylistItems(const std::string& name) override;
+    bool SavePlaylistItems(const std::string& name, const std::vector<wvp::MediaItem>& items) override;
+    void PlayPlaylist(const std::string& name, const std::vector<wvp::MediaItem>& items, int start) override;
+    void PlayPlaylistAtPosition(const std::string& name, const std::vector<wvp::MediaItem>& items, int start, double position) override;
+    void AppendPlaylistItems(const std::string& name, const std::vector<wvp::MediaItem>& items) override;
     void AppendToCurrentPlaylist(std::vector<wvp::MediaItem> items) override;
     /// Appends to `name` (the current playlist goes through the controller); startIfIdle = the Open rule (play the first
     /// item when nothing has played), false for every playlist-view drop / add.
-    void AppendItems(const std::wstring& name, const std::vector<wvp::MediaItem>& items, bool startIfIdle);
+    void AppendItems(const std::string& name, const std::vector<wvp::MediaItem>& items, bool startIfIdle);
     void ReplaceUnnamedPlaylistAtPosition(std::vector<wvp::MediaItem> items, double position) override;
-    void SetResumeDecision(const std::wstring& decision) override;
-    void PlaylistRenamed(const std::wstring& from, const std::wstring& to) override;
-    void PlaylistDeleted(const std::wstring& name) override;
+    void SetResumeDecision(const std::string& decision) override;
+    void PlaylistRenamed(const std::string& from, const std::string& to) override;
+    void PlaylistDeleted(const std::string& name) override;
     void PlaylistsChanged() override;
     void ShowInfoBar(InfoSeverity severity, const std::wstring& title, const std::wstring& message) override;
     void ShowToast(const std::wstring& text) override;
@@ -137,16 +131,27 @@ public:
     /// Probes every hardware adapter again in child processes (adapter set changed, device lost); coalesced while one runs.
     void StartAdapterProbe(const std::string& why);
     /// Selects the video GPU for the current request (wvp::SelectVideoGpu) and applies it: capabilities, preferences, the
-    /// d3d11_adapter_luid open option. onlyIfCheaper: keep the current adapter unless the new choice's total cost is strictly
-    /// lower (drag end). Returns true when the adapter changed. Does not reopen.
-    bool SelectVideoGpuNow(const std::string& trigger, bool onlyIfCheaper, wvp::FilterChange* change = nullptr);
+    /// presenter on that adapter. onlyIfCheaper: keep the current adapter unless the new choice's total cost is strictly
+    /// lower (drag end). Returns true when the adapter changed; *presenterSwitched is set when the player got a presenter on
+    /// another adapter (that stopped the media: the caller reopens). Does not reopen.
+    bool SelectVideoGpuNow(const std::string& trigger, bool onlyIfCheaper, wvp::FilterChange* change = nullptr,
+                           bool* presenterSwitched = nullptr);
     /// The video device was lost (presenter device_lost event, or the UI device loss that took the adapter with it):
     /// re-select and reopen the current item at its position and play state.
     void OnVideoDeviceLost(const std::string& why);
+    /// PRESENTER_ERROR: the presenter stopped for this open. A lost device re-selects (OnVideoDeviceLost); otherwise the
+    /// current item is reopened, where the presenter recovers its device in its open (at most once per 2 s).
+    void OnPresenterError(const wvp::PresenterErrorInfo& e);
     void OnWindowDragEnd();
-    /// Enumerates the hardware adapters, groups them into physical GPUs by PCI address (physGpus_, logged) and returns the
-    /// canonical adapter of each GPU: the probe and the video GPU candidates use those only.
-    std::vector<HwAdapter> PhysicalAdapters(const std::string& why);
+    /// Enumerates the hardware adapters (VideoPlatform::Adapters), groups them into physical GPUs by PCI address (physGpus_,
+    /// logged) and returns the canonical adapter of each GPU: the probe and the video GPU candidates use those only.
+    std::vector<wvp::AdapterEntry> PhysicalAdapters();
+    void LogAdapters(const std::string& why) const;
+    // The video GPU could not be chosen or no pipeline plan exists for the request: shown once per distinct reason.
+    void ReportPlanProblem() override;
+    std::string reportedPlanProblem_;
+    uint64_t startMs_ = 0;                          // App::Create entry (Now()): startup timing in the log
+    uint64_t startupProbeMs_ = 0, firstPreparedMs_ = 0;   // after startMs_: the startup probe's answer, the first Prepared
     std::string DisplayGpuLuid() const;   // canonical LUID of the GPU driving the window's monitor
     void OnDisplayChange();
 
@@ -171,7 +176,7 @@ public:
     void SimulateUiDeviceLoss(RebindReason reason = RebindReason::Test);
     /// Test hook: leaves the WARP fallback and rebinds to the hardware adapter again.
     void ResetRebindFallback();
-    /// Reports a loss from any other source (e.g. a future "adapter_change" trigger); starts the rebind on the UI thread.
+    /// Reports a loss from a source other than draw/commit failure; starts the rebind on the UI thread.
     void ReportGpuLoss(RebindReason reason, const char* where, double detectedUs = 0);
 
 private:
@@ -196,11 +201,6 @@ private:
     void Destroy();
     static LRESULT CALLBACK StaticProc(HWND, UINT, WPARAM, LPARAM);
     static LRESULT CALLBACK VideoProc(HWND, UINT, WPARAM, LPARAM);
-    static LRESULT CALLBACK VideoDropProc(HWND, UINT, WPARAM, LPARAM);
-    /// Keep SDL's host child from taking the legacy WM_DROPFILES path; OLE has a target registered on this child.
-    /// Idempotent; re-run from Tick in case SDL changes the child style or subclasses it later.
-    void EnsureVideoDropHook();
-    void UnhookVideoDrop();
     HRESULT RegisterDropTargets();
     void RevokeDropTargets();
     DropRoute RouteDropAtClient(POINT client) const;
@@ -213,8 +213,8 @@ private:
     bool EndSplitterDrag();
     void SetPanelWidth(int widthDip);   // applies the width (relayout) and stores what the layout actually allowed
     LPARAM NcClientLParam(LPARAM screenLp) const;   // screen lParam of a WM_NC* message -> client lParam
-    bool splitDrag_ = false;                        // dragging the panel splitter (mouse captured)
-    int splitGrabPx_ = 0;                           // press x minus the splitter left edge
+    bool splitDrag_ = false;
+    int splitGrabPx_ = 0;
     bool ncTracked_ = false;                        // TME_NONCLIENT leave tracking armed (maximize button hover)
     void OnClose();
     int S(double dip) const { return (int)std::lround(dip * scale_); }
@@ -227,9 +227,8 @@ private:
     bool chromeOffscreen_ = false;
 
     pui::PointerEvent MakePointer(LPARAM lp, pui::PointerButton b, int clicks = 1) const;
-    void OnVideoInput(const wvp::InputEventArgs& e);
+    void OnVideoInput(const VideoInput& e);
     void VideoPressDrag(HWND video, LPARAM lp);   // left press on the video child: window drag past the drag threshold
-    void HandleGlobalKey(int vk, unsigned mods, bool repeat = false);
     /// A key mapped to a command. D / F go to the frame-step controller (key held-ness, no queue); the rest to Execute.
     void RunKeyCommand(int vk, CommandId command, bool repeat);
     static constexpr int kKeyStepFrame = 0, kKeyStepKeyframe = 1, kKeyStepSkip = 100;   // actions of the shared held-key step controller; kKeyStepSkip + n = a timed skip of n seconds
@@ -285,7 +284,7 @@ private:
     void SizeWindowToVideo(double scale, std::optional<PxSize> knownVideo = std::nullopt);
     SnapTracker snap_;
     void SnapWindowMessage(LPARAM lp, bool move, int sizingEdge);   // WM_MOVING / WM_SIZING edge snapping
-    std::wstring sizedForUrl_;   // url the window was last sized for on open (once per opened item)
+    std::string sizedForUrl_;   // url the window was last sized for on open (once per opened item)
     bool MediaActive() const { return Loaded() || pending_.has_value(); }
     void CloseNotice(pui::Widget* w);
     ShellLayout ComputeLayout() const;
@@ -295,9 +294,9 @@ private:
     void WirePlayer();
     void RestoreCurrentPlaylist();
     bool PersistCurrentPlaylist();
-    void SetCurrentPlaylistName(const std::wstring& name);
+    void SetCurrentPlaylistName(const std::string& name);
     void SavePlaybackHistory(bool force, bool ended = false, double positionOverride = -1);
-    void SavePlaybackSnapshot(const std::wstring& playlist, const std::wstring& url, int index, double position, double duration,
+    void SavePlaybackSnapshot(const std::string& playlist, const std::string& url, int index, double position, double duration,
                               bool seekable, bool force, bool ended = false);
     void ApplyPendingQueue();
     void CheckReady();
@@ -316,9 +315,16 @@ private:
     void LogOpenPlan();
     wvp::PipelineSession pipe_;
     bool capsProbed_ = false;
-    PlaybackAdapter playAdapter_;     // the video GPU (SelectVideoGpuNow); luid "" = software decoding + SDL
+    PlaybackAdapter playAdapter_;     // the video GPU (SelectVideoGpuNow); luid "" = no hardware adapter (software decoding)
+    std::unique_ptr<wvp::win32::WindowsVideoPlatform> platform_;   // adapters, probe and the D3D11 presenters
+    /// A presenter on the adapter with this id ("" = the system's default adapter) for the video child; logs a failure.
+    wvp::PresenterHandle MakePresenter(const std::string& luid);
+    /// Gives the player a presenter on `luid` unless its presenter already runs there. True when it switched.
+    bool UsePresenterOn(const std::string& luid);
+    uint64_t presenterReopenMs_ = 0;                // last reopen after a presenter error (Now())
     std::vector<wvp::AdapterCandidate> adapters_;   // probed video GPU candidates (d3d11va usable)
-    std::vector<std::string> probedLuids_;          // every hardware adapter of the last probe (adapter-set change detection)
+    std::vector<std::string> probedLuids_;          // every hardware adapter id of the last probe (adapter-set change detection)
+    std::vector<wvp::AdapterEntry> probedAdapters_;  // every hardware adapter of the last probe
     std::string displayLuid_;                       // GPU driving the window's monitor at the last selection (canonical LUID)
     std::string displayRawLuid_;                    // the DXGI adapter of that monitor (an alias when it differs)
     std::vector<wvp::PhysicalGpu> physGpus_;
@@ -328,7 +334,7 @@ private:
     std::string adapterProbePending_;               // a re-probe requested while one ran
     std::thread adapterProbeThread_;
     uint64_t lastRestoreMs_ = 0;                    // last device-loss reopen (Now()), coalesces repeated losses
-    bool videoSoftwareFallback_ = false;            // the rebind controller fell back: video on software decoding + SDL
+    bool videoSoftwareFallback_ = false;            // the rebind controller fell back: video on software decoding, default adapter
     uint64_t pipeOpenMs_ = 0, pipePollNextMs_ = 0;
     bool RenderDebugLayer(bool force);
     bool UserPopupOpen() const;
@@ -343,9 +349,10 @@ private:
 
     AppOptions opt_;
     bool hidden_ = false, destroyed_ = false;
-    std::wstring dataDir_;
+    std::string dataDir_;
+    std::string UnnamedPath() const { return wvp::platform::Combine(dataDir_, "unnamed.m3u8"); }
     HWND hwnd_ = nullptr, video_ = nullptr;
-    IDropTarget* dropTarget_ = nullptr;            // owns one ref; OLE holds refs for the main and SDL child HWNDs
+    IDropTarget* dropTarget_ = nullptr;            // owns one ref; OLE holds refs for the main and video child HWNDs
     bool dropTargetMainRegistered_ = false, dropTargetVideoRegistered_ = false;
     float scale_ = 1.f;
     int cw_ = 0, ch_ = 0;
@@ -353,7 +360,6 @@ private:
     /// True while a key press is being dispatched (WM_KEYDOWN / video-child key): commands it runs leave the OSD alone.
     bool keyInput_ = false;
     wvp::FrameStepController frameStep_{MakeFrameStepHooks()};
-    int videoKeyVk_ = 0;                            // last key pressed in the video child, until released (auto-repeat detection)
     bool topmostWanted_ = false;   // last ApplyWindowTopmost decision (mini player: true); WM_WINDOWPOSCHANGING keeps it
     bool pointerInside_ = false;
     struct KeyInputScope {
@@ -391,7 +397,7 @@ private:
     uint64_t debugNextMs_ = 0, hDebug_ = 0;
     int debugCols_ = 0;
     std::vector<dbg::OverlayLine> debugLines_, debugRows_;   // full text / wrapped+clipped rows last drawn
-    std::wstring lastOpenUrl_, lastOpenCmd_;
+    std::string lastOpenUrl_;
     wvp::OpenOptions lastOpenOpts_;
     wvp::OpenOptions effOpts_;               // lastOpenOpts_ + the live vf/af of the latest filter change (overlay / log)
     std::thread probeThread_;
@@ -403,7 +409,8 @@ private:
     bool popupWasVisible_ = false, popupAcrylicWasActive_ = false;
     uint64_t acrylicSystemCheckNextMs_ = 0, acrylicPresenterCheckNextMs_ = 0;
     acrylic::FallbackReason acrylicFallbackReason_ = acrylic::FallbackReason::NoVideo;
-    std::vector<wvp::BackdropRegion> acrylicAppliedRegions_;
+    std::vector<wvp::win32::BackdropRegion> acrylicAppliedRegions_;
+    bool SetPresenterBackdrop(const std::vector<wvp::win32::BackdropRegion>& regions);   // false without a presenter
     HRESULT lastDrawHr_ = S_OK, lastCommitHr_ = S_OK;
 
     AutoHide autoHide_;
@@ -416,16 +423,16 @@ private:
     std::unique_ptr<wvp::PlaybackController> ctl_;
     struct PendingPlay { std::vector<wvp::MediaItem> items; int start; bool replace; double startAt = -1; };
     std::optional<PendingPlay> pending_;
-    std::wstring currentPlaylistName_;   // empty = persistent unnamed playlist
+    std::string currentPlaylistName_;   // empty = persistent unnamed playlist
     std::vector<wvp::MediaItem> currentPlaylistItems_;
-    std::wstring historyCurrentUrl_, historyCurrentPlaylistName_;
+    std::string historyCurrentUrl_, historyCurrentPlaylistName_;
     int historyCurrentIndex_ = -1;
     uint64_t historyWriteAt_ = 0, playbackProgressUiAt_ = 0;
     std::string resumeDecision_;
     // QPC us at the steps of the last StateChanged handler (headless pause/resume latency notes)
     struct { double enter = 0, topmost = 0, synced = 0, saved = 0; } stateTiming_;
     bool suppressPlaylistPersistence_ = false;
-    bool playerFailed_ = false, playerCreating_ = false;
+    bool playerFailed_ = false;
 
     BarModel model_;
     wvp::PlayerState state_ = wvp::PlayerState::Idle;
@@ -457,7 +464,6 @@ public:
     int DebugCols() const { return debugCols_; }
     int LayerIndex(Layer l) { const auto& z = gfx_.ZOrder(); for (size_t i = 0; i < z.size(); i++) if (z[i] == LayerSurf(l).visual.Get()) return (int)i; return -1; }
     const std::string& LastTabDecision() const { return lastTabDecision_; }
-    const std::wstring& LastOpenCmd() const { return lastOpenCmd_; }
     /// Headless: opens the video context menu in the current mode, renders, checks it is painted into the popup layer
     /// and that the popup layer is above the bar and title layers; closes it again.
     HRESULT CheckPopupOverBar();
@@ -475,7 +481,6 @@ public:
     /// Number of accepted file-drop batches processed through the OLE target.
     int DropEvents() const { return dropEvents_; }
     HWND VideoHwnd() const { return video_; }
-    bool VideoDropHooked() const { return video_ && GetWindowLongPtrW(video_, GWLP_WNDPROC) == reinterpret_cast<LONG_PTR>(&App::VideoDropProc); }
     bool DropTargetsReady() const { return dropTarget_ && dropTargetMainRegistered_ && dropTargetVideoRegistered_; }
     /// Test/headless entry point shared with IDropTarget::Drop; `client` is in main-window device pixels.
     bool HandleDropAtClient(POINT client, const std::vector<std::wstring>& files);

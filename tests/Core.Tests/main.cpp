@@ -1,5 +1,5 @@
 // Test runner. Usage: PlayerCore.Tests.exe [name-substring-filter] [--no-integration]
-// Integration tests (libffplay) force SDL_AUDIODRIVER=dummy and use a hidden host window; nothing is shown.
+// Integration tests (libffplay) play on SDL's dummy audio driver with a recording presenter; nothing is shown.
 #include <cstdlib>
 #include <cstring>
 #include <exception>
@@ -7,7 +7,7 @@
 
 #include <windows.h>
 
-#include "wvp/TestGuard.h"
+#include "wvp/win32/TestGuard.h"
 #include "wvptest.h"
 
 int main(int argc, char** argv) {

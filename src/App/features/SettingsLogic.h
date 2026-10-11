@@ -26,19 +26,12 @@ const std::array<AccentChoice, kAccentCount>& AccentPalette();
 /// Index of the palette entry equal to argb (alpha ignored), -1 when custom or 0 (system).
 int AccentIndexFor(std::uint32_t argb);
 
-struct HwDecoderChoice { const wchar_t* value; const wchar_t* label; };   // value = AppSettings::hwDecoder / hwaccel option
-inline constexpr int kHwDecoderCount = 7;   // Auto, Prefer GPU, D3D11VA, D3D12VA, CUDA, DXVA2, Off
+struct HwDecoderChoice { const char* value; const wchar_t* label; };   // value = AppSettings::hwDecoder / hwaccel option
+inline constexpr int kHwDecoderCount = 6;   // Auto, Prefer GPU, D3D11VA, D3D12VA, DXVA2, Off
 const std::array<HwDecoderChoice, kHwDecoderCount>& HwDecoderChoices();
 /// Index of `value` in HwDecoderChoices(); unknown values -> 0 (Auto).
-int HwDecoderIndex(const std::wstring& value);
-std::wstring HwDecoderValue(int index);   // out of range -> "auto"
-
-struct VideoOutputChoice { const wchar_t* value; const wchar_t* label; };   // value = AppSettings::presenter
-inline constexpr int kVideoOutputCount = 3;   // Auto, Direct3D 11, SDL (fallback)
-const std::array<VideoOutputChoice, kVideoOutputCount>& VideoOutputChoices();
-/// Index of `value` in VideoOutputChoices(); unknown values -> 0 (Auto).
-int VideoOutputIndex(const std::wstring& value);
-std::wstring VideoOutputValue(int index);   // out of range -> "auto"
+int HwDecoderIndex(const std::string& value);
+std::string HwDecoderValue(int index);   // out of range -> "auto"
 
 inline constexpr int kAlwaysOnTopCount = 4;   // Disable, Enable, WhenPlaying, WhenFullscreen
 int AlwaysOnTopIndex(wvp::AlwaysOnTop m);
@@ -57,8 +50,7 @@ struct PageState {
     bool useSystemAccent = true;
     int accentIndex = -1;                // palette index shown selected when !useSystemAccent, -1 = custom colour
     int alwaysOnTopIndex = 0;            // 0 Disable, 1 Enable, 2 WhenPlaying, 3 WhenFullscreen
-    int hwDecoderIndex = 0;              // RadioGroup index into HwDecoderChoices(): Auto, Prefer GPU, D3D11VA, D3D12VA, CUDA, DXVA2, Off
-    int videoOutputIndex = 0;            // RadioGroup index into VideoOutputChoices(): Auto, Direct3D 11, SDL
+    int hwDecoderIndex = 0;              // RadioGroup index into HwDecoderChoices(): Auto, Prefer GPU, D3D11VA, D3D12VA, DXVA2, Off
     bool debugLogging = false;
     bool operator==(const PageState&) const = default;
 };

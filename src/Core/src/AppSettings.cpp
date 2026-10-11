@@ -5,7 +5,7 @@
 
 #include "wvp/JsonLite.h"
 #include "wvp/JsonWriter.h"
-#include "wvp/Utf.h"
+#include "wvp/Platform.h"
 
 namespace wvp {
 
@@ -24,8 +24,8 @@ void GetNum(const Value& o, std::string_view k, double& out) {
 void GetInt(const Value& o, std::string_view k, int& out, int lo, int hi) {
     if (auto* v = Member(o, k, Value::Kind::Number)) if (std::isfinite(v->n)) out = (int)std::clamp(v->n, (double)lo, (double)hi);
 }
-void GetStr(const Value& o, std::string_view k, std::wstring& out) {
-    if (auto* v = Member(o, k, Value::Kind::String)) out = ToWide(v->s);
+void GetStr(const Value& o, std::string_view k, std::string& out) {
+    if (auto* v = Member(o, k, Value::Kind::String)) out = v->s;
 }
 
 const char* ThemeName(ThemeSetting t) {
@@ -44,13 +44,6 @@ void WriteFilters(JsonWriter& w, const FilterSettings& f) {
     w.Prop("deinterlaceRate", f.deinterlaceRate == DeinterlaceRate::Field ? "Field" : "Frame");
     w.Prop("deinterlaceOnlyInterlaced", f.deinterlaceOnlyInterlaced);
     w.Prop("deinterlacePriority", f.deinterlacePriority == DeinterlacePriority::Quality ? "quality" : "efficiency");
-    w.Prop("brightness", f.brightness);
-    w.Prop("contrast", f.contrast);
-    w.Prop("saturation", f.saturation);
-    w.Prop("gamma", f.gamma);
-    w.Prop("rotation", (int)f.rotation);
-    w.Prop("flipHorizontal", f.flipHorizontal);
-    w.Prop("flipVertical", f.flipVertical);
     w.Prop("normalize", f.normalize);
     w.Key("eqGainsDb").BeginArray();
     for (double g : f.eqGainsDb) w.Number(g);
@@ -72,15 +65,6 @@ void ReadFilters(const Value& o, FilterSettings& f) {
         f.deinterlacePriority = v->s == "quality" ? DeinterlacePriority::Quality : DeinterlacePriority::Efficiency;
     if (auto* v = Member(o, "deinterlaceRate", Value::Kind::String)) f.deinterlaceRate = v->s == "Field" ? DeinterlaceRate::Field : DeinterlaceRate::Frame;
     GetBool(o, "deinterlaceOnlyInterlaced", f.deinterlaceOnlyInterlaced);
-    GetNum(o, "brightness", f.brightness);
-    GetNum(o, "contrast", f.contrast);
-    GetNum(o, "saturation", f.saturation);
-    GetNum(o, "gamma", f.gamma);
-    int rot = (int)f.rotation;
-    GetInt(o, "rotation", rot, -100000, 100000);
-    f.rotation = (Rotation)rot;
-    GetBool(o, "flipHorizontal", f.flipHorizontal);
-    GetBool(o, "flipVertical", f.flipVertical);
     GetBool(o, "normalize", f.normalize);
     if (auto* a = Member(o, "eqGainsDb", Value::Kind::Array)) {
         for (size_t i = 0; i < f.eqGainsDb.size() && i < a->arr.size(); i++)
@@ -115,29 +99,24 @@ void ReadPlacement(const Value& root, std::string_view key, WindowPlacement& p) 
 
 }
 
-bool IsValidHwDecoder(const std::wstring& v) {
-    return v == L"auto" || v == L"gpu" || v == L"d3d11va" || v == L"d3d12va" || v == L"cuda" || v == L"dxva2" || v == L"off";
+bool IsValidHwDecoder(const std::string& v) {
+    return v == "auto" || v == "gpu" || v == "off" || v == "d3d11va" || v == "d3d12va" || v == "dxva2" || v == "videotoolbox";
 }
 
-bool IsValidPresenter(const std::wstring& v) { return v == L"auto" || v == L"d3d11" || v == L"sdl"; }
-
-PlanPrefs PlanPrefsFor(const std::wstring& hwDecoder, const std::wstring& presenter) {
+PlanPrefs PlanPrefsFor(const std::string& hwDecoder) {
     PlanPrefs p;
-    if (hwDecoder == L"gpu") p.decoder = DecoderPref::PreferGpu;
-    else if (hwDecoder == L"off") p.decoder = DecoderPref::Software;
-    else if (hwDecoder == L"d3d11va" || hwDecoder == L"d3d12va" || hwDecoder == L"cuda" || hwDecoder == L"dxva2") {
+    if (hwDecoder == "gpu") p.decoder = DecoderPref::PreferGpu;
+    else if (hwDecoder == "off") p.decoder = DecoderPref::Software;
+    else if (hwDecoder != "auto" && IsValidHwDecoder(hwDecoder)) {
         p.decoder = DecoderPref::Forced;
-        for (wchar_t ch : hwDecoder) p.forcedDecoder.push_back(static_cast<char>(ch));   // ASCII device type names
+        p.forcedDecoder = hwDecoder;
     }
-    if (presenter == L"d3d11") p.presenter = PresenterPref::D3D11;
-    else if (presenter == L"sdl") p.presenter = PresenterPref::Sdl;
     return p;
 }
 
-SettingsStore::SettingsStore(std::wstring path) : path_(path.empty() ? DefaultPath() : std::move(path)) {}
+SettingsStore::SettingsStore(std::string path) : path_(path.empty() ? DefaultPath() : std::move(path)) {}
 
-std::wstring SettingsStore::AppDataDir() { return fileio::LocalAppDataApp(); }
-std::wstring SettingsStore::DefaultPath() { return AppDataDir() + L"\\settings.json"; }
+std::string SettingsStore::DefaultPath() { return platform::Combine(platform::AppDataDir(), "settings.json"); }
 
 std::string SettingsStore::ToJson(const AppSettings& s) {
     JsonWriter w;
@@ -147,7 +126,6 @@ std::string SettingsStore::ToJson(const AppSettings& s) {
     w.Prop("alwaysOnTop", AlwaysOnTopName(s.alwaysOnTop));
     w.Prop("hwDecoder", s.hwDecoder);
     w.Prop("hwDecoderLastOn", s.hwDecoderLastOn);
-    w.Prop("presenter", s.presenter);
     if (s.videoGpu.Automatic()) w.Prop("videoGpu", "auto");
     else {
         w.Key("videoGpu").BeginObject();
@@ -193,19 +171,14 @@ bool SettingsStore::FromJson(const std::string& utf8, AppSettings& out) {
         else if (v->s == "WhenFullscreen") out.alwaysOnTop = AlwaysOnTop::WhenFullscreen;
     }
     {
-        std::wstring dec;
+        std::string dec;
         GetStr(r, "hwDecoder", dec);
-        out.hwDecoder = IsValidHwDecoder(dec) ? dec : std::wstring(L"auto");
+        out.hwDecoder = IsValidHwDecoder(dec) ? dec : std::string("auto");
     }
     {
-        std::wstring last;
+        std::string last;
         GetStr(r, "hwDecoderLastOn", last);
-        out.hwDecoderLastOn = IsValidHwDecoder(last) && last != L"off" ? last : std::wstring(L"auto");
-    }
-    {
-        std::wstring pr;
-        if (Member(r, "presenter", Value::Kind::String)) GetStr(r, "presenter", pr);
-        out.presenter = IsValidPresenter(pr) ? pr : std::wstring(L"auto");
+        out.hwDecoderLastOn = IsValidHwDecoder(last) && last != "off" ? last : std::string("auto");
     }
     if (auto* g = Member(r, "videoGpu", Value::Kind::Object)) {
         if (auto* v = Member(*g, "luid", Value::Kind::String)) out.videoGpu.luid = v->s;
@@ -234,7 +207,7 @@ AppSettings SettingsStore::Load() const {
     AppSettings s;
     try {
         std::string bytes;
-        if (!fileio::ReadAllBytes(path_, bytes)) return AppSettings{};
+        if (platform::ReadAllBytes(path_, bytes, (1ull << 30) - 1) != platform::ReadResult::Ok) return AppSettings{};
         if (!FromJson(bytes, s)) return AppSettings{};
     } catch (...) {
         return AppSettings{};
@@ -243,7 +216,7 @@ AppSettings SettingsStore::Load() const {
 }
 
 bool SettingsStore::Save(const AppSettings& s) const {
-    try { return fileio::AtomicWriteFile(path_, ToJson(s)); }
+    try { return platform::AtomicWriteFile(path_, ToJson(s)); }
     catch (...) { return false; }
 }
 

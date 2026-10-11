@@ -27,8 +27,8 @@ set_source_files_properties(app.rc PROPERTIES
     OBJECT_DEPENDS "${WVP_ROOT}/assets/icon/aribplayer.ico;${WVP_ROOT}/THIRD-PARTY-NOTICES.txt;${CMAKE_CURRENT_BINARY_DIR}/generated/aribplayer_version.h")
 wvp_link_executable(PlayerApp
     LIBS d3d11.lib dxgi.lib d2d1.lib dwrite.lib dcomp.lib dwmapi.lib shell32.lib ole32.lib oleaut32.lib uiautomationcore.lib
-         advapi32.lib winhttp.lib windowscodecs.lib comctl32.lib shlwapi.lib uxtheme.lib
-    PROJECTS PlayerCore PlayerUi)
+         advapi32.lib windowscodecs.lib comctl32.lib shlwapi.lib uxtheme.lib
+    PROJECTS PlayerPresenter PlayerCore PlayerUi)
 target_include_directories(PlayerApp BEFORE PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
 target_link_options(PlayerApp PRIVATE $<$<CONFIG:Debug>:/INCREMENTAL:NO>)
 

@@ -8,13 +8,14 @@
 #include "features/FiltersPanel.h"
 #include "features/FxModel.h"
 #include "features/FxUtil.h"
+#include "wvp/win32/Utf.h"
 #include "pui/Glyphs.h"
 #include "pui/InfoBar.h"
 
 namespace app {
 
 namespace {
-AudioOnlyState g_audio;
+bool g_audioOnly = false;
 pui::Widget* g_errBar = nullptr;
 UINT_PTR g_errTimer = 0;
 
@@ -84,10 +85,11 @@ void ShowPlaybackError(AppContext& ctx, const wvp::PlayerErrorInfo& e) {
     pui::InfoBar* raw = bar.get();
     bar->SetSeverity(pui::InfoBarSeverity::Error);
     bar->SetTitle(Tr(L"Playback error", L"재생 오류"));
-    std::wstring msg = e.Message.empty() ? Tr(L"The media could not be played.", L"미디어를 재생할 수 없습니다.") : e.Message;
+    std::wstring msg = e.Message.empty() ? Tr(L"The media could not be played.", L"미디어를 재생할 수 없습니다.") : wvp::ToWide(e.Message);
     if (!e.Url.empty()) {
-        size_t i = e.Url.find_last_of(L"\\/");
-        msg += L" (" + (i == std::wstring::npos ? e.Url : e.Url.substr(i + 1)) + L")";
+        const std::wstring url = wvp::ToWide(e.Url);
+        size_t i = url.find_last_of(L"\\/");
+        msg += L" (" + (i == std::wstring::npos ? url : url.substr(i + 1)) + L")";
     }
     bar->SetMessage(msg);
     bar->SetClosable(true);
@@ -110,20 +112,7 @@ void ShowPlaybackError(AppContext& ctx, const wvp::PlayerErrorInfo& e) {
     }, false);
 }
 
-const AudioOnlyState& AudioOnly() { return g_audio; }
-
-void PaintAudioOnlyPlaceholder(pui::IRenderer& r, const pui::Theme&, const pui::RectF& a, const std::wstring& title) {
-    if (a.Empty()) return;
-    float cx = a.cx(), cy = a.cy();
-    pui::TextStyle gs = pui::IconTextStyle(72);
-    r.Text(std::wstring(1, pui::glyph::Music), pui::RectF::XYWH(cx - 60, cy - 90, 120, 90), gs, pui::Color(0xB3FFFFFF));
-    if (!title.empty()) {
-        pui::TextStyle ts;
-        ts.size = 20; ts.weight = 600; ts.align = pui::TextAlign::Center; ts.valign = pui::ParaAlign::Top;
-        float w = std::max(60.f, std::min(a.w() - 48, 720.f));
-        r.Text(title, pui::RectF::XYWH(cx - w / 2, cy + 8, w, 32), ts, pui::Color(0xFFFFFFFF));
-    }
-}
+bool AudioOnlyMedia() { return g_audioOnly; }
 
 void InitPlaybackExtras(AppContext& ctx) {
     auto hookPlayer = [&ctx] {
@@ -137,16 +126,12 @@ void InitPlaybackExtras(AppContext& ctx) {
     if (ctx.Player()) hookPlayer();
     else ctx.OnPlayerReady.add(hookPlayer);
 
-    ctx.OnMediaOpened.add([&ctx](const wvp::MediaItem* it) {
-        g_audio.audioOnly = false;
-        g_audio.title = it ? it->DisplayTitle() : std::wstring();
+    ctx.OnMediaOpened.add([&ctx](const wvp::MediaItem*) {
+        g_audioOnly = false;
         ctx.RequestRedraw();
     });
     ctx.OnMediaPrepared.add([&ctx](const wvp::MediaPreparedInfo& p) {
-        g_audio.audioOnly = !p.HasVideo && p.HasAudio;
-        if (!p.Title.empty()) g_audio.title = p.Title;
-        else if (g_audio.title.empty())
-            if (auto* c = ctx.Controller()) if (auto* it = c->Current()) g_audio.title = it->DisplayTitle();
+        g_audioOnly = !p.HasVideo && p.HasAudio;
         RefreshZoomAspect(ctx);
         ctx.RequestRedraw();
     });

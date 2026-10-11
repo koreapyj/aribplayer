@@ -41,8 +41,6 @@ std::wstring LibffplayBuildStamp();
 /// Pure formatter used by both (FILETIME -> "built YYYY-MM-DD HH:MM:SS" local time), "" for a zero time.
 std::wstring FormatBuildTime(unsigned long long fileTime100ns);
 
-/// Sets the controller's first-class decoder choice (AppSettings::hwDecoder value) and drops any explicit hwaccel base option.
-void ApplyHwDecoder(wvp::PlaybackController& ctl, const std::wstring& decoder);
 /// Sets the ARIB font, superimpose and Windows caption-style open options before every media open.
 void ApplyCaptionOpenOptions(wvp::PlaybackController& ctl, const wvp::AppSettings& settings);
 /// Refreshes the Windows Closed Caption Properties mapping and ARIB caption decoder when the ClosedCaptioning registry key
@@ -56,8 +54,6 @@ void StartSystemCaptionSettingsWatch(AppContext& ctx);
 void StopSystemCaptionSettingsWatch();
 /// Bundled font location next to the executable (empty override means this path).
 std::wstring BundledAribFontPath();
-/// The controller's (legacy) decoder choice for a settings value: "gpu" (Prefer GPU, planner only) -> "auto"; invalid -> "auto".
-std::wstring LegacyHwDecoder(const std::wstring& decoder);
 
 /// What ApplySettingsLive did, for the toast and the tests.
 struct LiveApplyResult {
@@ -65,8 +61,9 @@ struct LiveApplyResult {
     std::wstring toast;             // "" = nothing to say
 };
 /// Applies the playback-affecting differences between `before` and `after` to the running playback:
-///  * hwDecoder -> controller property; when media is playing/paused: ReopenCurrentHere (position, pause kept; audio/subtitle
-///    selection is restored by the app through SelectTrack after the new Prepared).
+///  * hwDecoder -> the planner's decoder preference; when the plan's decoder changes and media is playing/paused:
+///    ReopenCurrentHere (position, pause kept; audio/subtitle selection is restored by the app through SelectTrack after
+///    the new Prepared).
 LiveApplyResult ApplySettingsLive(wvp::PlaybackController& ctl, wvp::FilterManager& fm, const wvp::AppSettings& before,
                                   const wvp::AppSettings& after);
 }

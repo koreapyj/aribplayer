@@ -24,6 +24,8 @@ std::string Num(const std::optional<double>& v, const char* f = "%.2f") { return
 std::string Int(const std::optional<int>& v) { return v ? std::to_string(*v) : "?"; }
 std::string I64(const std::optional<std::int64_t>& v) { return v ? std::to_string(*v) : "?"; }
 std::string S(const std::string& s, const char* dflt = "?") { return s.empty() ? dflt : s; }
+// The drawing path the presenter reports ("d3d11:videoprocessor"), else its name.
+std::string PresenterOutput(const wvp::DebugInfo& d) { return d.Presenter.Renderer.empty() ? d.Presenter.Name : d.Presenter.Renderer; }
 std::string Size(const std::optional<int>& w, const std::optional<int>& h) { return (w && h) ? std::to_string(*w) + "x" + std::to_string(*h) : "?"; }
 std::string Bytes(const std::optional<std::int64_t>& v) {
     if (!v) return "?";
@@ -326,7 +328,6 @@ std::vector<OverlayLine> BuildOverlayLines(const OverlayContext& c) {
     auto openLines = [&] {
         if (!c.url.empty()) Add(L, LineKind::Dim, Pad("open") + c.url);
         if (!c.openOptions.empty()) Add(L, LineKind::Normal, Pad("options") + c.openOptions);
-        if (!c.ffplayCmd.empty()) Add(L, LineKind::Dim, Pad("ffplay") + c.ffplayCmd);
     };
     if (!c.haveJson || !d.Valid) {
         Add(L, LineKind::Warn, "no debug info: nothing is open");
@@ -337,7 +338,7 @@ std::vector<OverlayLine> BuildOverlayLines(const OverlayContext& c) {
     {
         const auto& v = d.Video;
         int nonZero = (v.FramesHwDirect.value_or(0) > 0) + (v.FramesHwDownload.value_or(0) > 0) + (v.FramesSoftware.value_or(0) > 0);
-        std::string t = Pad("renderer") + S(d.Renderer) + "   frame_path " + S(v.FramePath) + "  (hw_direct " + I64(v.FramesHwDirect) + " | hw_download " +
+        std::string t = Pad("output") + S(PresenterOutput(d)) + "   frame_path " + S(v.FramePath) + "  (hw_direct " + I64(v.FramesHwDirect) + " | hw_download " +
                         I64(v.FramesHwDownload) + " | software " + I64(v.FramesSoftware) + ")";
         bool warn = nonZero > 1;
         if (warn) t += "  PATH CHANGED";
@@ -432,7 +433,7 @@ std::vector<OverlayLine> BuildOverlayLines(const OverlayContext& c) {
             auto dom = *wvp::PipelineTable::DomainFromSuffix(*roundTrip);
             std::string label = wvp::DomainName(dom);
             Add(L, LineKind::Dim, Pad("path") + (hw ? "GPU decode -> CPU download -> " : "CPU decode -> ") + label + " upload + " + *roundTrip +
-                                      " -> CPU download -> " + (d.Renderer.empty() ? "renderer" : d.Renderer));
+                                      " -> CPU download -> " + S(PresenterOutput(d), "presenter"));
         }
         if (d.HasAudio) {
             double want = c.requestedSpeed > 0 ? c.requestedSpeed : d.Speed.value_or(1.0);

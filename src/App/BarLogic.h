@@ -42,7 +42,7 @@ constexpr int kBarIdleHideMs = 3000, kBarShowMs = 300, kBarHideMs = 500;
 // the cursor leaves the overlay's own rect.
 constexpr float kEdgeRightDip = 12;
 
-// Dock metrics (DIP), from the prototype main-window.html.
+// Dock metrics (DIP).
 constexpr float kDockSeekTopDip = 10, kDockSeekH = 20, kDockRowTopDip = 36, kDockBtnDip = 40, kDockBtnGapDip = 2;
 constexpr float kDockSeekInsetDip = 16, kDockSeekGapDip = 12, kDockTimeLabelDip = 52, kDockThumbDip = 20;
 constexpr float kDockSideDip = 12, kDockGroupGapDip = 8, kDockChipLeadDip = 8;

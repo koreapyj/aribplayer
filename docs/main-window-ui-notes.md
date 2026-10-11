@@ -2,7 +2,8 @@
 
 The main window is a Fluent (WinUI-style) layout. Visual spec: `.ref/prototype-unpacked/main-window.html`
 (1280x760 DIP). All widgets are `pui` widgets drawn with Direct2D into DirectComposition
-layers; the video is an SDL child window. Pure layout/logic lives in headers covered by `--logictest`
+layers; the video is a child window that the D3D11 presenter draws into (its own swap chain window, disabled, so the
+input reaches the video child). Pure layout/logic lives in headers covered by `--logictest`
 (`src/App/ShellLogic.h`, `BarLogic.h`, `WindowSizing.h`, `Commands.cpp`, `shell/PlaylistPanelLogic.h`, `features/*Logic.*`).
 
 ## 1. Layout math
@@ -36,7 +37,7 @@ with the panel hidden. The overlay panel and the full-screen edge panel use the 
 | Mini player | strip 44 (no slide) | below the strip | overlay, auto-hides | hidden; toggle disabled |
 
 Window size keys 1-5 (`WindowSizing.h`): the window is sized so the VIDEO rect gets 0.5x / 1x / 1.5x / 2x of the display size
-(SAR and rotation applied) or the work area for "Max". `ClientWidthForVideo` / `ClientHeightForVideo` solve client size from the
+(SAR applied) or the work area for "Max". `ClientWidthForVideo` / `ClientHeightForVideo` solve client size from the
 video size against `ComputeShellLayout` itself (gutters, strip, dock, and the panel when it would dock at that width);
 the non-client frame is added from `GetWindowRect - GetClientRect`. Each axis is clamped to the work area independently.
 
@@ -121,7 +122,9 @@ releases it. Panel keys apply while the panel is ACTIVE (`PlaylistPanel::Active`
 the video / bar / title or hiding the panel deactivates it. Keys go to the active panel first (`PlaylistPanel::OnKeyDown`: accelerators,
 then Up/Down/Home/End/PageUp/PageDown/Enter/Del on the list), everything unhandled falls through to the player shortcuts, so Ctrl+O/U/T/S,
 Enter and Del mean the panel's action while it is active and the player's otherwise. Tab toggles the debug overlay (Shift+Tab does nothing).
-A left press on the video drags the window past the drag threshold (`App::OnVideoInput`): the native move loop is started with the press point.
+Mouse input on the video is the video child's own (`App::VideoProc` -> `App::OnVideoInput`: move, button down / up, double click;
+keys and the wheel are forwarded to the main window). A left press on the video drags the window past the drag threshold
+(`App::VideoPressDrag`): the native move loop is started with the press point.
 
 Edge snapping (`WindowSnap.h`, `App::SnapWindowMessage` on WM_MOVING / WM_SIZING; `SnapTracker` lives for one move / size loop):
 - Threshold `kSnapThresholdDip` = 12 DIP. Targets: monitor work areas and whole monitor bounds (taskbar edge and screen edge) and other `aribplayer.Main` windows (outer

@@ -2,10 +2,13 @@
 // Play queue on top of one IMediaPlayer with current index,
 // next/previous, stable shuffle, repeat modes, auto-advance on Ended (guarded by a generation counter)
 // and persistence of volume/mute/filters across items.
+// Every open uses the current pipeline plan: while there is none (capabilities not probed yet, or no valid pipeline), the
+// open waits as the pending open and runs when OpenPending() is called or a filter change arrives with a plan.
 // Not thread-safe: use from the UI thread. When the player raises Ended on another thread, pass a `post`
 // function so auto-advance (Stop/Open) is posted onto the owning thread.
 #include <functional>
 #include <memory>
+#include <optional>
 #include <random>
 #include <string>
 #include <utility>
@@ -21,28 +24,19 @@ enum class RepeatMode { Off, All, One };
 
 enum class MoveOp { Top, Up, Down, Bottom };
 
-/// Supplies the vf/af strings applied on every Open.
+/// Supplies the options applied on every Open.
 struct FilterProvider {
-    std::function<std::wstring()> videoFilter;       // may be empty function
-    std::function<std::wstring()> audioFilter;
-    /// Planner mode: the open options of the current plan (hwaccel, hwframes, presenter, vf, filter_hw_device).
-    /// Empty function or empty result (and planActive false/empty) = legacy behaviour. Replaces videoFilter /
-    /// the controller's hwDecoder for the video side; an explicit BaseOptions hwaccel still wins.
-    std::function<OpenOptions()> planOptions;
-    /// True when a plan is active even though it needs no options (software decode, no vf, sdl presenter).
-    std::function<bool()> planActive;
+    /// The open options of the current pipeline plan (hwaccel, vcodec, hwframes, vf, filter_hw_device); empty for a software
+    /// plan without filters. nullopt while there is no plan: the open waits. An empty function never has a plan.
+    std::function<std::optional<OpenOptions>()> planOptions;
+    std::function<std::string()> audioFilter;   // may be an empty function
 };
-
-struct FilterCommand { std::wstring target, command, argument; };
 
 /// Forwarded live to the player via ApplyFilterChange().
 struct FilterChange {
     bool videoRebuild = false, audioRebuild = false;
-    bool reopen = false;                  // planner: decoder/presenter/hwframes/filter device changed: reopen the item (also sets videoRebuild)
-    bool presenterParamsChanged = false;  // planner: presenter-applied parameters (rotation, flips, eq) changed
-    PresenterParams presenterParams;      // the new parameters (valid when presenterParamsChanged and no reopen)
-    std::wstring videoFilter, audioFilter;
-    std::vector<FilterCommand> commands;
+    bool reopen = false;                  // planner: decoder/hwframes/filter device changed: reopen the item (also sets videoRebuild)
+    std::string videoFilter, audioFilter;
 };
 
 class PlaybackController {
@@ -59,46 +53,43 @@ public:
 
     IMediaPlayer& Player() { return *player_; }
 
-    /// Extra ffplay/AVFormat options passed on every Open (e.g. hwaccel, user_agent). vf/af come from the filter provider.
+    /// Extra ffplay/AVFormat options passed on every Open (e.g. user_agent, caption options). The plan's options (decoder,
+    /// vf, filter device) and af from the filter provider are applied over them.
     OpenOptions BaseOptions;
-    void SetBaseOption(const std::wstring& key, const std::wstring& value);
+    void SetBaseOption(const std::string& key, const std::string& value);
 
-    /// First-class decoder choice, applied by every Open (so it cannot be lost to hook ordering): "auto" (default; libffplay tries
-    /// d3d11va, d3d12va, cuda, dxva2, then software), a device type name ("d3d11va", "d3d12va", "cuda", "dxva2"), or "off"/"" for
-    /// software decoding. An explicit `hwaccel` entry in BaseOptions wins over this property.
-    void SetHwDecoder(const std::wstring& name) { hwDecoder_ = name; }
-    const std::wstring& HwDecoder() const { return hwDecoder_; }
-    /// The value that goes into the `hwaccel` option for a decoder choice, "" when software decoding is wanted.
-    static std::wstring HwaccelOptionFor(const std::wstring& decoderChoice);
+    /// Runs the pending open (an open that waited for a plan) when the provider now has a plan. False when nothing is pending,
+    /// the queue moved on since (a later open, stop or queue change cancels it), or there is still no plan.
+    bool OpenPending();
+    bool HasPendingOpen() const { return pending_ && pending_->generation == generation_; }
 
     /// Re-opens the current item at `position` seconds (ffplay `ss`). When `paused` it opens with start_paused=1 (the landing frame is
     /// presented, Position() is valid, audio starts only on play; Pause() at Prepared if the player is not paused). Volume/mute persist in
     /// the player; audio/subtitle track selection is NOT restored (the native API has no select-by-index call, only cycling).
     /// Returns false when nothing is current.
     bool ReopenCurrent(double position, bool paused);
-    /// ReopenCurrent at the player's current Position()/paused state. Used when a setting that needs a reopen changes.
+    /// ReopenCurrent at the player's current Position()/paused state. Used when a setting that needs a reopen changes. With
+    /// an open pending it runs that open instead (OpenPending).
     bool ReopenCurrentHere();
 
     void SetFilters(FilterProvider p) { filters_ = std::move(p); }
 
-    /// Diagnostics hook: called right before every player->Open with the url and the FINAL options (BaseOptions incl.
-    /// hwaccel, vf/af from the filter provider, filter_hw_device, ...). Purely observational.
-    std::function<void(const std::wstring& url, const OpenOptions& options)> onOpening;
-    /// Called at the start of every OpenCurrent, before the options are built (so the host can re-plan for the new url).
-    std::function<void(const std::wstring& url)> beforeOpen;
+    /// Diagnostics hook: called right before every player->Open with the url and the FINAL options (BaseOptions, the plan's
+    /// options, af, ss, start_paused). Purely observational.
+    std::function<void(const std::string& url, const OpenOptions& options)> onOpening;
+    /// Called at the start of every open of an item, before the plan is asked for (so the host can re-plan for the new url).
+    /// Not called again when a pending open runs.
+    std::function<void(const std::string& url)> beforeOpen;
     /// Diagnostics hook: called at the start of ApplyFilterChange with the change being forwarded.
     std::function<void(const FilterChange& change)> onFilterChange;
-    /// Called when the player refused live presenter parameters (SetPresenterParams returned `err` != 0): the host marks the
-    /// absorption as impossible (FilterManager::PresenterParamsRejected) and applies the resulting change. Not called when the
-    /// player has no open media (the parameters then simply ride on the next open).
-    std::function<void(int err, const PresenterParams& rejected)> onPresenterParamsRejected;
     /// Resolves the start offset for every newly started item. requestedPosition is -1 when no caller preference was supplied.
     /// The host applies its resume policy here so transport, queue, and auto-advance opens all use the same decision.
     std::function<double(const MediaItem& item, double requestedPosition)> resolveResumePosition;
     /// Called before the current item is left, stopped, or removed, while Current() still refers to that item.
     /// Hosts use this to force-persist its last playback position before the player is stopped or the queue changes.
     std::function<void()> beforeLeavingCurrent;
-    /// Forwards a live filter change (rebuild strings and commands) to the player.
+    /// Forwards a live filter change (rebuild strings, reopen) to the player. With an open pending it runs that open instead
+    /// when there is a plan now.
     void ApplyFilterChange(const FilterChange& c);
 
     Event<> QueueChanged;
@@ -160,6 +151,11 @@ private:
     void AdvanceAfterEnd(int gen);
     void NotifyLeavingCurrent();
     void OpenCurrent(double startAt = -1, bool applyResumeRule = true);
+    struct PendingOpen {
+        int generation = 0;
+        double startAt = -1;
+        bool paused = false;
+    };
     void RebuildOrder(bool keepCurrent);
     void ExtendOrder(int firstNew);
     void ApplyPermutation(const std::vector<int>& perm);   // perm[new] = old; no-op for the identity
@@ -180,7 +176,7 @@ private:
     std::mt19937 rng_;
     bool disposed_ = false;
     FilterProvider filters_;
-    std::wstring hwDecoder_ = L"auto";
+    std::optional<PendingOpen> pending_;   // the open of the current item that waits for a plan
     Event<const MediaPreparedInfo&>::Token reopenToken_ = 0;
     bool openPaused_ = false;   // the next OpenCurrent passes start_paused=1 (ReopenCurrent while paused)
     Event<>::Token endedToken_ = 0;

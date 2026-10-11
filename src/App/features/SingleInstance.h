@@ -11,7 +11,7 @@ namespace app {
 class AppContext;
 
 /// dwData of the WM_COPYDATA command-line message.
-constexpr ULONG_PTR kCopyDataMagic = 0x41525031;   // 'ARP1' (an older build's 'WVP1' messages are ignored)
+constexpr ULONG_PTR kCopyDataMagic = 0x41525031;   // 'ARP1'
 
 /// true = another instance exists and received the args (the caller exits). Otherwise this process claims the
 /// per-session mutex "Local\aribplayer.SingleInstance" and returns false. Options (--x) are not forwarded.

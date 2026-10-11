@@ -1,7 +1,7 @@
 #pragma once
 // Pure interface (plus public multicast events) so playback logic can be tested with a fake player.
 // Control methods return 0 on success or a negative AVERROR.
-// Events are raised on the thread that calls FfPlayer::DispatchPendingEvents() (the UI thread).
+// Events are raised on the UI thread (FfPlayer runs them through its UiPost).
 #include <optional>
 #include <string>
 #include <utility>
@@ -13,7 +13,7 @@
 namespace wvp {
 
 // Ordered key=value open options (ffplay option names without '-', AVFormat/AVCodec options, ...).
-using OpenOptions = std::vector<std::pair<std::wstring, std::wstring>>;
+using OpenOptions = std::vector<std::pair<std::string, std::string>>;
 
 enum class SubtitleLayer : int { Caption = 0, Superimpose = 1 };
 
@@ -27,9 +27,8 @@ public:
     Event<bool> BufferingChanged;
     Event<> Ended;
     Event<const PlayerErrorInfo&> Error;
-    Event<const InputEventArgs&> Input;
     Event<const FilterErrorInfo&> FilterError;
-    Event<const PresenterErrorInfo&> PresenterError;   // the d3d11 presenter failed; libffplay fell back to SDL
+    Event<const PresenterErrorInfo&> PresenterError;   // the presenter stopped for this open; the host reopens
     Event<int, bool> FrameStepDone;               // StepFrame finished (after its PositionChanged): direction, a frame was presented
     Event<int, bool, double, double> KeyframeSeekDone;   // SeekKeyframe finished (after its PositionChanged): direction, a keyframe was presented,
                                                   // presented output position and its source PTS (media-relative seconds, -1 when none)
@@ -42,7 +41,7 @@ public:
     virtual double Position() = 0;                // seconds, NaN if unknown
     virtual double Duration() = 0;                // seconds, <= 0 if unknown/live
 
-    virtual int Open(const std::wstring& url, const OpenOptions& options = {}) = 0;
+    virtual int Open(const std::string& url, const OpenOptions& options = {}) = 0;
     virtual int Stop() = 0;
     virtual int Play() = 0;
     virtual int Pause() = 0;
@@ -67,15 +66,10 @@ public:
     virtual int AudioPreference() const { return 0; }
     /// Hides/shows a decoded subtitle layer without stopping its decoder. Unsupported backends return -22.
     virtual int SetSubtitleVisible(SubtitleLayer layer, bool on) { (void)layer; (void)on; return -22; }
-    virtual int SetVideoFilter(const std::wstring& vf) = 0;   // empty = none
-    virtual int SetAudioFilter(const std::wstring& af) = 0;
-    virtual int SendFilterCommand(const std::wstring& target, const std::wstring& command, const std::wstring& argument) = 0;
+    virtual int SetVideoFilter(const std::string& vf) = 0;   // empty = none
+    virtual int SetAudioFilter(const std::string& af) = 0;
+    virtual int SendFilterCommand(const std::string& target, const std::string& command, const std::string& argument) = 0;
     virtual std::optional<MediaInfo> GetMediaInfo() = 0;
-    // Live presenter parameters (rotation/flip/eq the d3d11 presenter applies itself). 0 or a negative error: FFP_EINVAL-like
-    // (-22) when the presenter cannot apply them (state unchanged). Default: unsupported.
-    virtual int SetPresenterParams(const PresenterParams&) { return -22; }
-    // Acrylic backdrop regions; count 0 clears. -22 when unsupported. Default: unsupported.
-    virtual int SetBackdropRegions(const BackdropRegion*, int) { return -22; }
     // nullopt when no frame was displayed yet (or on error).
     virtual std::optional<BgraFrame> Snapshot() = 0;
     /// Captures with optional subtitle composition. The default implementation captures video only.

@@ -1,5 +1,5 @@
 #pragma once
-// Strings are UTF-16 (std::wstring); empty means null/absent.
+// Strings are UTF-8; empty means null/absent.
 #include <cmath>
 #include <cstdint>
 #include <optional>
@@ -15,7 +15,7 @@ struct MediaPreparedInfo {
     double Duration = 0;
     bool Seekable = false, HasVideo = false, HasAudio = false;
     int Width = 0, Height = 0, SarNum = 0, SarDen = 0;
-    std::wstring Title;
+    std::string Title;
 
     // Display size after applying the sample aspect ratio.
     int DisplayWidth() const {
@@ -30,82 +30,48 @@ struct MediaPreparedInfo {
 
 struct PlayerErrorInfo {
     int Code = 0;
-    std::wstring Message;
-    std::wstring Url;
+    std::string Message;
+    std::string Url;
     bool DeviceLost = false;       // the d3d11va decoder's device was removed ("device_lost"): rebind, not a media error
     std::string RemovedReason;     // "removed_reason"
 };
 
 // Type is "video" or "audio".
 struct FilterErrorInfo {
-    std::wstring Type;
-    std::wstring Filter;
+    std::string Type;
+    std::string Filter;
     int Code = 0;
-    std::wstring Message;
+    std::string Message;
     bool HwframesFallback = false;   // libffplay fell back from hwframes=keep to download ("hwframes_fallback":true)
 };
 
-/// Parameters a presenter applies itself (live, no graph rebuild).
-struct PresenterParams {
-    int rotation = 0;                    // 0, 90, 180, 270 clockwise
-    bool flipH = false, flipV = false;   // after rotation (same composition as the filter path: transpose then hflip/vflip)
-    bool eq = false;                     // brightness/contrast/saturation/gamma below are applied
-    double brightness = 0, contrast = 1, saturation = 1, gamma = 1;   // ffmpeg eq semantics and ranges
-    bool operator==(const PresenterParams&) const = default;
-    bool IsIdentity() const { return rotation == 0 && !flipH && !flipV && !eq; }
-};
-
-/// libffplay presenter params JSON: {"rotation":90,"flip_h":false,"flip_v":false,"eq":{"brightness":..,"contrast":..,"saturation":..,"gamma":..}|null}
-/// (the presenter_params open option and ffp_set_presenter_params).
-std::wstring PresenterParamsJson(const PresenterParams& pp);
-
-/// Plain C-layout mirror of FFPBackdropRegion; field order/types must match ffplay.h exactly.
-/// Colors are 0xAARRGGBB-style packed values as defined by libffplay; coordinates are in output-window pixels.
-struct BackdropRegion {
-    int x = 0, y = 0, width = 0, height = 0;
-    float corner_radius = 0;
-    std::uint32_t tint_color = 0;
-    float tint_opacity = 0;
-    std::uint32_t luminosity_color = 0;
-    float luminosity_opacity = 0;
-    int noise = 0;
-    int z = 0;
-};
-static_assert(sizeof(BackdropRegion) == 44, "BackdropRegion must match FFPBackdropRegion");
-
-/// FFP_EVENT_PRESENTER_ERROR {"presenter","error","fallback"}.
+/// FFP_EVENT_PRESENTER_ERROR {"presenter","error","device_lost","removed_reason"}: the presenter stopped for this open; the
+/// host reopens (the presenter recovers its device in its next open).
 struct PresenterErrorInfo {
-    std::wstring Presenter, Error, Fallback;
-    bool DeviceLost = false;       // the presenter's device was removed / reset ("device_lost"): rebind, not a d3d11 failure
+    std::string Presenter, Error;  // Presenter: the FFPPresenter name
+    bool DeviceLost = false;       // the presenter's device was removed / reset ("device_lost")
     std::string RemovedReason;     // "0x887a0005" ... ("removed_reason")
 };
 
-enum class InputKind { Move, Down, Up, DoubleClick, Wheel, KeyDown, KeyUp };
-
-enum class InputModifiers : int { None = 0, Shift = 1, Ctrl = 2, Alt = 4 };
-
-// Typed INPUT event. Coordinates are client pixels of the video HWND.
-struct InputEventArgs {
-    InputKind Kind = InputKind::Move;
-    int X = 0, Y = 0, Button = 0, Buttons = 0, Delta = 0, VirtualKey = 0;
-    InputModifiers Modifiers = InputModifiers::None;
-};
+/// libaribcaption's "font" option value (the "arib_font" open option) for a font file: "file:<path>" with '/' separators
+/// (the option parser reads a backslash as an escape). A value that already starts with "file:" only gets the separators.
+std::string AribFontOption(const std::string& fontFile);
 
 enum class StreamType { Unknown, Video, Audio, Subtitle };
 
 struct StreamInfo {
     int Index = 0;
     StreamType Type = StreamType::Unknown;
-    std::wstring Codec;
+    std::string Codec;
     bool Selected = false;
-    std::wstring Language, Title;
-    std::wstring AribType;                 // "caption" | "superimpose"; empty for other subtitle streams
+    std::string Language, Title;
+    std::string AribType;                 // "caption" | "superimpose"; empty for other subtitle streams
     int ComponentTag = -1;
     int Width = 0, Height = 0, SarNum = 0, SarDen = 0;
     double Fps = 0;
-    std::wstring PixFmt;
-    std::wstring FourCC;                   // 4 chars from libffplay (container tag or RIFF tag); empty when none
-    std::wstring ColorTransfer;            // video: av_color_transfer_name ("smpte2084", "arib-std-b67", "bt709" ...)
+    std::string PixFmt;
+    std::string FourCC;                   // 4 chars from libffplay (container tag or RIFF tag); empty when none
+    std::string ColorTransfer;            // video: av_color_transfer_name ("smpte2084", "arib-std-b67", "bt709" ...)
     int SampleRate = 0, Channels = 0;
 };
 
@@ -118,7 +84,7 @@ struct AribAudioInfo {
 };
 
 struct MediaInfo {
-    std::wstring Url, Title, Format;
+    std::string Url, Title, Format;
     double Duration = 0;
     bool Seekable = false;
     std::int64_t BitRate = 0;

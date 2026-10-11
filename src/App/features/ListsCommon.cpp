@@ -7,6 +7,9 @@
 #include "features/OpenFlows.h"
 #include "features/TextInputDialog.h"
 #include "pui/Glyphs.h"
+#include "wvp/Platform.h"
+#include "wvp/Utf8.h"
+#include "wvp/win32/Utf.h"
 
 namespace app::lists {
 
@@ -15,19 +18,14 @@ std::wstring ItemCountText(int n) {
     return TrW(n == 1 ? L"1 item" : std::to_wstring(n) + L" items", std::to_wstring(n) + L"개 항목");
 }
 
-std::wstring TrimName(const std::wstring& name) {
-    size_t b = 0, e = name.size();
-    while (b < e && iswspace(name[b])) b++;
-    while (e > b && iswspace(name[e - 1])) e--;
-    return name.substr(b, e - b);
-}
+std::string TrimName(const std::string& name) { return std::string(wvp::utf8::Trim(name)); }
 
-std::wstring ValidatePlaylistName(const wvp::PlaylistStore& store, const std::wstring& rawName, const std::wstring& renamingFrom) {
-    std::wstring name = TrimName(rawName);
+std::wstring ValidatePlaylistName(const wvp::PlaylistStore& store, const std::string& rawName, const std::string& renamingFrom) {
+    std::string name = TrimName(rawName);
     if (name.empty()) return Tr(L"Enter a name for the playlist.", L"재생목록 이름을 입력하세요.");
     if (!wvp::PlaylistStore::IsValidName(name))
         return Tr(L"A playlist name can't contain < > : \" / \\ | ? * and can have at most 100 characters.", L"재생목록 이름에는 < > : \" / \\ | ? * 문자를 사용할 수 없으며 최대 100자까지 입력할 수 있습니다.");
-    if (!renamingFrom.empty() && _wcsicmp(name.c_str(), renamingFrom.c_str()) == 0) return {};
+    if (!renamingFrom.empty() && wvp::platform::NamesEqualIgnoreCase(name, renamingFrom)) return {};
     if (store.Exists(name)) return Tr(L"A playlist with this name already exists.", L"같은 이름의 재생목록이 이미 있습니다.");
     return {};
 }
@@ -110,20 +108,20 @@ ConfirmDialog* ShowConfirmDialog(pui::UiHost& host, const std::wstring& title, c
 }
 
 
-std::optional<std::wstring> PromptPlaylistName(AppContext& ctx, const std::wstring& title, const std::wstring& label,
-                                               const std::wstring& initial, const std::wstring& okText,
-                                               const std::wstring& renamingFrom) {
+std::optional<std::string> PromptPlaylistName(AppContext& ctx, const std::wstring& title, const std::wstring& label,
+                                              const std::string& initial, const std::wstring& okText,
+                                              const std::string& renamingFrom) {
     AppContext* c = &ctx;
     TextPromptOptions o;
     o.title = title;
     o.label = label;
-    o.initial = initial;
+    o.initial = wvp::ToWide(initial);
     o.okText = okText;
     o.placeholder = Tr(L"Playlist name", L"재생목록 이름");
-    o.validate = [c, renamingFrom](const std::wstring& v) { return ValidatePlaylistName(c->Svc().playlists, v, renamingFrom); };
+    o.validate = [c, renamingFrom](const std::wstring& v) { return ValidatePlaylistName(c->Svc().playlists, wvp::ToUtf8(v), renamingFrom); };
     auto r = PromptText(ctx, o);
     if (!r) return std::nullopt;
-    std::wstring name = TrimName(*r);
+    std::string name = TrimName(wvp::ToUtf8(*r));
     std::wstring err = ValidatePlaylistName(ctx.Svc().playlists, name, renamingFrom);
     if (!err.empty()) {
         ctx.ShowInfoBar(InfoSeverity::Warning, title, err);
@@ -132,37 +130,37 @@ std::optional<std::wstring> PromptPlaylistName(AppContext& ctx, const std::wstri
     return name;
 }
 
-bool SavePlaylistFile(AppContext& ctx, const std::wstring& name, const std::vector<wvp::MediaItem>& items) {
+bool SavePlaylistFile(AppContext& ctx, const std::string& name, const std::vector<wvp::MediaItem>& items) {
     if (ctx.Svc().playlists.Save(name, items)) { ctx.PlaylistsChanged(); return true; }
-    ctx.ShowInfoBar(InfoSeverity::Error, Tr(L"Could not save the playlist", L"재생목록을 저장할 수 없습니다"), TrW(L"The playlist \"" + name + L"\" could not be written.", L"재생목록 \"" + name + L"\"을(를) 쓸 수 없습니다.") );
+    ctx.ShowInfoBar(InfoSeverity::Error, Tr(L"Could not save the playlist", L"재생목록을 저장할 수 없습니다"), TrW(L"The playlist \"" + wvp::ToWide(name) + L"\" could not be written.", L"재생목록 \"" + wvp::ToWide(name) + L"\"을(를) 쓸 수 없습니다.") );
     return false;
 }
 
-bool NameUnnamedPlaylist(AppContext& ctx, const std::wstring& name, const std::vector<wvp::MediaItem>& items, int startIndex) {
+bool NameUnnamedPlaylist(AppContext& ctx, const std::string& name, const std::vector<wvp::MediaItem>& items, int startIndex) {
     if (items.empty() || !SavePlaylistFile(ctx, name, items)) return false;
     PlayPlaylistEntry(ctx, name, startIndex, false);
-    ctx.SavePlaylistItems(L"", {});   // the named copy is current before the unnamed slot is cleared
+    ctx.SavePlaylistItems("", {});   // the named copy is current before the unnamed slot is cleared
     return true;
 }
 
-bool AppendToPlaylist(AppContext& ctx, const std::wstring& name, const std::vector<wvp::MediaItem>& items) {
+bool AppendToPlaylist(AppContext& ctx, const std::string& name, const std::vector<wvp::MediaItem>& items) {
     if (items.empty()) return false;
     auto all = ctx.Svc().playlists.Load(name);
     all.insert(all.end(), items.begin(), items.end());
     if (!SavePlaylistFile(ctx, name, all)) return false;
-    ctx.ShowToast(TrW(L"Added " + ItemCountText((int)items.size()) + L" to " + name, name + L"에 " + ItemCountText((int)items.size()) + L" 추가함"));
+    ctx.ShowToast(TrW(L"Added " + ItemCountText((int)items.size()) + L" to " + wvp::ToWide(name), wvp::ToWide(name) + L"에 " + ItemCountText((int)items.size()) + L" 추가함"));
     return true;
 }
 
 std::vector<pui::MenuItemDesc> AddToPlaylistItems(AppContext& ctx, std::function<std::vector<wvp::MediaItem>()> getItems,
-                                                  const std::wstring& exclude) {
+                                                  const std::string& exclude) {
     AppContext* c = &ctx;
     std::vector<pui::MenuItemDesc> out;
     for (const auto& info : ctx.Svc().playlists.List()) {
         if (info.isReference) continue;  // referenced sources are not editable destinations
-        if (!exclude.empty() && _wcsicmp(info.name.c_str(), exclude.c_str()) == 0) continue;
-        std::wstring name = info.name;
-        out.push_back(pui::MenuItemDesc::Item(name, [c, name, getItems] { AppendToPlaylist(*c, name, getItems()); }));
+        if (!exclude.empty() && wvp::platform::NamesEqualIgnoreCase(info.name, exclude)) continue;
+        std::string name = info.name;
+        out.push_back(pui::MenuItemDesc::Item(wvp::ToWide(name), [c, name, getItems] { AppendToPlaylist(*c, name, getItems()); }));
     }
     if (out.empty()) {
         auto none = pui::MenuItemDesc::Item(Tr(L"(No playlists)", L"(재생목록 없음)"), [] {});
@@ -177,7 +175,7 @@ std::vector<pui::MenuItemDesc> AddToPlaylistItems(AppContext& ctx, std::function
             if (items.empty()) return;
             auto name = PromptPlaylistName(*c, Tr(L"New playlist", L"새 재생목록"), Tr(L"Playlist name", L"재생목록 이름"), c->Svc().playlists.CreateUniqueName(), Tr(L"Create", L"만들기"));
             if (!name) return;
-            if (SavePlaylistFile(*c, *name, items)) c->ShowToast(TrW(L"Created " + *name + L" with " + ItemCountText((int)items.size()), *name + L" 재생목록을 만들었습니다 (" + ItemCountText((int)items.size()) + L")"));
+            if (SavePlaylistFile(*c, *name, items)) c->ShowToast(TrW(L"Created " + wvp::ToWide(*name) + L" with " + ItemCountText((int)items.size()), wvp::ToWide(*name) + L" 재생목록을 만들었습니다 (" + ItemCountText((int)items.size()) + L")"));
         },
         {}, pui::glyph::Add));
     return out;

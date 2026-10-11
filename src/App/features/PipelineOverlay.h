@@ -22,8 +22,7 @@ struct PlanCheck {
     std::vector<std::string> problems;
     std::vector<std::string> notes;        // observed improvements over the plan, not mismatches
 };
-/// Planned vs measured. Decoder / frame path checks apply after kFpsWarmupFrames counted frames; the renderer check applies
-/// whenever d.Renderer is known.
+/// Planned vs measured. Decoder / frame path / presenter checks apply after kFpsWarmupFrames counted frames.
 PlanCheck CheckPlan(const wvp::Plan& p, const wvp::DebugInfo& d);
 
 /// The "pipeline" section rows (see PipelineOverlay.cpp). At most 4 rejected alternatives, none when !showRejected.

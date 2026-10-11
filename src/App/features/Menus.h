@@ -27,8 +27,7 @@ enum class Cmd {
     Execute,         // index = CommandId (everything that is just a command with a shortcut)
     SetShuffle, SetRepeat,
     SetSpeed,        // value = speed
-    SetRotation,     // value = degrees
-    FlipH, FlipV, Zoom,   // flag = new state
+    Zoom,            // flag = new state
     SetAlwaysOnTop,  // index = sl::AlwaysOnTopIndex
     SelectAudio,     // index = position among the audio streams
     SelectAribAudio, // ARIB TS: index = 0 audio 1, 1 audio 2 (the audio preference)
@@ -46,8 +45,7 @@ struct MenuState {
     BarModel bar;                               // playing / hasPrev / hasNext / shuffle / repeat / panelOpen / controlPanelOpen
     wvp::AlwaysOnTop alwaysOnTop = wvp::AlwaysOnTop::Disable;
     double speed = 1.0;
-    wvp::Rotation rotation = wvp::Rotation::None;
-    bool flipH = false, flipV = false, zoom = false;
+    bool zoom = false;
     std::vector<wvp::StreamInfo> audio, subs;   // same-type streams of the current media
     // ARIB TS: the audio item is a fixed pair Audio 1 / Audio 2 (the preference); audio 2 stays selectable while no
     // stream holds it, because it may appear later. The check mark is the user's selection, never the source playing.

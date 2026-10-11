@@ -1,5 +1,5 @@
 #pragma once
-// Decision logic for "rebind the GPU-dependent objects" (device loss today; a window moved to another GPU's monitor later).
+// Decision logic for rebinding the GPU-dependent objects after a device loss.
 // Pure C++: the caller owns the clock (nowMs) and performs the rebuild. Flow:
 //
 //     ctl.ReportLoss(reason)                 coalesced while an incident is open
@@ -44,7 +44,7 @@ public:
 
     bool Pending() const { return state_ == State::Pending; }
     bool Busy() const { return state_ != State::Idle; }
-    /// The UI runs on WARP and playback must use software decoding + SDL until ResetFallback().
+    /// The UI runs on WARP and playback must use software decoding until ResetFallback().
     bool FallbackActive() const { return fallback_; }
     /// Fallback itself failed: nothing more is attempted.
     bool GaveUp() const { return gaveUp_; }

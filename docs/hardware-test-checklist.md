@@ -18,7 +18,8 @@ clip, one HEVC 4:2:2 10-bit clip (camera footage), and an ARIB broadcast recordi
 | Hybrid laptop with an external monitor on the dGPU | drag the window to the external monitor and release: within a second the log has `adapter: drag end: video GPU <dGPU>` (only if that is cheaper) and playback continues at the same spot; dragging back reverts. No reopen while dragging. |
 | Settings > Playback > Video GPU = a specific GPU | overlay says `manual: <GPU>`; dragging never changes it |
 | Manual GPU disabled in Device Manager (or eGPU unplugged) | one toast `Video GPU <name> not found: using Automatic`; the setting still shows `<name> (not present)` |
-| No CUDA on Intel/AMD | the startup `caps: devices ... failed:` line lists `cuda`, nothing else complains |
+| Startup, file on the command line | `caps: startup probe done N ms after start`, then the file opens (`open: first media prepared ...`) with a plan: no open before the probe answered |
+| NVIDIA GPU | the plan uses `d3d11va` (or d3d12va / dxva2 / software), never `cuda`; no `cuda` device in the `caps: devices` line |
 
 ## 2. Decode per codec and bit depth
 
@@ -41,8 +42,6 @@ with no `MISMATCH` line.
 
 | Action | Expected |
 |---|---|
-| Filters > Rotate 90 / flips / brightness + contrast | plan shows `absorbed:transpose` / `absorbed:eq`, vf empty, `presenter rotate 90, eq ...`; picture correct |
-| Gamma != 1 | presenter route `shader` (VP cannot do gamma) |
 | Presenter line | `presenter d3d11 direct N uploaded 0`, `route vp` for plain playback; `adapter <GPU> (vendor 0x...., luid ...)`; no `fallbacks` line |
 
 ## 5. D3D11 filters, IVTC and deinterlace
@@ -75,11 +74,9 @@ Start the app once per row (`aribplayer.exe --console <switch> <file>`); the pic
 | `--d3d11-force-caps=decoder_srv=0` + `--d3d11-route=shader` | `force_caps:nv12_srv=0`, `force_caps:p010_srv=0`, `decoder_pool_no_srv` |
 | `--d3d11-force-caps=p010=0` (HEVC 10-bit) | `force_caps:p010=0`, `p010_vp_unsupported:shader` |
 | `--d3d11-force-caps=p010=0,shader=0` (HEVC 10-bit) | `p010_vp_unsupported:download` |
-| `--d3d11-force-caps=rotate=0` + Rotate 90 | rotation moves into the graph (`transpose_d3d11` or `transpose`), picture correct |
 | `--d3d11-route=shader` | `route shader`, `route_forced:shader` |
 | `--d3d11-force-caps=p010=0 --d3d11-route=vp` (HEVC 10-bit) | `route_forced_unavailable:vp` |
 | `--d3d11-debug` (needs Settings > System > Optional features > Graphics Tools) | `d3d11 debug layer on, 0 messages`; any `d3d11-debug:` log line is a bug report |
-| `--no-cuda` (NVIDIA only) | plans as above with `d3d11va`, never `cuda` |
 
 ## 8. Device loss
 

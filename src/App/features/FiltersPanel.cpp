@@ -10,6 +10,7 @@
 #include "BarLogic.h"
 #include "features/FxModel.h"
 #include "features/FxUtil.h"
+#include "wvp/win32/Utf.h"
 #include "features/SettingsService.h"
 #include "features/TextInputDialog.h"
 #include "pui/Buttons.h"
@@ -35,6 +36,7 @@ UINT_PTR g_zoomTimer = 0;
 FilterSettings CurrentUserFilters(AppContext& ctx) { return fx::UserView(ctx.Svc().filters.Settings()); }
 
 void SendFilterChange(AppContext& ctx, const wvp::FilterChange& change) {
+    ctx.ReportPlanProblem();
     if (!fx::HasEffect(change)) return;
     if (auto* c = ctx.Controller()) c->ApplyFilterChange(change);
 }
@@ -279,7 +281,7 @@ private:
     }
     void SyncError() {
         const auto& e = fx::LastFilterError();
-        err_->SetText(e ? fx::FormatFilterError(*e) + (e->Filter.empty() ? L"" : L"\n" + e->Filter) : L"");
+        err_->SetText(e ? fx::FormatFilterError(*e) + (e->Filter.empty() ? L"" : L"\n" + wvp::ToWide(e->Filter)) : L"");
         RequestLayout();
         FitHeight();
     }
@@ -383,30 +385,6 @@ private:
         if (dc.onlyInterlaced)
             sp.AddChild(ToggleRow(Tr(L"Only interlaced frames", L"인터레이스 프레임만"), cur_.deinterlaceOnlyInterlaced,
                                   [this](bool v) { Edit([&](FilterSettings& s) { s.deinterlaceOnlyInterlaced = v; }); }));
-        sp.AddChild(SliderRow(Tr(L"Brightness", L"밝기"), F::kBrightnessMin, F::kBrightnessMax, 0.01, cur_.brightness, 2,
-                              [this](double v) { Edit([&](FilterSettings& s) { s.brightness = v; }); }));
-        sp.AddChild(SliderRow(Tr(L"Contrast", L"대비"), 0, 2, 0.01, std::clamp(cur_.contrast, 0.0, 2.0), 2,
-                              [this](double v) { Edit([&](FilterSettings& s) { s.contrast = v; }); }));
-        sp.AddChild(SliderRow(Tr(L"Saturation", L"채도"), F::kSaturationMin, F::kSaturationMax, 0.01, cur_.saturation, 2,
-                              [this](double v) { Edit([&](FilterSettings& s) { s.saturation = v; }); }));
-        sp.AddChild(SliderRow(Tr(L"Gamma", L"감마"), F::kGammaMin, 3.0, 0.01, std::min(cur_.gamma, 3.0), 2,
-                              [this](double v) { Edit([&](FilterSettings& s) { s.gamma = v; }); }));
-        sp.AddChild(Heading(Tr(L"Orientation", L"방향")));
-        {
-            auto rg = std::make_unique<pui::RadioGroup>();
-            rg->SetName(Tr(L"Rotate", L"회전"));
-            rg->SetHorizontal(true);
-            rg->SetSpacing(4);
-            rg->AddOption(L"0°");
-            rg->AddOption(L"90°");
-            rg->AddOption(L"180°");
-            rg->AddOption(L"270°");
-            rg->SetSelectedIndex((int)cur_.rotation / 90);
-            rg->onSelectionChanged = [this](int i) { Edit([&](FilterSettings& s) { s.rotation = (wvp::Rotation)(i * 90); }); };
-            sp.AddChild(std::make_unique<FxRow>(m_, L"", std::move(rg), true));   // own line: four options do not fit next to a label
-        }
-        sp.AddChild(CheckRow(Tr(L"Flip horizontally", L"좌우 반전"), cur_.flipHorizontal, [this](bool v) { Edit([&](FilterSettings& s) { s.flipHorizontal = v; }); }));
-        sp.AddChild(CheckRow(Tr(L"Flip vertically", L"상하 반전"), cur_.flipVertical, [this](bool v) { Edit([&](FilterSettings& s) { s.flipVertical = v; }); }));
         sp.AddChild(CheckRow(Tr(L"Zoom to fill", L"화면 채우기"), fx::Zoom().on, [this](bool v) { SetZoomToFill(ctx_, v); }));
         sp.AddChild(std::make_unique<FxRow>(m_, L"", MakeButton(Tr(L"Reset video settings", L"영상 설정 초기화"), [this] {
             cur_ = fx::ResetVideoPart(cur_);
@@ -480,8 +458,8 @@ private:
             b->SetName(std::wstring(Tr(L"Edit ", L"편집: ")) + label);
             sp.AddChild(std::make_unique<FxRow>(m_, label, std::move(t), true, std::move(b), -1.f, 88.f));
         };
-        textRow(Tr(L"Video (vf)", L"영상 (vf)"), cur_.customVideoFilter, [this] { EditCustom(true); });
-        textRow(Tr(L"Audio (af)", L"소리 (af)"), cur_.customAudioFilter, [this] { EditCustom(false); });
+        textRow(Tr(L"Video (vf)", L"영상 (vf)"), wvp::ToWide(cur_.customVideoFilter), [this] { EditCustom(true); });
+        textRow(Tr(L"Audio (af)", L"소리 (af)"), wvp::ToWide(cur_.customAudioFilter), [this] { EditCustom(false); });
         sp.AddChild(CheckRow(Tr(L"Custom filters replace the presets above", L"사용자 지정 필터로 위의 프리셋을 대체"), cur_.advancedMode,
                              [this](bool v) { Edit([&](FilterSettings& s) { s.advancedMode = v; }); }));
         sp.AddChild(std::make_unique<FxRow>(m_, L"", MakeButton(Tr(L"Clear custom filters", L"사용자 지정 필터 지우기"), [this] {
@@ -504,7 +482,7 @@ private:
         TextPromptOptions o;
         o.title = video ? Tr(L"Custom video filter", L"사용자 지정 영상 필터") : Tr(L"Custom audio filter", L"사용자 지정 소리 필터");
         o.label = video ? Tr(L"FFmpeg video filter graph (vf), empty to clear", L"FFmpeg 영상 필터 그래프 (vf), 지우려면 비워 두세요") : Tr(L"FFmpeg audio filter graph (af), empty to clear", L"FFmpeg 소리 필터 그래프 (af), 지우려면 비워 두세요");
-        o.initial = video ? cur_.customVideoFilter : cur_.customAudioFilter;
+        o.initial = wvp::ToWide(video ? cur_.customVideoFilter : cur_.customAudioFilter);
         o.okText = Tr(L"Apply", L"적용");
         AppContext& ctx = ctx_;
         auto alive = alive_;
@@ -513,7 +491,7 @@ private:
             std::wstring v = *res;
             while (!v.empty() && std::iswspace(v.front())) v.erase(v.begin());
             while (!v.empty() && std::iswspace(v.back())) v.pop_back();
-            ApplyFilterEdit(ctx, [&](FilterSettings& s) { (video ? s.customVideoFilter : s.customAudioFilter) = v; });
+            ApplyFilterEdit(ctx, [&](FilterSettings& s) { (video ? s.customVideoFilter : s.customAudioFilter) = wvp::ToUtf8(v); });
         }
         // The panel was closed by the activation change: bring it back on the same tab so the inline error line (and the
         // new filter text) are visible. A fresh panel reads the settings and the last FILTER_ERROR itself.

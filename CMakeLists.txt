@@ -1,54 +1,77 @@
-# ARIB Player: MSVC x64 only. Configure from a VS 2022 x64 developer environment
+# ARIB Player: MSVC x64 on Windows. Configure from a VS 2022 x64 developer environment
 # (scripts\build.ps1 sets one up), e.g. `cmake --preset release && cmake --build --preset release`.
+# WVP_PORTABLE_CORE builds only the platform-independent core and its logic tests (any C++20 compiler, no libffplay).
 cmake_minimum_required(VERSION 3.25)
+
+option(WVP_PORTABLE_CORE "Build only the portable core and its logic tests" OFF)
 
 # Only the Visual Studio generator reads this; for Ninja the SDK comes from the developer environment (checked below).
 set(WVP_WINDOWS_SDK_VERSION "10.0.26100.0" CACHE STRING "Windows SDK version the build must use")
-if(NOT CMAKE_SYSTEM_VERSION)
+if(CMAKE_HOST_WIN32 AND NOT CMAKE_SYSTEM_VERSION)
     set(CMAKE_SYSTEM_VERSION "${WVP_WINDOWS_SDK_VERSION}")
 endif()
 
-project(ARIBPlayer LANGUAGES CXX RC)
-
-if(NOT MSVC OR CMAKE_CXX_COMPILER_ID STREQUAL "Clang" OR NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
-    message(FATAL_ERROR "Build with MSVC x64 (cl.exe from a VS 2022 x64 developer environment).")
+if(CMAKE_HOST_WIN32 AND NOT WVP_PORTABLE_CORE)
+    project(ARIBPlayer LANGUAGES CXX RC)
+else()
+    project(ARIBPlayer LANGUAGES CXX)
 endif()
-if(NOT CMAKE_GENERATOR MATCHES "Visual Studio")
-    string(REGEX REPLACE "[\\\\/]+$" "" _wvp_sdk "$ENV{WindowsSDKVersion}")
-    if(NOT _wvp_sdk STREQUAL WVP_WINDOWS_SDK_VERSION)
-        message(FATAL_ERROR "Windows SDK '${_wvp_sdk}' in the developer environment, expected ${WVP_WINDOWS_SDK_VERSION}: "
-                            "run vcvars64.bat ${WVP_WINDOWS_SDK_VERSION} (scripts\\build.ps1 does this).")
+
+if(WIN32 AND NOT WVP_PORTABLE_CORE)
+    if(NOT MSVC OR CMAKE_CXX_COMPILER_ID STREQUAL "Clang" OR NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
+        message(FATAL_ERROR "Build with MSVC x64 (cl.exe from a VS 2022 x64 developer environment).")
+    endif()
+    if(NOT CMAKE_GENERATOR MATCHES "Visual Studio")
+        string(REGEX REPLACE "[\\\\/]+$" "" _wvp_sdk "$ENV{WindowsSDKVersion}")
+        if(NOT _wvp_sdk STREQUAL WVP_WINDOWS_SDK_VERSION)
+            message(FATAL_ERROR "Windows SDK '${_wvp_sdk}' in the developer environment, expected ${WVP_WINDOWS_SDK_VERSION}: "
+                                "run vcvars64.bat ${WVP_WINDOWS_SDK_VERSION} (scripts\\build.ps1 does this).")
+        endif()
     endif()
 endif()
 
 set(WVP_ROOT "${CMAKE_CURRENT_SOURCE_DIR}")
-set(WVP_BIN_ROOT "${WVP_ROOT}/artifacts/bin" CACHE PATH "Final outputs go to <WVP_BIN_ROOT>/<Config>/<Target>/")
-set(WVP_FFPLAY_DIR "${WVP_ROOT}/ffmpeg/dist/win64" CACHE PATH "libffplay + FFmpeg DLLs (ffmpeg/build-ffplay.ps1 output)")
+if(WVP_PORTABLE_CORE)
+    set(WVP_BIN_ROOT "${CMAKE_BINARY_DIR}/bin" CACHE PATH "Final outputs go to <WVP_BIN_ROOT>/<Config>/<Target>/")
+else()
+    set(WVP_BIN_ROOT "${WVP_ROOT}/artifacts/bin" CACHE PATH "Final outputs go to <WVP_BIN_ROOT>/<Config>/<Target>/")
+    set(WVP_FFPLAY_DIR "${WVP_ROOT}/ffmpeg/dist/win64" CACHE PATH "libffplay + FFmpeg DLLs (ffmpeg/build-ffplay.ps1 output)")
+endif()
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
-set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
-set(CMAKE_MSVC_DEBUG_INFORMATION_FORMAT "$<IF:$<CONFIG:Debug>,EditAndContinue,ProgramDatabase>")
 
-# Replace CMake's defaults (/DWIN32 /D_WINDOWS /GR, /Ob2, /Ob0) so the command line holds only what we ask for.
-set(CMAKE_CXX_FLAGS "/EHsc")
-set(CMAKE_CXX_FLAGS_RELEASE "/O2 /Oi /Gy /DNDEBUG")
-set(CMAKE_CXX_FLAGS_DEBUG "/Od /RTC1 /JMC /D_DEBUG")
-# C++ only: the resource compiler (app.rc) shares the directory options but not these flags.
-foreach(opt /W4 /sdl /utf-8 /permissive- /Zc:inline /external:W4 /diagnostics:column /FC)
-    add_compile_options("$<$<COMPILE_LANGUAGE:CXX>:${opt}>")
-endforeach()
-add_compile_definitions(UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX _CRT_SECURE_NO_WARNINGS)
-include_directories("${WVP_ROOT}/src/Core/include" "${WVP_ROOT}/src/Ui/include" "${WVP_FFPLAY_DIR}")
+if(WIN32)
+    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    set(CMAKE_MSVC_DEBUG_INFORMATION_FORMAT "$<IF:$<CONFIG:Debug>,EditAndContinue,ProgramDatabase>")
 
-# The default Windows libraries are placed by wvp_link_executable() instead of CMake (which would put them last).
-set(CMAKE_CXX_STANDARD_LIBRARIES "")
-set(WVP_DEFAULT_LIBS kernel32.lib user32.lib gdi32.lib winspool.lib comdlg32.lib advapi32.lib shell32.lib ole32.lib
-    oleaut32.lib uuid.lib odbc32.lib odbccp32.lib)
-set(CMAKE_EXE_LINKER_FLAGS "/machine:x64 /DEBUG")
-set(CMAKE_EXE_LINKER_FLAGS_RELEASE "/INCREMENTAL:NO /OPT:REF /OPT:ICF")
-set(CMAKE_EXE_LINKER_FLAGS_DEBUG "/INCREMENTAL")
+    # Replace CMake's defaults (/DWIN32 /D_WINDOWS /GR, /Ob2, /Ob0) so the command line holds only what we ask for.
+    set(CMAKE_CXX_FLAGS "/EHsc")
+    set(CMAKE_CXX_FLAGS_RELEASE "/O2 /Oi /Gy /DNDEBUG")
+    set(CMAKE_CXX_FLAGS_DEBUG "/Od /RTC1 /JMC /D_DEBUG")
+    # C++ only: the resource compiler (app.rc) shares the directory options but not these flags. Headers of SYSTEM include
+    # directories (the FFmpeg package) are compiled as external with CMake's /external:W0; everything of this repo stays /W4.
+    foreach(opt /W4 /sdl /utf-8 /permissive- /Zc:inline /diagnostics:column /FC)
+        add_compile_options("$<$<COMPILE_LANGUAGE:CXX>:${opt}>")
+    endforeach()
+    add_compile_definitions(UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX _CRT_SECURE_NO_WARNINGS)
+
+    # The default Windows libraries are placed by wvp_link_executable() instead of CMake (which would put them last).
+    set(CMAKE_CXX_STANDARD_LIBRARIES "")
+    set(WVP_DEFAULT_LIBS kernel32.lib user32.lib gdi32.lib winspool.lib comdlg32.lib advapi32.lib shell32.lib ole32.lib
+        oleaut32.lib uuid.lib odbc32.lib odbccp32.lib)
+    set(CMAKE_EXE_LINKER_FLAGS "/machine:x64 /DEBUG")
+    set(CMAKE_EXE_LINKER_FLAGS_RELEASE "/INCREMENTAL:NO /OPT:REF /OPT:ICF")
+    set(CMAKE_EXE_LINKER_FLAGS_DEBUG "/INCREMENTAL")
+else()
+    add_compile_options(-Wall -Wextra)
+endif()
+
+include_directories("${WVP_ROOT}/src/Core/include")
+if(NOT WVP_PORTABLE_CORE)
+    include_directories("${WVP_ROOT}/src/Ui/include" "${WVP_FFPLAY_DIR}")
+endif()
 
 function(wvp_output_dirs target)
     set(dir "${WVP_BIN_ROOT}/$<CONFIG>/${target}")
@@ -57,6 +80,35 @@ function(wvp_output_dirs target)
         ARCHIVE_OUTPUT_DIRECTORY "${dir}"
         PDB_OUTPUT_DIRECTORY "${dir}")
 endfunction()
+
+# Windows executables link libffplay, user32 and gdi32 (whether they call them or not; the linker drops unused imports);
+# NO_FFPLAY leaves libffplay out. The order matters: the static libraries of this repo come last, after the Windows
+# libraries. The linker continues its search for a library member's externals from that library onward, so the default
+# libraries named by #pragma comment (windowsapp.lib, appended at the end) are found before kernel32.lib /
+# uiautomationcore.lib for some imports, which then bind to api-ms-win-* / ext-ms-win-* API sets.
+function(wvp_link_executable target)
+    cmake_parse_arguments(arg "NO_FFPLAY" "" "LIBS;PROJECTS" ${ARGN})
+    wvp_output_dirs(${target})
+    set(system_libs)
+    if(WIN32)
+        set(system_libs user32.lib gdi32.lib ${WVP_DEFAULT_LIBS})
+    endif()
+    if(arg_NO_FFPLAY)
+        target_link_libraries(${target} PRIVATE ${arg_LIBS} ${system_libs} ${arg_PROJECTS})
+    else()
+        # The import library is linked by path (an INTERFACE target would move it to the end of the line).
+        target_link_libraries(${target} PRIVATE ${arg_LIBS} "${WVP_FFPLAY_LIB}" ${system_libs} ${arg_PROJECTS})
+        add_dependencies(${target} libffplay_implib)
+    endif()
+endfunction()
+
+enable_testing()
+
+if(WVP_PORTABLE_CORE)
+    add_subdirectory(src/Core)
+    add_subdirectory(tests)
+    return()
+endif()
 
 if(NOT EXISTS "${WVP_FFPLAY_DIR}/ffplay.h")
     message(FATAL_ERROR "ffplay.h not found in ${WVP_FFPLAY_DIR} (build ffmpeg\\build-ffplay.ps1 first).")
@@ -77,19 +129,6 @@ add_custom_command(
     COMMENT "Generating libffplay.lib from ffplay.h"
     VERBATIM)
 add_custom_target(libffplay_implib DEPENDS "${WVP_FFPLAY_LIB}")
-
-# Every executable links libffplay, user32 and gdi32 (whether it calls them or not; the linker drops unused imports).
-# The order matters: the static libraries of this repo come last, after the Windows libraries. The linker continues its
-# search for a library member's externals from that library onward, so the default libraries named by #pragma comment
-# (windowsapp.lib, appended at the end) are found before kernel32.lib / uiautomationcore.lib for some imports, which
-# then bind to api-ms-win-* / ext-ms-win-* API sets.
-function(wvp_link_executable target)
-    cmake_parse_arguments(arg "" "" "LIBS;PROJECTS" ${ARGN})
-    wvp_output_dirs(${target})
-    # The import library is linked by path (an INTERFACE target would move it to the end of the line).
-    target_link_libraries(${target} PRIVATE ${arg_LIBS} "${WVP_FFPLAY_LIB}" user32.lib gdi32.lib ${WVP_DEFAULT_LIBS} ${arg_PROJECTS})
-    add_dependencies(${target} libffplay_implib)
-endfunction()
 
 file(GLOB WVP_FFPLAY_DLLS CONFIGURE_DEPENDS "${WVP_FFPLAY_DIR}/*.dll")
 if(NOT WVP_FFPLAY_DLLS)
@@ -134,9 +173,8 @@ function(wvp_copy_ffplay_dlls target)
     add_dependencies(${target} ${target}_prune_dlls)
 endfunction()
 
-enable_testing()
-
 add_subdirectory(src/Core)
+add_subdirectory(src/Presenter)
 add_subdirectory(src/Ui)
 add_subdirectory(src/App)
 add_subdirectory(tests)

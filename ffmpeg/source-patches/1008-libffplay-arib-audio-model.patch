@@ -1,0 +1,124 @@
+--- /dev/null
++++ b/fftools/ffplay_arib_audio.h
+@@ -0,0 +1,121 @@
++/*
++ * ARIB audio model of libffplay: the pure decision functions (no I/O, no allocation), kept apart from ffplay.c so
++ * that they can be table-tested on their own (ffmpeg/tests/arib_select_tests.c includes this file).
++ *
++ * Time unit of every position is one sample of the mix timeline (the device rate); the demux fronts of the
++ * starvation rules are seconds.
++ */
++#ifndef FFTOOLS_FFPLAY_ARIB_AUDIO_H
++#define FFTOOLS_FFPLAY_ARIB_AUDIO_H
++
++#include <math.h>
++#include <stdint.h>
++
++/* MAIN: always audio 1; COMMENTARY: audio 2 wherever it has samples, audio 1 otherwise */
++enum { FFP_ARIB_PREF_MAIN = 0, FFP_ARIB_PREF_COMMENTARY = 1 };
++
++enum {
++    FFP_ARIB_SRC_A1      = 0,
++    FFP_ARIB_SRC_A2      = 1,
++    FFP_ARIB_SRC_SILENCE = 2,
++    FFP_ARIB_SRC_WAIT    = 3,   /* a source has not decided yet: do not advance the cursor */
++    FFP_ARIB_SRC_END     = 4,   /* everything is finished and nothing is left at the cursor */
++};
++
++#define FFP_ARIB_T_STARVE_AUDIO_S  0.5    /* a source lags the other audio candidate by more than this */
++#define FFP_ARIB_T_STARVE_VIDEO_S  1.5    /* ... or the video by more than this (audio trails video by up to ~1 s) */
++#define FFP_ARIB_MARGIN_AUDIO_S    0.15   /* interleave lag A2 behind A1 (measured max 0.106 s) */
++#define FFP_ARIB_MARGIN_VIDEO_S    1.2    /* constant offset of audio behind video on CS (measured max 0.955 s) + slack */
++#define FFP_ARIB_HOLD_S            1.0    /* minimum time on audio 1 before returning to audio 2 */
++#define FFP_ARIB_FADE_S            0.005  /* crossfade / dip length at every source change */
++
++typedef struct FFPAribStream {
++    int index;      /* AVStream index */
++    int aac;        /* ADTS AAC */
++    int tag;        /* component_tag, -1 when the stream has none */
++} FFPAribStream;
++
++/* tsreadex CServiceFilter::AddPmt: audio 1 = AAC with component tag 0x10 / 0x83 / 0x85 (the last match wins), else the
++ * first untagged AAC; audio 2 = tag 0x11. s[] is the video program's streams in PMT order. -1 = none. */
++static inline void ffp_arib_roles(const FFPAribStream *s, int n, int *a1, int *a2)
++{
++    int i;
++
++    *a1 = *a2 = -1;
++    for (i = 0; i < n; i++) {
++        if (!s[i].aac)
++            continue;
++        if ((*a1 < 0 && s[i].tag < 0) || s[i].tag == 0x10 || s[i].tag == 0x83 || s[i].tag == 0x85)
++            *a1 = s[i].index;
++        else if (s[i].tag == 0x11)
++            *a2 = s[i].index;
++    }
++}
++
++typedef struct FFPAribSel {
++    int pref;           /* FFP_ARIB_PREF_* */
++    int a1_cov, a1_dec; /* audio 1: has a sample at the cursor / has decided about it (data beyond it, or starved) */
++    int a2_cov, a2_dec;
++    int cur_a2;         /* the sample before the cursor came from audio 2 */
++    int a2_blocked;     /* hold: audio 2 may not be entered from audio 1 yet */
++    int silence_ok;     /* silence is justified here (the video front is beyond the cursor) */
++    int eof;            /* every present source is finished */
++} FFPAribSel;
++
++/* Which source supplies the sample at the cursor.
++ * Audio 2 preference: audio 2 where it covers (the hold only delays the return from audio 1), else audio 1, else silence.
++ * Main: audio 1, else silence. A source that has neither a sample nor a decision makes the cursor wait. */
++static inline int ffp_arib_select(const FFPAribSel *s)
++{
++    if (s->pref == FFP_ARIB_PREF_COMMENTARY) {
++        if (s->a2_cov && (s->cur_a2 || !s->a2_blocked))
++            return FFP_ARIB_SRC_A2;
++        if (!s->a2_cov && !s->a2_dec)
++            return FFP_ARIB_SRC_WAIT;
++    }
++    if (s->a1_cov)
++        return FFP_ARIB_SRC_A1;
++    if (s->pref == FFP_ARIB_PREF_COMMENTARY && s->a2_cov)
++        return FFP_ARIB_SRC_A2;
++    if (!s->a1_dec)
++        return FFP_ARIB_SRC_WAIT;
++    if (s->eof)
++        return FFP_ARIB_SRC_END;
++    return s->silence_ok ? FFP_ARIB_SRC_SILENCE : FFP_ARIB_SRC_WAIT;
++}
++
++/* Starvation of one source from the demux fronts (seconds, NAN = unknown). Returns 1 when the source is starved: a PMT
++ * removed it, it finished, it lags the other audio candidate by more than T_STARVE_AUDIO or the video by more than
++ * T_STARVE_VIDEO. *known_until: the media time up to which the absence of its data is certain (interleave guarantees
++ * that its data before that time would have been demuxed already); -INFINITY when starved only by removal with no
++ * front known, +INFINITY for a finished source. */
++static inline int ffp_arib_starved(int removed, int finished, double own_end, double other_end, double video_end,
++                                   double *known_until)
++{
++    double ku = -INFINITY;
++    int starved = 0;
++
++    if (finished) {
++        *known_until = INFINITY;
++        return 1;
++    }
++    if (!isnan(own_end) && !isnan(other_end) && other_end - own_end > FFP_ARIB_T_STARVE_AUDIO_S) {
++        ku = fmax(ku, other_end - FFP_ARIB_MARGIN_AUDIO_S);
++        starved = 1;
++    }
++    if (!isnan(own_end) && !isnan(video_end) && video_end - own_end > FFP_ARIB_T_STARVE_VIDEO_S) {
++        ku = fmax(ku, video_end - FFP_ARIB_MARGIN_VIDEO_S);
++        starved = 1;
++    }
++    if (removed) {
++        if (!isnan(other_end))
++            ku = fmax(ku, other_end - FFP_ARIB_MARGIN_AUDIO_S);
++        if (!isnan(video_end))
++            ku = fmax(ku, video_end - FFP_ARIB_MARGIN_VIDEO_S);
++        starved = 1;
++    }
++    *known_until = ku;
++    return starved;
++}
++
++#endif

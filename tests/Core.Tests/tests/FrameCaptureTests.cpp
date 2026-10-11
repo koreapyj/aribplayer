@@ -7,7 +7,7 @@
 #include <cstring>
 #include <stdexcept>
 
-#include "wvp/FrameCapture.h"
+#include "wvp/win32/FrameCapture.h"
 
 using namespace wvp;
 

@@ -28,7 +28,8 @@
 #include "wvp/DebugInfo.h"
 #include "wvp/FfPlayer.h"
 #include "wvp/JsonLite.h"
-#include "wvp/Utf.h"
+#include "wvp/win32/Utf.h"
+#include "TestPlayer.h"
 #include "wvptest.h"
 
 #pragma comment(lib, "mmdevapi.lib")
@@ -37,32 +38,6 @@ using namespace wvp;
 namespace fs = std::filesystem;
 
 namespace {
-
-constexpr UINT kPauseNotifyMsg = WM_APP + 61;
-
-LRESULT CALLBACK PauseHostProc(HWND h, UINT m, WPARAM w, LPARAM l) {
-    if (m == kPauseNotifyMsg) { FfPlayer::HandleNotify(w, l); return 0; }
-    return DefWindowProcW(h, m, w, l);
-}
-
-struct Host {
-    HWND parent = nullptr, child = nullptr;
-    Host() {
-        static ATOM a = [] {
-            WNDCLASSW wc{};
-            wc.lpfnWndProc = PauseHostProc;
-            wc.hInstance = GetModuleHandleW(nullptr);
-            wc.lpszClassName = L"WvpPauseLatencyHost";
-            return RegisterClassW(&wc);
-        }();
-        (void)a;
-        HINSTANCE inst = GetModuleHandleW(nullptr);
-        parent = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, L"WvpPauseLatencyHost", L"host", WS_POPUP, -32000, -32000, 960, 540,
-                                 nullptr, nullptr, inst, nullptr);
-        child = CreateWindowExW(0, L"STATIC", L"video", WS_CHILD | WS_VISIBLE, 0, 0, 960, 540, parent, nullptr, inst, nullptr);
-    }
-    ~Host() { if (parent) DestroyWindow(parent); }
-};
 
 fs::path RepoRoot() {
     wchar_t buf[MAX_PATH * 2];
@@ -77,22 +52,10 @@ fs::path RepoRoot() {
     return fs::current_path();
 }
 
-void Pump() {
-    MSG msg;
-    while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) { TranslateMessage(&msg); DispatchMessageW(&msg); }
-}
+using wvptest::Pump;
 
 template <class F>
-bool WaitFor(F cond, double seconds) {
-    auto end = std::chrono::steady_clock::now() + std::chrono::milliseconds((long long)(seconds * 1000));
-    while (std::chrono::steady_clock::now() < end) {
-        Pump();
-        if (cond()) return true;
-        Sleep(5);
-    }
-    Pump();
-    return cond();
-}
+bool WaitFor(F cond, double seconds) { return wvptest::WaitFor(cond, seconds); }
 
 void Delay(double seconds) { WaitFor([] { return false; }, seconds); }
 
@@ -227,15 +190,16 @@ Summary MeasureCycles(FfPlayer& player, int cycles, const char* config) {
     return s;
 }
 
-bool OpenPlaying(Host& host, std::unique_ptr<FfPlayer>& player, const Config& c, std::string& why) {
+// audioDriver: SDL's driver for the process (the first player decides it).
+bool OpenPlaying(std::unique_ptr<FfPlayer>& player, const Config& c, std::string& why, const char* audioDriver = "dummy") {
     int err = 0;
-    player = FfPlayer::CreateSync(host.child, host.parent, kPauseNotifyMsg, &err);
-    if (!player) { why = "CreateSync failed " + std::to_string(err); return false; }
+    player = FfPlayer::Create(std::make_unique<wvptest::RecordingPresenter>(false), wvptest::TestUi().Post(), &err, audioDriver);
+    if (!player) { why = "FfPlayer::Create failed " + std::to_string(err); return false; }
     auto prepared = std::make_shared<int>(0);
     auto errors = std::make_shared<int>(0);
     player->Prepared.add([prepared](const MediaPreparedInfo&) { ++*prepared; });
     player->Error.add([errors](const PlayerErrorInfo&) { ++*errors; });
-    if (player->Open(c.file.wstring(), c.options) != 0) { why = "open rejected"; return false; }
+    if (player->Open(ToUtf8(c.file.wstring()), c.options) != 0) { why = "open rejected"; return false; }
     if (!WaitFor([&] { return *prepared > 0 || *errors > 0; }, 20) || *errors) { why = "did not prepare"; return false; }
     if (!WaitFor([&] {
             auto js = player->GetDebugInfoJson();
@@ -248,35 +212,28 @@ bool OpenPlaying(Host& host, std::unique_ptr<FfPlayer>& player, const Config& c,
 std::vector<Config> Configs() {
     std::vector<Config> v;
     const fs::path tone = RepoRoot() / L"testmedia" / L"testsrc2-1080p-60s.mp4";   // 25 fps + continuous 440 Hz sine
-    v.push_back({"sdl-software", tone, {{L"presenter", L"sdl"}, {L"stats", L"1"}}, 40.0});
-    auto caps = FfPlayer::ProbeCaps();
-    const PresenterCap* d3 = caps ? caps->Presenter("d3d11") : nullptr;
-    if (d3 && d3->ok) v.push_back({"d3d11-software", tone, {{L"presenter", L"d3d11"}, {L"stats", L"1"}}, 40.0});
-    // the user's pipeline: CUDA decode + ivtc_cuda + d3d11 with ARIB captions (broadcast fixture), when the machine has it
+    v.push_back({"software", tone, {{"stats", "1"}}, 40.0});
+    // the user's decode pipeline with ARIB captions (broadcast fixture), when the machine has it; the frames are downloaded
+    // for the recording presenter
+    auto engine = FfPlayer::ProbeEngine(nullptr, 0);
+    std::optional<CapabilitySet> caps;
+    if (engine) caps = MergeBuildCapabilities(*engine, BuildCapabilities());
     const fs::path tbs = RepoRoot() / L"testmedia" / L"arib" / L"tbs-captions.ts";
-    const DecoderCap* dc = caps ? caps->Decoder("h264", "cuda") : nullptr;
-    if (fs::exists(tbs) && d3 && d3->ok && d3->importCuda && caps->DeviceOk("cuda") && dc && dc->ok && caps->Filter("ivtc_cuda"))
-        v.push_back({"user-cuda-ivtc-d3d11-captions", tbs,
-                     {{L"hwaccel", L"cuda"}, {L"hwframes", L"keep"}, {L"presenter", L"d3d11"}, {L"vf", L"ivtc_cuda"}, {L"stats", L"1"}},
-                     1001.0 / 24.0});
     const DecoderCap* dv = caps ? caps->Decoder("mpeg2video", "d3d11va") : nullptr;
-    if (fs::exists(tbs) && d3 && d3->ok && caps->DeviceOk("d3d11va") && dv && dv->ok && caps->Filter("ivtc_d3d11"))
-        v.push_back({"user-d3d11va-ivtc-d3d11-captions", tbs,
-                     {{L"hwaccel", L"d3d11va"}, {L"hwframes", L"keep"}, {L"presenter", L"d3d11"}, {L"vf", L"ivtc_d3d11"}, {L"stats", L"1"}},
-                     1001.0 / 24.0});
+    if (fs::exists(tbs) && caps && caps->DeviceOk("d3d11va") && dv && dv->ok && caps->Filter("ivtc_d3d11"))
+        v.push_back({"user-d3d11va-ivtc-captions", tbs,
+                     {{"hwaccel", "d3d11va"}, {"hwframes", "keep"}, {"vf", "ivtc_d3d11"}, {"stats", "1"}}, 1001.0 / 24.0});
     return v;
 }
 
 }
 
 TEST_CASE_INTEGRATION(PauseLatency_api_pause_resume_stages) {
-    if (!std::getenv("SDL_AUDIODRIVER")) _putenv_s("SDL_AUDIODRIVER", "dummy");
     for (const Config& c : Configs()) {
         REQUIRE_MSG(fs::exists(c.file), "missing fixture " + ToUtf8(c.file.wstring()));
-        Host host;
         std::unique_ptr<FfPlayer> player;
         std::string why;
-        REQUIRE_MSG(OpenPlaying(host, player, c, why), std::string(c.name) + ": " + why);
+        REQUIRE_MSG(OpenPlaying(player, c, why), std::string(c.name) + ": " + why);
         REQUIRE_MSG(ReadTiming(*player).valid, "libffplay without pause_timing (patch 1025)");
         Summary s = MeasureCycles(*player, 6, c.name);
         const double pv = Median(s.pauseVideo), pa = Median(s.pauseAudio), rv = Median(s.resumeVideo), ra = Median(s.resumeAudio);
@@ -461,21 +418,20 @@ TEST_CASE_INTEGRATION(PauseLatency_loopback_wasapi) {
         std::printf("LOOPBACK | SKIP: set WVP_PAUSE_LOOPBACK=1 and run this test alone (plays a quiet 440 Hz tone)\n");
         return;
     }
-    // main() forces the dummy driver; SDL reads the variable when libffplay first initialises audio, so this test must run
-    // alone in its process (filter PauseLatency_loopback).
-    _putenv_s("SDL_AUDIODRIVER", "wasapi");
+    // SDL has one audio driver per process, chosen by the first player: this test must run alone in its process (filter
+    // PauseLatency_loopback). main() also sets SDL_AUDIODRIVER=dummy, which SDL reads first: clear it.
+    _putenv_s("SDL_AUDIODRIVER", "");
+    _putenv_s("SDL_AUDIO_DRIVER", "");
     Loopback lb;
     std::string why;
     REQUIRE_MSG(lb.Start(why), why);
     const fs::path tone = RepoRoot() / L"testmedia" / L"testsrc2-1080p-60s.mp4";
     std::vector<Config> configs = {
-        {"sdl-wasapi", tone, {{L"presenter", L"sdl"}, {L"volume", L"3"}}, 40.0},
-        {"d3d11-wasapi", tone, {{L"presenter", L"d3d11"}, {L"volume", L"3"}}, 40.0},
+        {"wasapi", tone, {{"volume", "3"}}, 40.0},
     };
     for (const Config& c : configs) {
-        Host host;
         std::unique_ptr<FfPlayer> player;
-        REQUIRE_MSG(OpenPlaying(host, player, c, why), std::string(c.name) + ": " + why);
+        REQUIRE_MSG(OpenPlaying(player, c, why, "wasapi"), std::string(c.name) + ": " + why);
         Delay(1.0);
         std::vector<double> stopMs, startMs, estStop, estStart;
         for (int i = 0; i < 5; ++i) {

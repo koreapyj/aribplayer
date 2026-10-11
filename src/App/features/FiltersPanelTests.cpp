@@ -8,6 +8,7 @@
 
 #include "AppContext.h"
 #include "LogicTest.h"
+#include "wvp/CapabilitySet.h"
 #include "features/FiltersPanel.h"
 #include "features/FxUtil.h"
 #include "pui/Buttons.h"
@@ -23,7 +24,7 @@ using namespace app;
 
 class RecPlayer final : public wvp::IMediaPlayer {
 public:
-    std::vector<std::wstring> vf, cmds;
+    std::vector<std::string> vf, cmds;
     wvp::PlayerState State() const override { return wvp::PlayerState::Playing; }
     int Volume() const override { return 100; }
     void SetVolume(int) override {}
@@ -31,17 +32,17 @@ public:
     void SetMuted(bool) override {}
     double Position() override { return 0; }
     double Duration() override { return 0; }
-    int Open(const std::wstring&, const wvp::OpenOptions& = {}) override { return 0; }
+    int Open(const std::string&, const wvp::OpenOptions& = {}) override { return 0; }
     int Stop() override { return 0; }
     int Play() override { return 0; }
     int Pause() override { return 0; }
     int TogglePause() override { return 0; }
     int Seek(double, bool) override { return 0; }
     int CycleStream(wvp::StreamType) override { return 0; }
-    int SetVideoFilter(const std::wstring& s) override { vf.push_back(s); return 0; }
-    int SetAudioFilter(const std::wstring&) override { return 0; }
-    int SendFilterCommand(const std::wstring& t, const std::wstring& c, const std::wstring& a) override {
-        cmds.push_back(t + L" " + c + L"=" + a);
+    int SetVideoFilter(const std::string& s) override { vf.push_back(s); return 0; }
+    int SetAudioFilter(const std::string&) override { return 0; }
+    int SendFilterCommand(const std::string& t, const std::string& c, const std::string& a) override {
+        cmds.push_back(t + " " + c + "=" + a);
         return 0;
     }
     std::optional<wvp::MediaInfo> GetMediaInfo() override { return std::nullopt; }
@@ -50,7 +51,10 @@ public:
 
 class PanelCtx final : public AppContext {
 public:
-    PanelCtx(const std::wstring& dir, pui::IRenderer& m) : svc(dir), measurer(m), ctl(player), theme(pui::Theme::Make(false)) {}
+    PanelCtx(const std::wstring& dir, pui::IRenderer& m) : svc(dir), measurer(m), ctl(player), theme(pui::Theme::Make(false)) {
+        svc.filters.SetCapabilities(wvp::fakecaps::None());
+        ctl.SetFilters(svc.filters.Provider());
+    }
     HWND MainHwnd() const override { return nullptr; }
     pui::UiHost& Ui() override { return host; }
     wvp::PlaybackController* Controller() override { return &ctl; }
@@ -154,58 +158,28 @@ int CountClipped(pui::Widget* panel, pui::IRenderer& m, std::wstring* why) {
 bool InsideV(const pui::RectF& r, const pui::RectF& outer) { return r.t >= outer.t - 0.5f && r.b <= outer.b + 0.5f; }
 }
 
-LOGIC_TEST(fxpanel_reset_video_resets_brightness_widget_and_sends_change) {
+LOGIC_TEST(fxpanel_reset_video_resets_deinterlace_and_sends_change) {
     Env e(1120, 720);
     LT_CHECK(e.Ok());
     if (!e.Ok()) return;
     PanelCtx& c = *e.ctx;
+    wvp::FilterSettings s = c.svc.filters.Settings();
+    s.deinterlace = wvp::DeinterlaceMode::On;
+    c.svc.filters.Apply(s);
     ShowFiltersPanel(c, FiltersTab::Video);
     pui::Widget* panel = e.Panel();
     LT_CHECK(panel != nullptr);
     if (!panel) return;
-    auto* sl = Find<pui::Slider>(panel, L"Brightness");
-    LT_CHECK(sl != nullptr);
-    if (!sl) return;
-    sl->SetRangeValue(0.5);
-    LT_CHECK(c.svc.filters.Settings().brightness == 0.5);
-    LT_CHECK(!c.player.vf.empty());       // eq appears: structural change
-    sl = Find<pui::Slider>(panel, L"Brightness");
-    sl->SetRangeValue(0.7);
-    LT_CHECK(!c.player.cmds.empty());     // then only commands
-    auto* sat = Find<pui::Slider>(panel, L"Saturation");
-    if (sat) sat->SetRangeValue(1.4);
+    LT_CHECK(!Find<pui::Slider>(panel, L"Brightness") && !Find<pui::Slider>(panel, L"Gamma"));
     size_t vfBefore = c.player.vf.size();
-    auto* reset = Find<pui::Button>(panel, L"");
     pui::Button* btn = nullptr;
     Walk(panel, [&](pui::Widget* w) { if (auto* b = dynamic_cast<pui::Button*>(w)) if (b->Text() == L"Reset video settings") btn = b; });
     LT_CHECK(btn != nullptr);
-    (void)reset;
     if (!btn) return;
     btn->onClick();
     c.Pump();                              // RebuildLater
-    LT_CHECK(c.svc.filters.Settings().brightness == 0.0);
-    LT_CHECK(c.svc.filters.Settings().saturation == 1.0);
-    LT_CHECK(c.player.vf.size() > vfBefore);   // eq removed -> rebuild with the (empty) video filter
-    LT_CHECK(c.player.vf.back().empty());
-    panel = e.Panel();
-    sl = Find<pui::Slider>(panel, L"Brightness");
-    LT_CHECK(sl && sl->Value() == 0.0);
-    auto* sat2 = Find<pui::Slider>(panel, L"Saturation");
-    LT_CHECK(sat2 && sat2->Value() == 1.0);
-}
-
-LOGIC_TEST(fxpanel_reset_with_active_eq_keeps_other_eq_values_and_sends_eq_commands) {
-    // brightness reset while contrast stays non-default: the eq filter stays, so the reset is a live command only
-    Env e(1120, 720);
-    if (!e.Ok()) return;
-    PanelCtx& c = *e.ctx;
-    ShowFiltersPanel(c, FiltersTab::Video);
-    pui::Widget* panel = e.Panel();
-    if (!panel) { LT_CHECK(false); return; }
-    Find<pui::Slider>(panel, L"Brightness")->SetRangeValue(0.4);
-    c.player.cmds.clear();
-    Find<pui::Slider>(panel, L"Brightness")->SetRangeValue(0.0);   // user drags back to 0 with contrast still default -> eq removed
-    LT_CHECK(c.svc.filters.Settings().brightness == 0.0);
+    LT_CHECK(c.svc.filters.Settings().deinterlace == wvp::DeinterlaceMode::Off);
+    LT_CHECK(c.player.vf.size() > vfBefore);   // the deinterlacer is removed: rebuild with the (empty) video filter
     LT_CHECK(c.player.vf.back().empty());
 }
 
@@ -214,7 +188,7 @@ LOGIC_TEST(fxpanel_inline_error_line_shows_mapped_text_when_panel_opens_and_live
     if (!e.Ok()) return;
     PanelCtx& c = *e.ctx;
     wvp::FilterErrorInfo err;
-    err.Type = L"video"; err.Filter = L"bogus_filter"; err.Code = -1279870712; err.Message = L"Filter not found";
+    err.Type = "video"; err.Filter = "bogus_filter"; err.Code = -1279870712; err.Message = "Filter not found";
     fx::SetFilterError(err);   // arrives while no panel is open (the shell closed it for the dialog)
     ShowFiltersPanel(c, FiltersTab::Advanced);   // what EditCustom does after PromptText returns
     pui::Widget* panel = e.Panel();
@@ -229,7 +203,7 @@ LOGIC_TEST(fxpanel_inline_error_line_shows_mapped_text_when_panel_opens_and_live
         }
     });
     // live: a second error while the panel is open updates the same line
-    err.Type = L"audio"; err.Code = -22; err.Filter = L"volume=";
+    err.Type = "audio"; err.Code = -22; err.Filter = "volume=";
     fx::SetFilterError(err);
     bool seen = false;
     Walk(panel, [&](pui::Widget* w) { if (w->GetRole() == pui::Role::Text && w->Name().find(L"Audio filter failed: Invalid argument") != std::wstring::npos) seen = true; });
@@ -297,8 +271,8 @@ LOGIC_TEST(fxpanel_tab_switch_resizes_panel_to_content) {
     if (!e.Ok()) return;
     ShowFiltersPanel(*e.ctx, FiltersTab::Advanced);
     float hAdv = e.Panel()->Bounds().h();
-    ShowFiltersPanel(*e.ctx, FiltersTab::Video);
-    float hVid = e.Panel()->Bounds().h();
-    LT_CHECK(hVid > hAdv + 20);
+    ShowFiltersPanel(*e.ctx, FiltersTab::Audio);
+    float hAud = e.Panel()->Bounds().h();
+    LT_CHECK(hAud > hAdv + 20);
     LT_CHECK(e.ctx->host.PopupCount() == 1);
 }

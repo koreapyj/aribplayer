@@ -5,7 +5,7 @@
 #include <exception>
 #include <string>
 
-#include "wvp/TestGuard.h"
+#include "wvp/win32/TestGuard.h"
 #include "wvptest.h"
 
 int main(int argc, char** argv) {

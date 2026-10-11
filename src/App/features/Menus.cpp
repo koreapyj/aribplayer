@@ -96,14 +96,7 @@ std::vector<MenuItemDesc> BuildMenu(const MenuState& s, std::function<void(const
         else m.push_back(MenuItemDesc::Sub(Tr(L"Subtitles", L"자막"), std::move(subs), G::Subtitles));
     }
     {
-        std::vector<MenuItemDesc> rot;
-        const int degs[] = {0, 90, 180, 270};
-        for (int d : degs)
-            rot.push_back(MenuItemDesc::Radio(std::to_wstring(d) + L"°", (int)s.rotation == d, cmd(Cmd::SetRotation, d)));
         std::vector<MenuItemDesc> vs;
-        vs.push_back(MenuItemDesc::Sub(Tr(L"Rotate", L"회전"), std::move(rot), G::Rotate));
-        vs.push_back(MenuItemDesc::Check(Tr(L"Flip horizontally", L"좌우 반전"), s.flipH, [run](bool v) { if (run) run(MenuCmd{Cmd::FlipH, 0, 0, v}); }));
-        vs.push_back(MenuItemDesc::Check(Tr(L"Flip vertically", L"상하 반전"), s.flipV, [run](bool v) { if (run) run(MenuCmd{Cmd::FlipV, 0, 0, v}); }));
         vs.push_back(MenuItemDesc::Check(Tr(L"Zoom to fill", L"화면 채우기"), s.zoom, [run](bool v) { if (run) run(MenuCmd{Cmd::Zoom, 0, 0, v}); },
                                          acc(CommandId::ZoomToFill)));
         vs.push_back(item(Tr(L"Enhancements…", L"영상 향상…"), CommandId::VideoEnhancements, G::VideoEnhancer));
@@ -192,9 +185,6 @@ MenuState CaptureMenuState(AppContext& ctx) {
     }
     const auto& f = ctx.Svc().filters.Settings();
     s.speed = f.speed;
-    s.rotation = f.rotation;
-    s.flipH = f.flipHorizontal;
-    s.flipV = f.flipVertical;
     s.zoom = IsZoomToFill();
     return s;
 }
@@ -211,11 +201,6 @@ void Run(AppContext& ctx, const menus::MenuCmd& c) {
         if (auto* ctl = ctx.Controller()) ctl->SetRepeat((wvp::RepeatMode)c.index);
         break;
     case Cmd::SetSpeed: SetPlaybackSpeed(ctx, c.value); break;
-    case Cmd::SetRotation:
-        ApplyFilterEdit(ctx, [&](wvp::FilterSettings& s) { s.rotation = (wvp::Rotation)(int)c.value; });
-        break;
-    case Cmd::FlipH: ApplyFilterEdit(ctx, [&](wvp::FilterSettings& s) { s.flipHorizontal = c.flag; }); break;
-    case Cmd::FlipV: ApplyFilterEdit(ctx, [&](wvp::FilterSettings& s) { s.flipVertical = c.flag; }); break;
     case Cmd::Zoom: SetZoomToFill(ctx, c.flag); break;
     case Cmd::SetAlwaysOnTop:
         ctx.Svc().settings.alwaysOnTop = sl::AlwaysOnTopFromIndex(c.index);

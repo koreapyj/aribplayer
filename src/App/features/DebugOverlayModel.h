@@ -29,7 +29,6 @@ struct OverlayContext {
     std::string resumeDecision;
     std::string url;
     std::string openOptions;        // compact "k=v k=v" line of the options passed to ffp_open
-    std::string ffplayCmd;
     double requestedSpeed = 0;      // FilterManager speed; 0 = unknown (info.Speed is used)
     std::string deinterlaceRequested;   // requested Deinterlace mode: "", "off", "deinterlace" (On), "ivtc"
     std::string adapterNote;        // video GPU, display adapter, why, runner-up ("video GPU NVIDIA ... (luid ...), display ..."); "" = unknown
@@ -52,7 +51,7 @@ struct GraphCompare {
 GraphCompare CompareGraph(const std::string& requested, const std::vector<std::string>& actualNames);
 /// Product of every atempo value in the audio graph (1.0 when none), `any` = at least one atempo present.
 double AtempoProduct(const std::string& afGraph, bool* any = nullptr);
-/// One row for the single Deinterlace option: "IVTC: ivtc_cuda (cuda), residual-combing fallback unavailable" |
+/// One row for the single Deinterlace option: "IVTC: ivtc_d3d11 (d3d11), residual-combing fallback unavailable" |
 /// "IVTC: ivtc_d3d11 (d3d11va)" | "IVTC: fieldmatch+bwdif(interlaced)+decimate (CPU)" | "bwdif (CPU)" | "none" ...;
 /// for On the planner's reason follows: "yadif (CPU); priority efficiency: no GPU deinterlacer -> yadif".
 /// `warn` when the requested mode is not in the actual graph.

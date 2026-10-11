@@ -19,6 +19,7 @@ constexpr Suffix kSuffixes[] = {
     {"_cuda", FrameDomain::Cuda}, {"_npp", FrameDomain::Cuda}, {"_cuvid", FrameDomain::Cuda},
     {"_opencl", FrameDomain::OpenCl}, {"_qsv", FrameDomain::Qsv}, {"_d3d11va", FrameDomain::D3D11}, {"_d3d11", FrameDomain::D3D11},
     {"_d3d12", FrameDomain::D3D12}, {"_vulkan", FrameDomain::Vulkan}, {"_dxva2", FrameDomain::Dxva2},
+    {"_videotoolbox", FrameDomain::VideoToolbox},
 };
 
 struct Load { const char* name; double load; };

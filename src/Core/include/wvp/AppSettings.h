@@ -1,5 +1,5 @@
 #pragma once
-// JSON persistence in %LOCALAPPDATA%\aribplayer\settings.json (path injectable for tests).
+// JSON persistence in platform::AppDataDir()\settings.json (path injectable for tests).
 // Unknown keys are ignored, out-of-range values clamped.
 #include <cstdint>
 #include <string>
@@ -20,28 +20,24 @@ struct WindowPlacement {
     bool operator==(const WindowPlacement&) const = default;
 };
 
-/// Valid hwDecoder values ("auto", "gpu" = prefer GPU, "d3d11va", "d3d12va", "cuda", "dxva2", "off"); anything else normalises to "auto".
-bool IsValidHwDecoder(const std::wstring& v);
-/// Valid presenter values ("auto", "d3d11", "sdl"); anything else normalises to "auto".
-bool IsValidPresenter(const std::wstring& v);
+/// Valid hwDecoder values ("auto", "gpu" = prefer GPU, "off", or a device type: "d3d11va", "d3d12va", "dxva2",
+/// "videotoolbox"); anything else normalises to "auto".
+bool IsValidHwDecoder(const std::string& v);
 
-/// The planner preferences of the two settings: auto->Auto, gpu->PreferGpu, d3d11va/d3d12va/cuda/dxva2->Forced(name), off->Software;
-/// presenter auto->Auto, d3d11->D3D11, sdl->Sdl.
+/// The planner preferences of the decoder setting: auto->Auto, gpu->PreferGpu, a device type->Forced(name), off->Software.
 struct PlanPrefs {
     DecoderPref decoder = DecoderPref::Auto;
     std::string forcedDecoder;
-    PresenterPref presenter = PresenterPref::Auto;
     bool operator==(const PlanPrefs&) const = default;
 };
-PlanPrefs PlanPrefsFor(const std::wstring& hwDecoder, const std::wstring& presenter);
+PlanPrefs PlanPrefsFor(const std::string& hwDecoder);
 
 struct AppSettings {
     ThemeSetting theme = ThemeSetting::System;
     std::uint32_t accentColor = 0;           // 0 = system accent, else ARGB
     AlwaysOnTop alwaysOnTop = AlwaysOnTop::Disable;   // JSON key "alwaysOnTop": "Disable"|"Enable"|"WhenPlaying"|"WhenFullscreen"; else Disable
-    std::wstring hwDecoder = L"auto";        // "auto" | "gpu" | "d3d11va" | "d3d12va" | "cuda" | "dxva2" | "off"; JSON key "hwDecoder" (absent/invalid -> auto)
-    std::wstring hwDecoderLastOn = L"auto";  // last non-"off" hwDecoder: what the bar H/W chip switches back to; JSON key "hwDecoderLastOn" (absent/invalid/"off" -> auto)
-    std::wstring presenter = L"auto";        // "auto" | "d3d11" | "sdl"; JSON key "presenter" (absent/invalid -> auto)
+    std::string hwDecoder = "auto";        // see IsValidHwDecoder; JSON key "hwDecoder" (absent/invalid -> auto)
+    std::string hwDecoderLastOn = "auto";  // last non-"off" hwDecoder: what the bar H/W chip switches back to; JSON key "hwDecoderLastOn" (absent/invalid/"off" -> auto)
     // Settings > Playback > Video GPU. JSON key "videoGpu": "auto" (also absent/invalid) or
     // {"luid": "HHHHHHHH:LLLLLLLL", "vendorId": N, "deviceId": N, "name": "..."}.
     VideoGpuPref videoGpu;
@@ -57,8 +53,8 @@ struct AppSettings {
     bool debugLogging = false;               // write the libffplay + app log to %LOCALAPPDATA%\aribplayer\logs\aribplayer-YYYYMMDD.log
     bool showCaptions = true;                 // ARIB caption layer; missing key means on
     bool showSuperimpose = true;               // ARIB superimpose layer; missing key means on
-    std::wstring aribFont;                     // optional TTF override; empty = bundled WLC Maru ARIB font
-    std::wstring currentPlaylist;              // active named playlist (PlaylistStore name); empty = the unnamed playlist; missing key = empty
+    std::string aribFont;                     // optional TTF override; empty = bundled WLC Maru ARIB font
+    std::string currentPlaylist;              // active named playlist (PlaylistStore name); empty = the unnamed playlist; missing key = empty
 
     bool operator==(const AppSettings&) const = default;
 };
@@ -66,12 +62,11 @@ struct AppSettings {
 class SettingsStore {
 public:
     /// Empty path = DefaultPath().
-    explicit SettingsStore(std::wstring path = {});
+    explicit SettingsStore(std::string path = {});
 
-    static std::wstring DefaultPath();   // AppDataDir()\settings.json
-    static std::wstring AppDataDir();    // %LOCALAPPDATA%\aribplayer
+    static std::string DefaultPath();   // platform::AppDataDir() + settings.json
 
-    const std::wstring& Path() const { return path_; }
+    const std::string& Path() const { return path_; }
 
     /// Missing or corrupt file -> defaults; never throws.
     AppSettings Load() const;
@@ -83,7 +78,7 @@ public:
     static bool FromJson(const std::string& utf8, AppSettings& out);
 
 private:
-    std::wstring path_;
+    std::string path_;
 };
 
 }

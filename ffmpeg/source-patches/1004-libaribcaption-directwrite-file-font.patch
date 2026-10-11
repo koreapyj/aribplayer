@@ -30,7 +30,7 @@
  static void estimate_video_frame_size(ARIBCaptionContext *ctx)
  {
      if (ctx->avctx->width > 0 && ctx->avctx->height > 0) {
-@@ -1554,6 +1577,11 @@ static av_cold int aribcaption_init(AVCo
+@@ -1553,6 +1576,11 @@ static av_cold int aribcaption_init(AVCo
  {
      ARIBCaptionContext *ctx = avctx->priv_data;
      aribcc_profile_t profile;
@@ -42,7 +42,7 @@
      int ret = 0;
  
      ctx->avctx = avctx;
-@@ -1622,14 +1650,32 @@ static av_cold int aribcaption_init(AVCo
+@@ -1621,14 +1649,32 @@ static av_cold int aribcaption_init(AVCo
          break;
  
      case SUBTITLE_BITMAP:
@@ -53,8 +53,8 @@
 +                return has_file_font;
 +            if (has_file_font) {
 +                /* The DirectWrite provider resolves file: fonts to a path and face index. Render them
-+                 * with FreeType, as the reference Android player does, so the glyph and outline
-+                 * rasterization match it; without FreeType keep the DirectWrite renderer. */
++                 * with FreeType so the glyph and outline rasterization match the reference rendering;
++                 * without FreeType keep the DirectWrite renderer. */
 +                font_provider_type = ARIBCC_FONTPROVIDER_TYPE_DIRECTWRITE;
 +#if defined(ARIBCC_USE_FREETYPE)
 +                text_renderer_type = ARIBCC_TEXTRENDERER_TYPE_FREETYPE;
@@ -77,7 +77,7 @@
              av_log(avctx, AV_LOG_ERROR, "Failed to initialize libaribcaption renderer.\n");
              return AVERROR_EXTERNAL;
          }
-@@ -1673,6 +1719,32 @@ static av_cold int aribcaption_init(AVCo
+@@ -1672,6 +1718,32 @@ static av_cold int aribcaption_init(AVCo
                          fonts++;
                  }
              }

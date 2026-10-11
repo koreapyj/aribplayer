@@ -7,7 +7,7 @@
 #include "features/Logging.h"
 #include "features/SettingsService.h"
 #include "wvp/AppSettings.h"
-#include "wvp/Utf.h"
+#include "wvp/win32/Utf.h"
 
 namespace app {
 
@@ -17,30 +17,6 @@ std::string Join(const std::vector<std::string>& v) {
     for (const auto& e : v) s += (s.empty() ? "" : ", ") + e;
     return s.empty() ? "-" : s;
 }
-}
-
-std::vector<std::pair<std::wstring, std::wstring>> LibffplayDeviceOptions(const std::wstring& adapterLuid, const AppOptions& o) {
-    std::vector<std::pair<std::wstring, std::wstring>> v;
-    if (!adapterLuid.empty()) v.emplace_back(L"d3d11_adapter_luid", adapterLuid);
-    if (o.d3d11Debug) v.emplace_back(L"d3d11_debug", L"1");
-    if (!o.d3d11ForceCaps.empty()) v.emplace_back(L"d3d11_force_caps", o.d3d11ForceCaps);
-    if (!o.d3d11Route.empty()) v.emplace_back(L"d3d11_route", o.d3d11Route);
-    return v;
-}
-
-std::wstring ProbeOptions(const std::wstring& adapterLuid, const AppOptions& o) {
-    std::wstring s;
-    for (const auto& [k, v] : LibffplayDeviceOptions(adapterLuid, o))
-        if (k != L"d3d11_route") s += (s.empty() ? L"" : L"\n") + k + L"=" + v;
-    return s;
-}
-
-wvp::CapabilitySet WithoutCuda(wvp::CapabilitySet caps) {
-    for (auto& d : caps.devices)
-        if (d.type == "cuda") { d.ok = false; d.error = "disabled by --no-cuda"; }
-    std::erase_if(caps.decoders, [](const wvp::DecoderCap& d) { return d.hwaccel == "cuda"; });
-    for (auto& p : caps.presenters) { p.importCuda = false; p.importCudaZeroCopy = false; }
-    return caps;
 }
 
 void LogCaps(const wvp::CapabilitySet& c) {
@@ -77,43 +53,36 @@ void App::LogOpenPlan() {
 }
 
 void App::WirePipeline() {
-    ctl_->beforeOpen = [this](const std::wstring& url) {
+    ctl_->beforeOpen = [this](const std::string& url) {
         // Resolve the Windows caption style and font on every open, before the final options are logged/passed to libffplay.
         ApplyCaptionOpenOptions(*ctl_, svc_->settings);
         // plan with what we know about this file (cached from an earlier open) before the options are built
         wvp::ContentInfo c = pipe_.BeforeOpen(url);
         svc_->filters.SetContent(c);
         SelectVideoGpuNow("open", false);
+        ReportPlanProblem();
     };
     player_->Prepared.add([this](const wvp::MediaPreparedInfo&) { OnPipelinePrepared(); });
     player_->Error.add([this](const wvp::PlayerErrorInfo& e) {
-        if (e.DeviceLost) OnVideoDeviceLost("decoder: " + wvp::ToUtf8(e.Message) + " " + e.RemovedReason);
+        if (e.DeviceLost) OnVideoDeviceLost("decoder: " + e.Message + " " + e.RemovedReason);
     });
     player_->FilterError.add([this](const wvp::FilterErrorInfo& e) {
         const wvp::Plan* pl = svc_->filters.CurrentPlan();
         if (!pl) return;
         if (auto fb = pipe_.OnFilterError(*pl, e)) PipelineFallback(*fb);
     });
-    player_->PresenterError.add([this](const wvp::PresenterErrorInfo& e) {
-        if (e.DeviceLost) { OnVideoDeviceLost("presenter: " + wvp::ToUtf8(e.Error) + " " + e.RemovedReason); return; }
-        const wvp::Plan* pl = svc_->filters.CurrentPlan();
-        if (!pl) return;
-        if (auto fb = pipe_.OnPresenterError(*pl, e)) PipelineFallback(*fb);   // libffplay is already on SDL: replan without d3d11, reopen
-    });
-    ctl_->onPresenterParamsRejected = [this](int err, const wvp::PresenterParams& rejected) {
-        // the presenter cannot apply what the plan absorbed: move that operation into the graph and replan
-        log::Event("pipeline", "presenter refused its parameters (error " + std::to_string(err) + "): not absorbing them", log::kWarning);
-        wvp::FilterChange ch = svc_->filters.PresenterParamsRejected(rejected);
-        if (const wvp::Plan* pl = svc_->filters.CurrentPlan()) log::Event("pipeline", "replanned: " + pl->Summary());
-        SendFilterChange(*this, ch);
-    };
+    player_->PresenterError.add([this](const wvp::PresenterErrorInfo& e) { OnPresenterError(e); });
 }
 
 void App::OnPipelinePrepared() {
     if (!player_ || !ctl_) return;
+    if (!firstPreparedMs_) {
+        firstPreparedMs_ = Now() - startMs_;
+        log::Event("open", "first media prepared " + std::to_string(firstPreparedMs_) + " ms after start");
+    }
     auto mi = player_->GetMediaInfo();
     if (!mi) return;
-    const std::wstring url = lastOpenUrl_;
+    const std::string url = lastOpenUrl_;
     wvp::PipelineSession::Prepared pr = pipe_.OnPrepared(url, *mi);
     if (!pr.content.Known() || !svc_->filters.PlannerActive()) {
         if (pr.content.Known()) svc_->filters.SetContent(pr.content);   // remembered for when capabilities arrive
@@ -130,7 +99,7 @@ void App::OnPipelinePrepared() {
             if (ctl_ && pipe_.Generation() == gen && Loaded()) ctl_->ReopenCurrentHere();
         });
     } else {
-        SendFilterChange(*this, ch);   // graph rebuild / eq commands only
+        SendFilterChange(*this, ch);   // graph rebuild only
     }
 }
 

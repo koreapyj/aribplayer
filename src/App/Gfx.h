@@ -23,7 +23,7 @@ struct Surf {
 using StepFn = std::function<void(const char* step, HRESULT hr)>;
 
 /// The video GPU libffplay plays on (App::SelectVideoGpuNow; the UI device stays on Windows' default adapter). luid "" = none:
-/// software decoding + SDL. note says why.
+/// software decoding. note says why.
 struct PlaybackAdapter {
     std::string luid;
     std::wstring name;
@@ -90,15 +90,3 @@ private:
     DWORD removedCookie_ = 0;
 };
 
-struct HwAdapter {
-    std::string luid;
-    std::wstring name;
-    unsigned vendorId = 0, deviceId = 0;
-    bool hasPci = false;                   // PCI bus/device/function from D3DKMT (KMTQAITYPE_ADAPTERADDRESS)
-    unsigned bus = 0, device = 0, function = 0;
-    bool hasOutputs = false;               // drives at least one monitor
-};
-/// Hardware adapters in DXGI order (no software adapters, no Microsoft Basic Render Driver). No device is created.
-std::vector<HwAdapter> EnumHardwareAdapters();
-/// LUID of the adapter whose DXGI output holds the monitor the window is on; "" when no adapter reports that monitor.
-std::string DisplayAdapterLuid(HWND hwnd);

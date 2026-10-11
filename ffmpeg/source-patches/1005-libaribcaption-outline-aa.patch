@@ -334,7 +334,7 @@
  static int set_ass_header(ARIBCaptionContext *ctx)
  {
      AVCodecContext *avctx = ctx->avctx;
-@@ -1405,13 +1441,8 @@ static int aribcaption_rerender(ARIBCapt
+@@ -1404,13 +1440,8 @@ static int aribcaption_rerender(ARIBCapt
      h = &ctx->store.events[idx];
      /* The renderer copies the caption; the history keeps ownership. Appending
       * an older pts re-inserts it and invalidates the renderer's image cache. */
@@ -349,12 +349,11 @@
      if (ret < 0)
          return ret;
      ctx->rendered_subtitle_pts = h->subtitle_pts;
-@@ -1692,7 +1723,8 @@ static av_cold int aribcaption_init(AVCo
+@@ -1691,7 +1722,7 @@ static av_cold int aribcaption_init(AVCo
  
          aribcc_renderer_set_storage_policy(ctx->renderer, ARIBCC_CAPTION_STORAGE_POLICY_MINIMUM, 0);
          aribcc_renderer_set_replace_drcs(ctx->renderer, ctx->replace_drcs);
 -        aribcc_renderer_set_force_stroke_text(ctx->renderer, ctx->force_stroke_text);
-+        /* Forced strokes are preprocessed with opaque colors before appending captions. */
 +        aribcc_renderer_set_force_stroke_text(ctx->renderer, false);
          aribcc_renderer_set_force_no_background(ctx->renderer, ctx->ignore_background);
          aribcc_renderer_set_force_no_ruby(ctx->renderer, ctx->ignore_ruby);

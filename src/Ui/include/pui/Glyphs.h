@@ -23,7 +23,6 @@ constexpr wchar_t Subtitles = L'';
 constexpr wchar_t Equalizer = L'';
 constexpr wchar_t VideoSettings = L'';   // video camera glyph used for "Video settings"
 constexpr wchar_t VideoEnhancer = L'';
-constexpr wchar_t Rotate = L'';
 constexpr wchar_t Properties = L'';
 constexpr wchar_t Info = L'';
 

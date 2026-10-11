@@ -1,5 +1,5 @@
 #pragma once
-// The player bar (spec: 86 DIP dock): seek row (elapsed | slider | total) and transport row (Play/Pause, Stop, Prev, Next, Open,
+// The player bar (86 DIP dock): seek row (elapsed | slider | total) and transport row (Play/Pause, Stop, Prev, Next, Open,
 // codec chips, ... Mute, volume slider, Subtitle, 제어창, Playlist panel, Full screen). Windowed it is docked under the video and
 // paints no background (Mica shows through); in full screen it is the auto-hide overlay with `barFill` + a 1 px top stroke.
 // One widget per button (tooltip, automation Name, Invoke, accelerator text); the sliders are the shell's own widgets.

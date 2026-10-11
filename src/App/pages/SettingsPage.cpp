@@ -23,7 +23,7 @@
 #include "pui/ScrollViewer.h"
 #include "pui/Toggles.h"
 #include "wvp/FfPlayer.h"
-#include "wvp/Utf.h"
+#include "wvp/win32/Utf.h"
 
 namespace app {
 
@@ -214,7 +214,7 @@ std::wstring PickAribFont(HWND owner) {
 
 std::wstring CaptionFontDescription(const wvp::AppSettings& settings) {
     if (settings.aribFont.empty()) return Tr(L"Using the bundled WLC Maru ARIB font; the decoder falls back to Windows fonts if unavailable.", L"내장된 WLC Maru ARIB 글꼴을 사용합니다. 사용할 수 없으면 디코더가 Windows 글꼴로 대체합니다.");
-    return Tr(L"Custom font: ", L"사용자 지정 글꼴: ") + settings.aribFont;
+    return std::wstring(Tr(L"Custom font: ", L"사용자 지정 글꼴: ")) + wvp::ToWide(settings.aribFont);
 }
 
 class SettingsPageImpl final : public pui::Widget {
@@ -327,7 +327,7 @@ private:
         };
 
         auto* hw = Row(pui::glyph::VideoSettings, Tr(L"Hardware decoding", L"하드웨어 디코딩"),
-                       Tr(L"Auto tries d3d11va, d3d12va, CUDA and DXVA2 before software; Prefer GPU lets the pipeline planner pick the GPU decoder with the fewest copies. Changing it re-opens the current item at the same position", L"자동은 소프트웨어 이전에 d3d11va, d3d12va, CUDA, DXVA2를 시도하며, GPU 우선은 파이프라인 계획기가 복사가 가장 적은 GPU 디코더를 고르게 합니다. 변경하면 현재 항목이 같은 위치에서 다시 열립니다"), true);
+                       Tr(L"Auto lets the pipeline planner pick the decoder with the fewest copies, software included; Prefer GPU always uses a GPU decoder when one fits. Changing it re-opens the current item at the same position", L"자동은 파이프라인 계획기가 소프트웨어를 포함해 복사가 가장 적은 디코더를 고르게 하며, GPU 우선은 맞는 GPU 디코더가 있으면 항상 사용합니다. 변경하면 현재 항목이 같은 위치에서 다시 열립니다"), true);
         auto hwGroup = std::make_unique<pui::RadioGroup>();
         hwGroup->SetHorizontal(true);
         hwGroup->SetName(Tr(L"Hardware decoding", L"하드웨어 디코딩"));
@@ -338,21 +338,6 @@ private:
         hwCtl->onSelectionChanged = [this](int i) {
             if (i < 0) return;
             state_.hwDecoderIndex = i;
-            Commit();
-        };
-
-        auto* vo = Row(pui::glyph::VideoSettings, Tr(L"Video output", L"영상 출력"),
-                       Tr(L"Auto picks the cheapest output for the content; Direct3D 11 shows hardware frames without a copy, SDL always works. Changing it re-opens the current item at the same position", L"자동은 콘텐츠에 가장 부담이 적은 출력을 고르며, Direct3D 11은 하드웨어 프레임을 복사 없이 표시하고, SDL은 항상 작동합니다. 변경하면 현재 항목이 같은 위치에서 다시 열립니다"), true);
-        auto voGroup = std::make_unique<pui::RadioGroup>();
-        voGroup->SetHorizontal(true);
-        voGroup->SetName(Tr(L"Video output", L"영상 출력"));
-        voGroup->SetAutomationId(L"VideoOutputGroup");
-        for (const auto& ch : sl::VideoOutputChoices()) voGroup->AddOption(ch.label)->SetName(ch.label);
-        voGroup->SetSelectedIndex(state_.videoOutputIndex);
-        auto* voCtl = vo->SetControl(std::move(voGroup));
-        voCtl->onSelectionChanged = [this](int i) {
-            if (i < 0) return;
-            state_.videoOutputIndex = i;
             Commit();
         };
 
@@ -472,7 +457,7 @@ private:
     void BrowseCaptionFont() {
         std::wstring picked = PickAribFont(env_.owner ? env_.owner : ctx_.MainHwnd());
         if (picked.empty()) return;
-        ctx_.Svc().settings.aribFont = std::move(picked);
+        ctx_.Svc().settings.aribFont = wvp::ToUtf8(picked);
         Commit();
         Refresh();
         ctx_.ShowToast(Tr(L"Caption font saved", L"자막 글꼴을 저장했습니다"));

@@ -1,13 +1,14 @@
 #pragma once
 // Concrete filters that can realize each pipeline operation, discovered from a CapabilitySet at runtime.
 // Discovery order for a filter's frame domain:
-//   1. pad pixel formats (FilterCap::formats == List): a hw pix_fmt ("cuda", "opencl", ...) -> that domain, only sw formats -> System;
+//   1. pad pixel formats (FilterCap::formats == List): a hw pix_fmt ("d3d11", "cuda", ...) -> that domain, only sw formats -> System;
 //      formats == Any (passthrough) -> FrameDomain::Any;
 //   2. the suffix map ("_cuda", "_npp", "_cuvid" -> Cuda; "_opencl" -> OpenCl; "_qsv" -> Qsv; "_d3d11"/"_d3d11va" -> D3D11;
-//      "_d3d12" -> D3D12; "_vulkan" -> Vulkan; "_dxva2" -> Dxva2);
+//      "_d3d12" -> D3D12; "_vulkan" -> Vulkan; "_dxva2" -> Dxva2; "_videotoolbox" -> VideoToolbox);
 //   3. otherwise System.
-// The operation of a filter comes from its base name (name minus the domain suffix: "ivtc_cuda" -> "ivtc") looked up in the
-// base-name map, then from the one-line alias table (kAliases). So a new upstream "ivtc_cuda" or a future "ivtc_npp" needs no code change.
+// The operation of a filter comes from its base name (name minus the domain suffix: "ivtc_d3d11" -> "ivtc") looked up in the
+// base-name map, then from the one-line alias table (kAliases). So a new upstream variant ("ivtc_vulkan") needs no code change.
+// Cuda-domain variants are discovered like any other but are never planned: the player has no CUDA device (CapabilitySet.h).
 // Driver deinterlacers and video post-processors (deinterlace_d3d11/_qsv/_vaapi/_amf, vpp_qsv/_amf, ...) are denied: never a variant.
 // Pure logic, no Win32.
 #include <optional>

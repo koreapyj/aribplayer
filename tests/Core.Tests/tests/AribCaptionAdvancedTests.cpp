@@ -1,4 +1,5 @@
-// Fixture-optional hidden-host integration tests for ARIB cue timing and presenter behavior.
+// Fixture-optional integration tests for ARIB cue timing and the caption canvas, on the recording presenter (its view
+// size stands for the video area).
 #include "wvptest.h"
 
 #include <algorithm>
@@ -16,34 +17,13 @@
 
 #include "wvp/FfPlayer.h"
 #include "wvp/JsonLite.h"
-#include "wvp/Utf.h"
+#include "wvp/win32/Utf.h"
+#include "TestPlayer.h"
 
 using namespace wvp;
 namespace fs = std::filesystem;
 
 namespace {
-
-constexpr UINT kNotifyMsg = WM_APP + 70;
-constexpr wchar_t kHostClass[] = L"WvpAribAdvancedTestHost";
-
-LRESULT CALLBACK HostProc(HWND hwnd, UINT message, WPARAM w, LPARAM l) {
-    if (message == kNotifyMsg) {
-        FfPlayer::HandleNotify(w, l);
-        return 0;
-    }
-    return DefWindowProcW(hwnd, message, w, l);
-}
-
-void EnsureHostClass() {
-    static const ATOM atom = [] {
-        WNDCLASSW wc{};
-        wc.lpfnWndProc = HostProc;
-        wc.hInstance = GetModuleHandleW(nullptr);
-        wc.lpszClassName = kHostClass;
-        return RegisterClassW(&wc);
-    }();
-    (void)atom;
-}
 
 fs::path RepoRoot() {
     static const fs::path root = [] {
@@ -69,26 +49,8 @@ void RequireFixture() {
         throw wvptest::SkipFailure{ "gitignored ARIB fixture is not present" };
 }
 
-void PumpMessages() {
-    MSG msg;
-    while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
-        TranslateMessage(&msg);
-        DispatchMessageW(&msg);
-    }
-}
-
 template <class F>
-bool WaitFor(F&& predicate, double seconds = 10.0) {
-    const auto deadline = std::chrono::steady_clock::now() +
-        std::chrono::milliseconds(static_cast<long long>(seconds * 1000.0));
-    while (std::chrono::steady_clock::now() < deadline) {
-        PumpMessages();
-        if (predicate()) return true;
-        Sleep(10);
-    }
-    PumpMessages();
-    return predicate();
-}
+bool WaitFor(F&& predicate, double seconds = 10.0) { return wvptest::WaitFor(predicate, seconds); }
 
 const json::Value* Member(const json::Value* object, std::string_view key) {
     return object && object->kind == json::Value::Kind::Object ? object->Find(key) : nullptr;
@@ -156,53 +118,41 @@ std::string PresenterName(const json::Value& root) {
     return presenter ? presenter->Str("name") : std::string{};
 }
 
-struct HiddenHost {
-    HWND parent = nullptr;
-    HWND video = nullptr;
-
-    HiddenHost() {
-        EnsureHostClass();
-        const HINSTANCE instance = GetModuleHandleW(nullptr);
-        parent = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, kHostClass, L"ARIB test host",
-            WS_POPUP, -32000, -32000, 640, 360, nullptr, nullptr, instance, nullptr);
-        if (parent)
-            video = CreateWindowExW(0, L"STATIC", L"video", WS_CHILD | WS_VISIBLE,
-                0, 0, 640, 360, parent, nullptr, instance, nullptr);
-    }
-
-    ~HiddenHost() {
-        if (parent) DestroyWindow(parent);
-    }
-};
-
 struct Session {
-    HiddenHost host;
     std::unique_ptr<FfPlayer> player;
+    wvptest::RecordingPresenter* presenter = nullptr;
+    int viewWidth = 640, viewHeight = 360;
     int prepared = 0;
     int errors = 0;
 
     Session() {
-        REQUIRE_MSG(host.parent && host.video, "could not create hidden ARIB host window");
         int error = 0;
-        player = FfPlayer::CreateSync(host.video, host.parent, kNotifyMsg, &error);
-        REQUIRE_MSG(player != nullptr, "FfPlayer::CreateSync failed: " + std::to_string(error));
+        player = wvptest::CreateTestPlayer(&presenter, &error);
+        REQUIRE_MSG(player != nullptr, "FfPlayer::Create failed: " + std::to_string(error));
+        presenter->Resize(viewWidth, viewHeight);
         player->Prepared.add([this](const MediaPreparedInfo&) { ++prepared; });
         player->Error.add([this](const PlayerErrorInfo&) { ++errors; });
     }
 
     ~Session() { player.reset(); }
 
-    void Open(const wchar_t* presenter, const wchar_t* hwaccel = nullptr, bool keepFrames = false) {
+    // The video area the presenter reports from now on (a resized view).
+    void Resize(int width, int height) {
+        viewWidth = width;
+        viewHeight = height;
+        presenter->Resize(width, height);
+    }
+
+    void Open(const char* hwaccel = nullptr, bool keepFrames = false) {
         REQUIRE_MSG(fs::exists(FontPath()), "bundled WLC Maru ARIB font is missing");
         const int before = prepared;
         OpenOptions options = {
-            { L"presenter", presenter },
-            { L"superimpose", L"0" },
-            { L"arib_font", FontPath().wstring() },
+            { "superimpose", "0" },
+            { "arib_font", AribFontOption(wvp::ToUtf8(FontPath().wstring())) },
         };
-        if (hwaccel && *hwaccel) options.emplace_back(L"hwaccel", hwaccel);
-        if (keepFrames) options.emplace_back(L"hwframes", L"keep");
-        REQUIRE_MSG(player->Open(FixturePath().wstring(), options) == 0, "ARIB fixture open rejected");
+        if (hwaccel && *hwaccel) options.emplace_back("hwaccel", hwaccel);
+        if (keepFrames) options.emplace_back("hwframes", "keep");
+        REQUIRE_MSG(player->Open(wvp::ToUtf8(FixturePath().wstring()), options) == 0, "ARIB fixture open rejected");
         REQUIRE_MSG(WaitFor([&] { return prepared > before || errors > 0; }, 25.0),
                     "fixture produced no PREPARED event");
         REQUIRE_MSG(errors == 0, "fixture open raised a player error");
@@ -265,13 +215,8 @@ void AppendDebugValue(std::ostringstream& out, std::string_view name, const json
     if (value) out << ' ' << name << '=' << CompactValue(value);
 }
 
-void AppendHostClientSize(std::ostringstream& out, HWND videoHwnd) {
-    RECT client{};
-    if (videoHwnd && GetClientRect(videoHwnd, &client)) {
-        out << " host_client=" << (client.right - client.left) << 'x' << (client.bottom - client.top);
-    } else {
-        out << " host_client=unavailable";
-    }
+void AppendViewSize(std::ostringstream& out, const Session& session) {
+    out << " view=" << session.viewWidth << 'x' << session.viewHeight;
 }
 
 std::string DiagnosticState(Session& session, const json::Value* snapshot = nullptr) {
@@ -283,7 +228,7 @@ std::string DiagnosticState(Session& session, const json::Value* snapshot = null
     if (!snapshot) {
         std::ostringstream out;
         out << " [diag debug=unavailable player_errors=" << session.errors;
-        AppendHostClientSize(out, session.host.video);
+        AppendViewSize(out, session);
         out << ']';
         return out.str();
     }
@@ -296,8 +241,6 @@ std::string DiagnosticState(Session& session, const json::Value* snapshot = null
         << " clock_master=" << CompactValue(Member(Member(snapshot, "sync"), "master"))
         << " presenter=" << CompactValue(Member(Member(snapshot, "presenter"), "name"))
         << " player_errors=" << session.errors;
-    AppendDebugValue(out, "presenter_requested", Member(Member(snapshot, "presenter"), "requested"));
-    AppendDebugValue(out, "renderer", Member(snapshot, "renderer"));
 
     const json::Value* video = Member(snapshot, "video");
     if (video && video->kind == json::Value::Kind::Null) {
@@ -310,7 +253,7 @@ std::string DiagnosticState(Session& session, const json::Value* snapshot = null
     AppendDebugValue(out, "frames_decoded", Member(fps, "frames_decoded"));
     AppendDebugValue(out, "frames_displayed", Member(fps, "frames_displayed"));
     AppendDebugValue(out, "video_queue", Member(Member(snapshot, "queues"), "video"));
-    AppendHostClientSize(out, session.host.video);
+    AppendViewSize(out, session);
 
     const auto caption = ReadCaption(*snapshot);
     if (caption) {
@@ -400,31 +343,18 @@ size_t DifferentPixels(const BgraFrame& a, const BgraFrame& b) {
     return different;
 }
 
-bool ResizeVideoWindow(HWND hwnd, int width, int height) {
-    return SetWindowPos(hwnd, nullptr, 0, 0, width, height,
-                        SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER) != FALSE;
-}
-
-bool GetClientSize(HWND hwnd, int& width, int& height) {
-    RECT r{};
-    if (!GetClientRect(hwnd, &r)) return false;
-    width = r.right - r.left;
-    height = r.bottom - r.top;
-    return width > 0 && height > 0;
-}
-
 bool HasCaptionStream(const MediaInfo& info) {
     for (const auto& stream : info.Streams)
-        if (stream.Type == StreamType::Subtitle && stream.AribType == L"caption") return true;
+        if (stream.Type == StreamType::Subtitle && stream.AribType == "caption") return true;
     return false;
 }
 
 }
 
-TEST_CASE_INTEGRATION(AribAdvanced_sdl_caption_transition_tracks_video_clock) {
+TEST_CASE_INTEGRATION(AribAdvanced_caption_transition_tracks_video_clock) {
     RequireFixture();
     Session s;
-    s.Open(L"sdl");
+    s.Open();
     const auto info = s.player->GetMediaInfo();
     REQUIRE(info.has_value());
     REQUIRE_MSG(HasCaptionStream(*info), "fixture has no classified ARIB caption stream");
@@ -474,13 +404,13 @@ TEST_CASE_INTEGRATION(AribAdvanced_sdl_caption_transition_tracks_video_clock) {
     CHECK_MSG(timingError <= oneFramePlusClockGranularity,
               "new caption transition was not presented within one frame of its start PTS (clock-start=" +
               std::to_string(timingError) + "s)");
-    CHECK_EQ(PresenterName(*transition), std::string("sdl"));
+    CHECK_EQ(PresenterName(*transition), std::string("recording"));
 }
 
-TEST_CASE_INTEGRATION(AribAdvanced_sdl_indefinite_caption_survives_hide_show) {
+TEST_CASE_INTEGRATION(AribAdvanced_indefinite_caption_survives_hide_show) {
     RequireFixture();
     Session s;
-    s.Open(L"sdl");
+    s.Open();
 
     std::optional<json::Value> activeWaitState;
     auto active = WaitForActive(s, 30.0, &activeWaitState);
@@ -558,10 +488,10 @@ TEST_CASE_INTEGRATION(AribAdvanced_sdl_indefinite_caption_survives_hide_show) {
     REQUIRE_MSG(showObserved, "active indefinite caption did not reappear after show");
 }
 
-TEST_CASE_INTEGRATION(AribAdvanced_sdl_indefinite_caption_clear_event_is_observable) {
+TEST_CASE_INTEGRATION(AribAdvanced_indefinite_caption_clear_event_is_observable) {
     RequireFixture();
     Session s;
-    s.Open(L"sdl");
+    s.Open();
     std::optional<json::Value> activeWaitState;
     auto active = WaitForActive(s, 30.0, &activeWaitState);
     REQUIRE_MSG(active.has_value(), "fixture produced no active ARIB caption cue" +
@@ -619,10 +549,10 @@ TEST_CASE_INTEGRATION(AribAdvanced_sdl_indefinite_caption_clear_event_is_observa
               "clear counter did not advance for the empty cue event" + DiagnosticState(s, &*clearState));
 }
 
-TEST_CASE_INTEGRATION(AribAdvanced_sdl_seek_flushes_active_caption_layer) {
+TEST_CASE_INTEGRATION(AribAdvanced_seek_flushes_active_caption_layer) {
     RequireFixture();
     Session s;
-    s.Open(L"sdl");
+    s.Open();
     const auto info = s.player->GetMediaInfo();
     REQUIRE(info.has_value());
     if (!info->Seekable || info->Duration <= 0.0)
@@ -681,10 +611,10 @@ TEST_CASE_INTEGRATION(AribAdvanced_sdl_seek_flushes_active_caption_layer) {
     REQUIRE_MSG(seekCompleted, "seek did not flush the active caption serial or reach its target");
 }
 
-TEST_CASE_INTEGRATION(AribAdvanced_sdl_resize_rerenders_without_losing_active_cue) {
+TEST_CASE_INTEGRATION(AribAdvanced_resize_rerenders_without_losing_active_cue) {
     RequireFixture();
     Session s;
-    s.Open(L"sdl");
+    s.Open();
     const auto info = s.player->GetMediaInfo();
     REQUIRE(info.has_value());
     const auto videoStreams = info->Of(StreamType::Video);
@@ -720,7 +650,8 @@ TEST_CASE_INTEGRATION(AribAdvanced_sdl_resize_rerenders_without_losing_active_cu
     const int oldRenders = before->rerenders;
 
     int clientWidth = 0, clientHeight = 0;
-    REQUIRE_MSG(GetClientSize(s.host.video, clientWidth, clientHeight), "could not query the initial hidden host size");
+    clientWidth = s.viewWidth;
+    clientHeight = s.viewHeight;
     double displayAspect = videoStreams.front().Height > 0
         ? static_cast<double>(videoStreams.front().Width) / videoStreams.front().Height : 16.0 / 9.0;
     if (videoStreams.front().SarNum > 0 && videoStreams.front().SarDen > 0)
@@ -728,9 +659,8 @@ TEST_CASE_INTEGRATION(AribAdvanced_sdl_resize_rerenders_without_losing_active_cu
     if (displayAspect <= 0.0) displayAspect = 16.0 / 9.0;
     const int targetWidth = std::max(960, clientWidth * 3 / 2);
     const int targetHeight = std::max(1, static_cast<int>(std::lround(targetWidth / displayAspect)));
-    REQUIRE_MSG(ResizeVideoWindow(s.host.video, targetWidth, targetHeight), "SetWindowPos failed for the resize test");
-    int expectedWidth = 0, expectedHeight = 0;
-    REQUIRE_MSG(GetClientSize(s.host.video, expectedWidth, expectedHeight), "could not query the resized hidden host size");
+    s.Resize(targetWidth, targetHeight);
+    const int expectedWidth = targetWidth, expectedHeight = targetHeight;
 
     bool observedBlank = false;
     std::optional<CaptionDebug> after;
@@ -783,10 +713,10 @@ TEST_CASE_INTEGRATION(AribAdvanced_sdl_resize_rerenders_without_losing_active_cu
 // A with-captions snapshot is re-rendered at the snapshot's own (window independent) size. The same paused cue
 // snapshotted under two different window sizes must therefore be byte-identical; a scaled copy of the live
 // bitmap would differ between the two sizes.
-TEST_CASE_INTEGRATION(AribAdvanced_sdl_snapshot_exact_rerender_is_window_size_independent) {
+TEST_CASE_INTEGRATION(AribAdvanced_snapshot_exact_rerender_is_window_size_independent) {
     RequireFixture();
     Session s;
-    s.Open(L"sdl");
+    s.Open();
     auto active = WaitForActive(s, 30.0);
     REQUIRE_MSG(active.has_value(), "fixture produced no active ARIB caption cue" + DiagnosticState(s));
     CHECK_EQ(s.player->Pause(), 0);
@@ -814,10 +744,9 @@ TEST_CASE_INTEGRATION(AribAdvanced_sdl_snapshot_exact_rerender_is_window_size_in
     CHECK_MSG(liveA->canvasWidth == start->canvasWidth && liveA->canvasHeight == start->canvasHeight,
               "snapshot re-render did not restore the live caption canvas" + DiagnosticState(s));
 
-    int w0 = 0, h0 = 0;
-    REQUIRE(GetClientSize(s.host.video, w0, h0));
+    const int w0 = s.viewWidth, h0 = s.viewHeight;
     const int w1 = std::max(960, w0 * 3 / 2), h1 = std::max(1, h0 * w1 / w0);
-    REQUIRE(ResizeVideoWindow(s.host.video, w1, h1));
+    s.Resize(w1, h1);
     const bool settled = WaitFor([&] {
         const auto c = readLive();
         return c && c->rects > 0 && c->canvasWidth != start->canvasWidth && c->canvasHeight != start->canvasHeight;
@@ -828,7 +757,7 @@ TEST_CASE_INTEGRATION(AribAdvanced_sdl_snapshot_exact_rerender_is_window_size_in
         throw wvptest::SkipFailure{ reason };
     }
     Sleep(300);
-    PumpMessages();
+    wvptest::Pump();
 
     auto videoB = s.Snapshot(false);
     auto capB = s.Snapshot(true);
@@ -856,7 +785,7 @@ TEST_CASE_INTEGRATION(AribAdvanced_sdl_snapshot_exact_rerender_is_window_size_in
               DiagnosticState(s));
 }
 
-TEST_CASE_INTEGRATION(AribAdvanced_sdl_new_caption_wins_observed_resize_race) {
+TEST_CASE_INTEGRATION(AribAdvanced_new_caption_wins_observed_resize_race) {
     // Opportunistic probe: it needs a new cue to arrive while a resize re-render is pending, and no public API can
     // force that. It skips with a fixed reason unless
     // WVP_RACE_TESTS=1 (then it makes the timing-dependent attempts below). Real coverage needs a libffplay debug hook
@@ -870,7 +799,7 @@ TEST_CASE_INTEGRATION(AribAdvanced_sdl_new_caption_wins_observed_resize_race) {
     }
     RequireFixture();
     Session s;
-    s.Open(L"sdl");
+    s.Open();
     std::optional<json::Value> activeWaitState;
     auto active = WaitForActive(s, 30.0, &activeWaitState);
     REQUIRE_MSG(active.has_value(), "fixture produced no active ARIB caption cue" +
@@ -900,7 +829,7 @@ TEST_CASE_INTEGRATION(AribAdvanced_sdl_new_caption_wins_observed_resize_race) {
         const int baseRenders = base->rerenders;
         const int width = resizeAttempt++ % 2 ? 1040 : 960;
         const int height = static_cast<int>(std::lround(width * 9.0 / 16.0));
-        if (!ResizeVideoWindow(s.host.video, width, height)) break;
+        s.Resize(width, height);
         const auto resizeStarted = std::chrono::steady_clock::now();
         auto resizeBaseDebug = ReadDebug(*s.player);
         if (resizeBaseDebug) lastRaceState = *resizeBaseDebug;
@@ -976,67 +905,8 @@ TEST_CASE_INTEGRATION(AribAdvanced_sdl_new_caption_wins_observed_resize_race) {
               "new cue generation lost to an older resize result" + DiagnosticState(s, &*latest));
 }
 
-TEST_CASE_INTEGRATION(AribAdvanced_d3d11_overlay_counters_preserve_direct_video_path) {
-    RequireFixture();
-    Session s;
-    s.Open(L"d3d11", L"d3d11va", true);
-    const auto firstDebug = ReadDebug(*s.player);
-    const auto firstCaption = firstDebug ? ReadCaption(*firstDebug) : std::nullopt;
-    const int initialShown = firstCaption ? firstCaption->cuesShown : 0;
-    const int initialUploaded = firstCaption ? firstCaption->cuesUploaded : 0;
-
-    auto directPath = WaitFor([&] {
-        auto debug = ReadDebug(*s.player);
-        if (!debug || PresenterName(*debug) != "d3d11") return false;
-        const json::Value* video = Member(&*debug, "video");
-        const json::Value* counts = Member(video, "frame_path_counts");
-        const auto direct = Number(counts, "hw_direct");
-        const auto downloads = Number(counts, "hw_download");
-        const auto sinkDownloads = Number(counts, "sink_download");
-        const auto device = Member(video, "hwaccel_device");
-        return device && device->kind == json::Value::Kind::String && device->s == "d3d11va" &&
-               direct && *direct > 0 && downloads && *downloads == 0 && sinkDownloads && *sinkDownloads == 0;
-    }, 12.0);
-    if (!directPath)
-        throw wvptest::SkipFailure{ "D3D11 presenter plus direct D3D11VA decode is unavailable on this host" };
-
-    auto baseline = ReadDebug(*s.player);
-    REQUIRE(baseline.has_value());
-    const json::Value* baseVideo = Member(&*baseline, "video");
-    const json::Value* basePaths = Member(baseVideo, "frame_path_counts");
-    const int initialDownloads = static_cast<int>(Number(basePaths, "hw_download").value_or(0));
-    const int initialSinkDownloads = static_cast<int>(Number(basePaths, "sink_download").value_or(0));
-    const json::Value* basePresenter = Member(&*baseline, "presenter");
-    const int initialDeviceCopies = static_cast<int>(Number(basePresenter, "frames_d3d11_copied").value_or(0));
-    if (initialDeviceCopies != 0)
-        throw wvptest::SkipFailure{ "D3D11 direct decode path requires device-local copies on this host" };
-
-    std::optional<json::Value> displayed;
-    const bool captionShown = WaitFor([&] {
-        auto debug = ReadDebug(*s.player);
-        if (!debug) return false;
-        const auto caption = ReadCaption(*debug);
-        if (!caption || caption->cuesShown <= initialShown || caption->cuesUploaded <= initialUploaded) return false;
-        displayed = std::move(debug);
-        return true;
-    }, 30.0);
-    REQUIRE_MSG(captionShown, "D3D11 debug counters did not report a shown and uploaded caption overlay");
-    CHECK_EQ(PresenterName(*displayed), std::string("d3d11"));
-
-    const json::Value* video = Member(&*displayed, "video");
-    const json::Value* paths = Member(video, "frame_path_counts");
-    const json::Value* presenter = Member(&*displayed, "presenter");
-    CHECK_MSG(Number(paths, "hw_direct").value_or(0) > 0, "video stopped using the direct D3D11 frame path");
-    CHECK_EQ(static_cast<int>(Number(paths, "hw_download").value_or(0)), initialDownloads);
-    CHECK_EQ(static_cast<int>(Number(paths, "sink_download").value_or(0)), initialSinkDownloads);
-    CHECK_MSG(Number(presenter, "frames_direct").value_or(0) > 0, "D3D11 presenter did not report direct video frames");
-    CHECK_EQ(static_cast<int>(Number(presenter, "frames_d3d11_copied").value_or(-1)), initialDeviceCopies);
-}
-
 namespace {
 
-// tbs-captions.ts cue timeline (stream timestamps, s): indefinite cues at 12.455, 19.129, 21.965, ..., 42.052; one with
-// a finite duration at 15.292 (to 17.992); the next cue starts at 19.129. The history window covers all of it.
 constexpr double kCueA = 19.129;       // indefinite, replaced by the cue at 21.965
 constexpr double kInsideA = 20.5;
 constexpr double kCueB = 12.455;       // indefinite, replaced by the cue at 15.292
@@ -1105,13 +975,12 @@ void OpenFixtureAs(Session& s, const fs::path& file, double ss, bool paused) {
     const int before = s.prepared;
     s.player->Stop();
     OpenOptions options = {
-        { L"presenter", L"sdl" },
-        { L"superimpose", L"0" },
-        { L"arib_font", FontPath().wstring() },
+        { "superimpose", "0" },
+        { "arib_font", AribFontOption(wvp::ToUtf8(FontPath().wstring())) },
     };
-    if (ss > 0.0) options.emplace_back(L"ss", std::to_wstring(ss));
-    if (paused) options.emplace_back(L"start_paused", L"1");
-    REQUIRE_MSG(s.player->Open(file.wstring(), options) == 0, "ARIB fixture reopen rejected");
+    if (ss > 0.0) options.emplace_back("ss", std::to_string(ss));
+    if (paused) options.emplace_back("start_paused", "1");
+    REQUIRE_MSG(s.player->Open(wvp::ToUtf8(file.wstring()), options) == 0, "ARIB fixture reopen rejected");
     REQUIRE_MSG(WaitFor([&] { return s.prepared > before || s.errors > 0; }, 25.0), "reopen produced no PREPARED event");
     REQUIRE_MSG(s.errors == 0, "reopen raised a player error");
 }
@@ -1131,7 +1000,7 @@ double PlayPast(Session& s, double until) {
 
 }
 
-TEST_CASE_INTEGRATION(AribAdvanced_sdl_seek_back_shows_active_caption_from_history) {
+TEST_CASE_INTEGRATION(AribAdvanced_seek_back_shows_active_caption_from_history) {
     RequireFixture();
     FixtureLink link(L"seek");
     Session s;
@@ -1216,7 +1085,7 @@ TEST_CASE_INTEGRATION(AribAdvanced_sdl_seek_back_shows_active_caption_from_histo
     }
 }
 
-TEST_CASE_INTEGRATION(AribAdvanced_sdl_same_file_reopen_continues_caption_history) {
+TEST_CASE_INTEGRATION(AribAdvanced_same_file_reopen_continues_caption_history) {
     RequireFixture();
     FixtureLink link(L"same");
     FixtureLink other(L"other");

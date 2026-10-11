@@ -8,7 +8,7 @@
 #include <vector>
 
 #include "wvp/FfPlayer.h"
-#include "wvp/Utf.h"
+#include "wvp/win32/Utf.h"
 
 namespace app::log {
 
@@ -79,15 +79,13 @@ std::wstring UsageText() {
            L"                         (default: warning; info while --console/--log-file/--stats/Debug logging is on).\r\n"
            L"  --stats                Enable ffplay's periodic status line (A-V, fd, aq, vq, sq ...) at info level.\r\n"
            L"  --log-file=<path>      Append timestamped log lines (libffplay + app events) to <path>.\r\n"
-           L"  --planner=off          Do not probe GPU capabilities / plan the pipeline (legacy open options).\r\n"
-           L"  --no-cuda              Hide CUDA from the pipeline planner (plans as on a GPU without CUDA).\r\n"
-           L"  --d3d11-debug          D3D11 debug layer on libffplay devices (needs Graphics Tools); messages in the log.\r\n"
+           L"  --d3d11-debug          D3D11 debug layer on the presenter's devices (needs Graphics Tools); messages in the log.\r\n"
            L"  --d3d11-force-caps=<key=0,...>  Mask presenter capabilities to exercise fallbacks: nv12_srv, p010_srv,\r\n"
-           L"                         decoder_srv, p010, rotate, mirror, procamp, shader, cuda_import.\r\n"
+           L"                         decoder_srv, p010, shader.\r\n"
            L"  --d3d11-route=vp|shader  Force the D3D11 presenter route.\r\n"
            L"  --help, -h, /?         Show this text.\r\n"
            L"\r\n"
-           L"Tab toggles the debug overlay (decoder, renderer, frame path, filter graphs, sync) in Now playing, full screen\r\n"
+           L"Tab toggles the debug overlay (decoder, presenter output, frame path, filter graphs, sync) in Now playing, full screen\r\n"
            L"and the mini player. Settings > Advanced > Debug logging writes\r\n"
            L"%LOCALAPPDATA%\\aribplayer\\logs\\aribplayer-YYYYMMDD.log.\r\n"
            L"\r\n"
@@ -239,7 +237,7 @@ void OpenConsole() {
             if (needErr) SetStdHandle(STD_ERROR_HANDLE, con);
         }
     }
-    if (g_settings.console) Global().SetConsole(GetStdHandle(STD_ERROR_HANDLE));   // --console: log lines go to stderr, like ffplay
+    if (g_settings.console) Global().SetConsole(GetStdHandle(STD_ERROR_HANDLE));   // --console: log lines go to stderr
 }
 
 void PrintToConsole(const std::wstring& text) {
@@ -261,16 +259,16 @@ int EffectiveLevel() {
     return kWarning;
 }
 
-std::wstring LogsDir(const std::wstring& settingsFilePath) {
-    size_t i = settingsFilePath.find_last_of(L"\\/");
-    return (i == std::wstring::npos ? std::wstring(L".") : settingsFilePath.substr(0, i)) + L"\\logs";
+std::string LogsDir(const std::string& settingsFilePath) {
+    size_t i = settingsFilePath.find_last_of("\\/");
+    return (i == std::string::npos ? std::string(".") : settingsFilePath.substr(0, i)) + "\\logs";
 }
 
-void ApplyDebugLogging(bool on, const std::wstring& logsDir) {
+void ApplyDebugLogging(bool on, const std::string& logsDir) {
     if (on == g_debugLogging && (!on || Global().HasFile(true))) return;
     g_debugLogging = on;
     if (on) {
-        Global().OpenFile(DebugLogPath(logsDir, NowStamp()), true);
+        Global().OpenFile(DebugLogPath(wvp::ToWide(logsDir), NowStamp()), true);
         Event("log", "debug logging enabled: " + wvp::ToUtf8(Global().FilePath(true)));
     } else {
         Event("log", "debug logging disabled");

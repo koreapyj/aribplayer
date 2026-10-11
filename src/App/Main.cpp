@@ -11,8 +11,8 @@
 #include "features/CrashDump.h"
 #include "features/Logging.h"
 #include "features/SingleInstance.h"
-#include "wvp/FfPlayer.h"
-#include "wvp/TestGuard.h"
+#include "wvp/win32/WindowsVideoPlatform.h"
+#include "wvp/win32/TestGuard.h"
 
 namespace {
 std::string Narrow(const std::wstring& w) {
@@ -54,19 +54,15 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
             help = true;
         } else if (low == L"--console") {
             ls.console = true;
-        } else if (low == L"--planner=off") {
-            o.plannerOff = true;
         } else if (low == L"--d3d11-debug") {
-            o.d3d11Debug = true;
+            o.video.debug = true;
         } else if (low.rfind(L"--d3d11-force-caps=", 0) == 0) {
-            o.d3d11ForceCaps = a.substr(19);
+            o.video.forceCaps = Narrow(a.substr(19));
         } else if (low.rfind(L"--d3d11-route=", 0) == 0) {
-            o.d3d11Route = low.substr(14);
-            if (o.d3d11Route != L"vp" && o.d3d11Route != L"shader") badArg = L"invalid --d3d11-route value: " + a.substr(14);
+            o.video.route = Narrow(low.substr(14));
+            if (o.video.route != "vp" && o.video.route != "shader") badArg = L"invalid --d3d11-route value: " + a.substr(14);
         } else if (low.rfind(L"--test-ui-device-loss=", 0) == 0) {
             o.testUiLossMs = _wtoi(a.c_str() + 22);
-        } else if (low == L"--no-cuda") {
-            o.noCuda = true;
         } else if (low.rfind(L"--adapter-luid=", 0) == 0) {
             probeLuid = a.substr(15);
         } else if (low == L"--stats") {
@@ -88,12 +84,10 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     if (argv) LocalFree(argv);
     if (logic || o.headless) wvp::SilenceFailureDialogs();   // test modes never show CRT / RTC / error dialogs
 
-    // Internal child mode of the GPU probe (App::Create): the drivers keep tens of MB of per-process state after the
-    // probes, so they run here and the app only reads the answers. The answer is one JSON line: the capabilities.
+    // Internal child mode of the GPU probe (VideoPlatform::Probe): the drivers keep tens of MB of per-process state after
+    // the probes, so they run here and the app only reads the answers.
     if (!probeOut.empty()) {
-        wvp::FfPlayer::SetProbeOptions(Narrow(app::ProbeOptions(probeLuid, o)));
-        auto oneLine = [](std::string j) { for (char& c : j) if (c == '\r' || c == '\n') c = ' '; return j; };
-        const std::string text = oneLine(wvp::FfPlayer::ProbeCapsJson()) + "\n";
+        std::string text = wvp::win32::WindowsVideoPlatform::ProbeChildJson(Narrow(probeLuid), o.video) + "\n";
         FILE* f = nullptr;
         if (_wfopen_s(&f, probeOut.c_str(), L"wb") != 0 || !f) return 3;
         const bool ok = fwrite(text.data(), 1, text.size(), f) == text.size();

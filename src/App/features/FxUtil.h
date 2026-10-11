@@ -25,7 +25,7 @@ wvp::Event<>& FilterErrorChanged();
 /// Readable text for an AVERROR code (local FFERRTAG / errno table), empty when unknown.
 std::wstring AvErrorText(int code);
 /// Name of the only filter of a one-filter graph ("[in]bogus_filter=a=1" -> "bogus_filter"), empty otherwise.
-std::wstring FirstFilterName(const std::wstring& graph);
+std::string FirstFilterName(const std::string& graph);
 /// "Video filter failed: Invalid argument" / "Video filter failed: Filter not found ('bogus_filter')" / "Audio filter failed: ...".
 std::wstring FormatFilterError(const wvp::FilterErrorInfo& e);
 

@@ -1,4 +1,4 @@
-// Hardware decoding per codec/profile through the real libffplay (hidden host window, SDL_AUDIODRIVER=dummy).
+// Hardware decoding per codec/profile through the real libffplay (recording presenter, dummy audio driver).
 // Samples live in testmedia\hw (generated with ffmpeg).
 // Whether the GPU can decode a sample is decided by probing the D3D11 video decoder profiles in the test itself.
 #include <d3d11.h>
@@ -13,6 +13,8 @@
 
 #include "wvp/DebugInfo.h"
 #include "wvp/FfPlayer.h"
+#include "wvp/win32/Utf.h"
+#include "TestPlayer.h"
 #include "wvptest.h"
 
 #pragma comment(lib, "d3d11.lib")
@@ -22,24 +24,6 @@ namespace fs = std::filesystem;
 using Microsoft::WRL::ComPtr;
 
 namespace {
-
-constexpr UINT kHwNotifyMsg = WM_APP + 58;
-
-LRESULT CALLBACK HwHostProc(HWND h, UINT m, WPARAM w, LPARAM l) {
-    if (m == kHwNotifyMsg) { FfPlayer::HandleNotify(w, l); return 0; }
-    return DefWindowProcW(h, m, w, l);
-}
-
-void EnsureHwClass() {
-    static ATOM a = [] {
-        WNDCLASSW wc{};
-        wc.lpfnWndProc = HwHostProc;
-        wc.hInstance = GetModuleHandleW(nullptr);
-        wc.lpszClassName = L"WvpHwTestHost";
-        return RegisterClassW(&wc);
-    }();
-    (void)a;
-}
 
 fs::path HwRepoRoot() {
     wchar_t buf[MAX_PATH * 2];
@@ -54,21 +38,15 @@ fs::path HwRepoRoot() {
     return fs::current_path();
 }
 
-void HwPump() {
-    MSG msg;
-    while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) { TranslateMessage(&msg); DispatchMessageW(&msg); }
-}
-
 template <class F>
-bool HwWaitFor(F cond, double seconds) {
-    auto end = std::chrono::steady_clock::now() + std::chrono::milliseconds((long long)(seconds * 1000));
-    while (std::chrono::steady_clock::now() < end) {
-        HwPump();
-        if (cond()) return true;
-        Sleep(15);
-    }
-    HwPump();
-    return cond();
+bool HwWaitFor(F cond, double seconds) { return wvptest::WaitFor(cond, seconds); }
+
+// The recording presenter brings no device: a hwaccel open creates the default device of its type.
+std::unique_ptr<FfPlayer> HwPlayer() {
+    int err = 0;
+    auto p = wvptest::CreateTestPlayer(nullptr, &err, false);
+    REQUIRE_MSG(p != nullptr, "FfPlayer::Create failed: " + std::to_string(err));
+    return p;
 }
 
 struct D3dCaps {
@@ -133,26 +111,19 @@ struct Result {
     bool opened = false;
 };
 
-Result RunSample(const char* file, const wchar_t* mode, Codec codec) {
-    EnsureHwClass();
+Result RunSample(const char* file, const char* mode, Codec codec) {
     Result res;
     fs::path p = HwRepoRoot() / L"testmedia" / L"hw" / file;
     REQUIRE_MSG(fs::exists(p), std::string("missing sample ") + file + " (generate: see report / ffmpeg\\README.md)");
 
-    HINSTANCE inst = GetModuleHandleW(nullptr);
-    HWND parent = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, L"WvpHwTestHost", L"host", WS_POPUP, -32000, -32000, 640, 360, nullptr,
-                                  nullptr, inst, nullptr);
-    HWND child = CreateWindowExW(0, L"STATIC", L"video", WS_CHILD | WS_VISIBLE, 0, 0, 640, 360, parent, nullptr, inst, nullptr);
-    int err = 0;
     {
-        auto player = FfPlayer::CreateSync(child, parent, kHwNotifyMsg, &err);
-        if (!player) { DestroyWindow(parent); REQUIRE_MSG(false, "CreateSync failed: " + std::to_string(err)); }
+        auto player = HwPlayer();
         int prepared = 0, errors = 0;
         player->Prepared.add([&](const MediaPreparedInfo&) { prepared++; });
         player->Error.add([&](const PlayerErrorInfo&) { errors++; });
         OpenOptions o;
-        if (mode && *mode) o.push_back({L"hwaccel", mode});
-        int rc = player->Open(p.wstring(), o);
+        if (mode && *mode) o.push_back({"hwaccel", mode});
+        int rc = player->Open(ToUtf8(p.wstring()), o);
         bool ok = rc == 0 && HwWaitFor([&] { return prepared > 0 || errors > 0; }, 10) && errors == 0;
         if (ok) {
             res.opened = true;
@@ -166,11 +137,10 @@ Result RunSample(const char* file, const wchar_t* mode, Codec codec) {
         }
         player.reset();
     }
-    DestroyWindow(parent);
 
     const DebugVideo& v = res.d.Video;
-    std::printf("HWROW | %-28s | req=%-8ls | decoder=%-10s | device=%-8s | path=%-11s | decoded=%-8s | after=%-6s | gpu=%s | err=%s\n", file,
-                (mode && *mode) ? mode : L"-", v.Decoder.c_str(), v.HwaccelDevice.c_str(), v.FramePath.c_str(), v.PixFmtDecoded.c_str(),
+    std::printf("HWROW | %-28s | req=%-8s | decoder=%-10s | device=%-8s | path=%-11s | decoded=%-8s | after=%-6s | gpu=%s | err=%s\n", file,
+                (mode && *mode) ? mode : "-", v.Decoder.c_str(), v.HwaccelDevice.c_str(), v.FramePath.c_str(), v.PixFmtDecoded.c_str(),
                 v.PixFmtAfterTransfer.c_str(), GpuSupports(codec) ? "yes" : "no", v.HwaccelError.c_str());
     std::fflush(stdout);
     return res;
@@ -178,7 +148,7 @@ Result RunSample(const char* file, const wchar_t* mode, Codec codec) {
 
 // The contract for every sample: when the GPU supports the codec, the requested hwaccel is the device really used and frames are
 // hardware decoded; otherwise a readable error and software frames.
-void CheckSample(const char* file, const wchar_t* mode, Codec codec) {
+void CheckSample(const char* file, const char* mode, Codec codec) {
     Result r = RunSample(file, mode, codec);
     REQUIRE_MSG(r.opened, "open failed");
     const DebugVideo& v = r.d.Video;
@@ -200,9 +170,8 @@ void CheckSample(const char* file, const wchar_t* mode, Codec codec) {
 
 }
 
-#define HW_CASE(id, file, codec)                                                           \
-    TEST_CASE_INTEGRATION(Hwaccel_d3d11va_##id) { CheckSample(file, L"d3d11va", codec); }  \
-    TEST_CASE_INTEGRATION(Hwaccel_auto_##id) { CheckSample(file, L"auto", codec); }
+#define HW_CASE(id, file, codec) \
+    TEST_CASE_INTEGRATION(Hwaccel_d3d11va_##id) { CheckSample(file, "d3d11va", codec); }
 
 HW_CASE(h264_1080p_mp4, "h264-1080p.mp4", Codec::H264)
 HW_CASE(h264_1080p_ts, "h264-1080p.ts", Codec::H264)
@@ -217,23 +186,16 @@ HW_CASE(vp9, "vp9-1080p.webm", Codec::Vp9)
 HW_CASE(av1, "av1-1080p.mp4", Codec::Av1)
 
 // An unsupported combination must fall back visibly: mpeg4 part 2 has no D3D11VA hwaccel in any build.
-TEST_CASE_INTEGRATION(Hwaccel_unsupported_codec_reports_readable_error_or_other_device) {
+TEST_CASE_INTEGRATION(Hwaccel_unsupported_codec_reports_readable_error) {
     fs::path clip = HwRepoRoot() / L"testmedia" / L"mpeg4-240p-short.mp4";
     REQUIRE_MSG(fs::exists(clip), "mpeg4-240p-short.mp4 missing (generated by the DebugInfo tests)");
-    for (const wchar_t* mode : {L"d3d11va", L"auto"}) {
-        EnsureHwClass();
-        HINSTANCE inst = GetModuleHandleW(nullptr);
-        HWND parent = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, L"WvpHwTestHost", L"host", WS_POPUP, -32000, -32000, 640, 360, nullptr,
-                                      nullptr, inst, nullptr);
-        HWND child = CreateWindowExW(0, L"STATIC", L"video", WS_CHILD | WS_VISIBLE, 0, 0, 640, 360, parent, nullptr, inst, nullptr);
+    {
         DebugInfo d;
         {
-            int err = 0;
-            auto player = FfPlayer::CreateSync(child, parent, kHwNotifyMsg, &err);
-            REQUIRE(player != nullptr);
+            auto player = HwPlayer();
             int prepared = 0;
             player->Prepared.add([&](const MediaPreparedInfo&) { prepared++; });
-            REQUIRE(player->Open(clip.wstring(), {{L"hwaccel", mode}}) == 0);
+            REQUIRE(player->Open(ToUtf8(clip.wstring()), {{"hwaccel", "d3d11va"}}) == 0);
             REQUIRE(HwWaitFor([&] { return prepared > 0; }, 10));
             HwWaitFor([&] {
                 auto js = player->GetDebugInfoJson();
@@ -242,13 +204,6 @@ TEST_CASE_INTEGRATION(Hwaccel_unsupported_codec_reports_readable_error_or_other_
                 return d.Valid && d.Video.FramesSoftware.value_or(0) >= 5;
             }, 10);
             player.reset();
-        }
-        DestroyWindow(parent);
-        if (std::wstring(mode) == L"auto" && d.Video.HwaccelDevice != "none") {
-            // auto may legitimately find another device type (NVDEC/CUDA decodes MPEG-4 part 2): then it must really be hardware
-            CHECK(d.Video.FramePath == "hw_download" || d.Video.FramePath == "hw_direct");
-            CHECK(d.Video.HwaccelDevice != "d3d11va");
-            continue;
         }
         CHECK_EQ(d.Video.HwaccelDevice, std::string("none"));
         CHECK_EQ(d.Video.FramePath, std::string("software"));

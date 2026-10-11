@@ -14,7 +14,7 @@
     fonts\WLCMARU2004ARIBU.TTF     read by the app at <exe dir>\fonts
     THIRD-PARTY-NOTICES.txt        repo root
     licenses\*                     <ffmpeg dist>\licenses (FFmpeg COPYING*, LICENSE.md, ...)
-  Not shipped: pdb/lib/exp/def/.dll.a, ffmpeg.exe/ffplay.exe/ffprobe.exe, ffplay.h, build debris.
+  Not shipped: pdb/lib/exp/def/.dll.a, ffmpeg.exe/ffprobe.exe, ffplay.h, build debris.
 #>
 [CmdletBinding()]
 param(

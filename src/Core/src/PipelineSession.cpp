@@ -3,7 +3,6 @@
 #include <cctype>
 
 #include "wvp/JsonLite.h"
-#include "wvp/Utf.h"
 
 namespace wvp {
 
@@ -51,15 +50,15 @@ ContentInfo PipelineSession::ContentOf(const MediaInfo& info) {
     }
     ContentInfo c;
     if (!v) return c;
-    c.codec = Lower(ToUtf8(v->Codec));
+    c.codec = Lower(v->Codec);
     c.width = v->Width;
     c.height = v->Height;
-    c.bitDepth = BitDepthOf(ToUtf8(v->PixFmt));
-    c.chroma = ChromaOf(ToUtf8(v->PixFmt));
+    c.bitDepth = BitDepthOf(v->PixFmt);
+    c.chroma = ChromaOf(v->PixFmt);
     return c;
 }
 
-void PipelineSession::Put(const std::wstring& url, const ContentInfo& c) {
+void PipelineSession::Put(const std::string& url, const ContentInfo& c) {
     auto it = index_.find(url);
     if (it != index_.end()) cache_.erase(it->second);
     cache_.emplace_front(url, c);
@@ -70,13 +69,13 @@ void PipelineSession::Put(const std::wstring& url, const ContentInfo& c) {
     }
 }
 
-std::optional<ContentInfo> PipelineSession::Cached(const std::wstring& url) const {
+std::optional<ContentInfo> PipelineSession::Cached(const std::string& url) const {
     auto it = index_.find(url);
     if (it == index_.end()) return std::nullopt;
     return it->second->second;
 }
 
-ContentInfo PipelineSession::BeforeOpen(const std::wstring& url) {
+ContentInfo PipelineSession::BeforeOpen(const std::string& url) {
     generation_++;
     fallbackDone_ = false;
     ContentInfo c;
@@ -89,7 +88,7 @@ ContentInfo PipelineSession::BeforeOpen(const std::wstring& url) {
     return c;
 }
 
-PipelineSession::Prepared PipelineSession::OnPrepared(const std::wstring& url, const MediaInfo& info) {
+PipelineSession::Prepared PipelineSession::OnPrepared(const std::string& url, const MediaInfo& info) {
     Prepared r;
     r.content = ContentOf(info);
     if (!r.content.Known()) return r;
@@ -99,7 +98,7 @@ PipelineSession::Prepared PipelineSession::OnPrepared(const std::wstring& url, c
     return r;
 }
 
-bool PipelineSession::ClaimContentReopen(const std::wstring& url) {
+bool PipelineSession::ClaimContentReopen(const std::string& url) {
     if (contentReopenUrl_ == url) return false;
     contentReopenUrl_ = url;
     return true;
@@ -138,21 +137,13 @@ std::optional<PipelineSession::Fallback> PipelineSession::OnFilterError(const Pl
     return std::nullopt;
 }
 
-std::optional<PipelineSession::Fallback> PipelineSession::OnPresenterError(const Plan& plan, const PresenterErrorInfo& info) {
-    (void)plan;
-    if (info.DeviceLost) return std::nullopt;   // the device is gone, not unusable: the app rebinds instead
-    std::string name = ToUtf8(info.Presenter);
-    if (name.empty()) name = "d3d11";
-    return Take({ "presenter:" + name, ToUtf8(info.Error) });
-}
-
 std::optional<PipelineSession::Fallback> PipelineSession::OnFilterError(const Plan& plan, const std::string& eventJson) {
     FilterErrorInfo info;
     if (auto doc = json::Parse(eventJson); doc && doc->IsObject()) {
-        info.Type = ToWide(doc->Str("type"));
-        info.Filter = ToWide(doc->Str("filter"));
+        info.Type = doc->Str("type");
+        info.Filter = doc->Str("filter");
         info.Code = doc->Int("code");
-        info.Message = ToWide(doc->Str("message"));
+        info.Message = doc->Str("message");
         info.HwframesFallback = doc->Bool("hwframes_fallback");
     }
     return OnFilterError(plan, info);

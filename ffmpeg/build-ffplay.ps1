@@ -1,7 +1,8 @@
 #Requires -Version 7
 <#
 .SYNOPSIS
-  Builds libffplay.dll / ffplay.exe / libav*.dll into ffmpeg\dist\win64 via WSL (digest-cached).
+  Builds libffplay.dll / libav*.dll (+ the libavutil headers and avutil.lib) into ffmpeg\dist\win64 via WSL
+  (digest-cached).
 .DESCRIPTION
   Skips the build when dist\win64\.stamp equals the digest of (builder.lock + this
   script + scripts/*.sh + patches\* + source-patches\*) and libffplay.dll exists. The digest is computed by the bash script itself
@@ -58,7 +59,8 @@ if ($LASTEXITCODE -ne 0 -or $digest -notmatch '^[0-9a-f]{64}$') {
 }
 
 $stampFile = Join-Path $dist '.stamp'
-if (-not $Force -and -not $CheckOnly -and (Test-Path $stampFile) -and (Test-Path (Join-Path $dist 'libffplay.dll')) -and
+if (-not $Force -and -not $CheckOnly -and (Test-Path $stampFile) -and -not (Test-Path (Join-Path $dist '.dev-build')) -and
+    (Test-Path (Join-Path $dist 'libffplay.dll')) -and
     (Test-Path (Join-Path $dist 'ffcapsdump.exe'))) {
     $stamp = (Get-Content -Raw $stampFile).Trim()
     if ($stamp -eq $digest) {

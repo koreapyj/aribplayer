@@ -99,7 +99,7 @@ VideoGpuChoice SelectVideoGpu(const std::vector<AdapterCandidate>& candidates, c
     }
     std::string prefix = ch.manualMissing ? "automatic (preferred " + pref.name + " not present): " : "automatic: ";
     if (best < 0) {
-        ch.reason = prefix + "no hardware adapter -> software decoding + SDL";
+        ch.reason = prefix + "no hardware adapter -> software decoding";
         return ch;
     }
     const Scored& b = ok[best];

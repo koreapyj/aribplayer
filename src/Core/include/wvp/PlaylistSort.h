@@ -17,7 +17,7 @@ struct FileMeta {
     std::optional<std::int64_t> size;       // bytes
     std::optional<std::int64_t> modified;   // any monotonic tick count (default provider: filesystem clock ticks)
 };
-using FileMetaProvider = std::function<FileMeta(const std::wstring& url)>;
+using FileMetaProvider = std::function<FileMeta(const std::string& url)>;
 
 /// std::filesystem based; URLs (anything with "://") and missing files give unknown values.
 FileMetaProvider DefaultFileMetaProvider();
@@ -31,11 +31,11 @@ std::vector<int> SortOrder(const std::vector<MediaItem>& items, SortKey key, boo
 std::vector<int> ReverseOrder(size_t count);
 
 /// Case-insensitive natural comparison (digit runs compare numerically): <0, 0, >0.
-int NaturalCompare(const std::wstring& a, const std::wstring& b);
+int NaturalCompare(const std::string& a, const std::string& b);
 
 /// Pieces of a url used by the sort keys (query/fragment dropped for non-local urls).
-std::wstring UrlFileName(const std::wstring& url);    // last segment, with extension
-std::wstring UrlExtension(const std::wstring& url);   // with the dot, "" when none
-std::wstring UrlFolder(const std::wstring& url);      // everything before the last separator, "" when none
+std::string UrlFileName(const std::string& url);    // last segment, with extension
+std::string UrlExtension(const std::string& url);   // with the dot, "" when none
+std::string UrlFolder(const std::string& url);      // everything before the last separator, "" when none
 
 }

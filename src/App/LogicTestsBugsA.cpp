@@ -81,9 +81,9 @@ LOGIC_TEST(acrylic_regions_map_client_dips_to_video_pixels_at_each_dpi) {
         LT_CHECK_EQ(region->y, (int)std::lround(surface.t * scale) - layout.video.t);
         LT_CHECK_EQ(region->width, (int)std::lround(surface.r * scale) - (int)std::lround(surface.l * scale));
         LT_CHECK_EQ(region->height, (int)std::lround(surface.b * scale) - (int)std::lround(surface.t * scale));
-        LT_CHECK(std::abs(region->corner_radius - 8.f * (float)scale) < 0.01f);
-        LT_CHECK_EQ(region->tint_color, theme.acrylicTintColor.v);
-        LT_CHECK_EQ(region->luminosity_color, theme.acrylicLuminosityColor.v);
+        LT_CHECK(std::abs(region->cornerRadius - 8.f * (float)scale) < 0.01f);
+        LT_CHECK_EQ(region->tintColor, theme.acrylicTintColor.v);
+        LT_CHECK_EQ(region->luminosityColor, theme.acrylicLuminosityColor.v);
         LT_CHECK_EQ(region->z, 7);
     }
     auto clipped = acrylic::RegionFromDip({-8, 40, 24, 72}, 0, 32, 800, 568, 1.0, 4.f, theme, 0);
@@ -218,19 +218,4 @@ LOGIC_TEST(fullscreen_title_layout_keeps_controls_in_bounds_at_small_widths) {
             if (width >= 320) LT_CHECK(sawTitle);
         }
     }
-}
-
-LOGIC_TEST(audio_content_layer_is_opaque_black_under_the_placeholder) {
-    pui::RecordingRenderer r;
-    pui::Theme th;
-    pui::RectF area = pui::RectF::XYWH(0, 0, 1280, 688);
-    PaintAudioContentLayer(r, th, area, L"audio");
-    LT_CHECK(!r.calls.empty());
-    if (r.calls.empty()) return;
-    // the first paint call fills the whole layer with opaque black: nothing of the video child may show through
-    LT_CHECK(r.calls[0].op == pui::RecordingRenderer::Op::FillRect);
-    LT_CHECK(r.calls[0].rect.l == area.l && r.calls[0].rect.t == area.t && r.calls[0].rect.r == area.r && r.calls[0].rect.b == area.b);
-    LT_CHECK_EQ((unsigned)r.calls[0].color.v, 0xFF000000u);
-    LT_CHECK(r.HasText(L"audio"));
-    for (size_t i = 1; i < r.calls.size(); i++) LT_CHECK(r.calls[i].op == pui::RecordingRenderer::Op::Text);
 }

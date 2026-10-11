@@ -10,7 +10,7 @@
 
 namespace app {
 
-/// Glyph button with the spec's 83 ms fill fade. Rounded = 4 DIP radius bar button, Rect = square title-bar button.
+/// Glyph button with an 83 ms fill fade. Rounded = 4 DIP radius bar button, Rect = square title-bar button.
 /// Accent style = accent fill + black glyph (play / pause); toggled = subtle 8 % fill + accent glyph + accent underline
 /// (playlist panel toggle). A right click (or Shift+F10 / Menu key) raises onRightClick.
 class GlyphButton : public pui::Widget {
@@ -110,7 +110,7 @@ private:
     bool clickable_, menuOpen_ = false;
 };
 
-/// Horizontal slider with the prototype look: 4 DIP track, accent fill, 20 DIP thumb with a 10 DIP accent dot. Value is a
+/// Horizontal slider: 4 DIP track, accent fill, 20 DIP thumb with a 10 DIP accent dot. Value is a
 /// fraction 0..1; UIA RangeValue reports value*scale. The track is inset from the control rect by half a
 /// thumb so the thumb never leaves the widget.
 class ShellSlider : public pui::Widget {

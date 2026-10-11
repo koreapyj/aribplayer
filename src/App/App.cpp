@@ -30,7 +30,7 @@
 #include "pui/TextBox.h"
 #include "pui/ToolTipStyle.h"
 #include "shell/SettingsWindow.h"
-#include "wvp/Utf.h"
+#include "wvp/win32/Utf.h"
 
 namespace app {
 
@@ -112,15 +112,12 @@ const char* ModeName(ShellMode m) {
 constexpr LONG_PTR kCaptionlessStyle = ((WS_OVERLAPPEDWINDOW & ~WS_CAPTION) | WS_SYSMENU | WS_THICKFRAME | WS_MINIMIZEBOX |
                                         WS_MAXIMIZEBOX | WS_CLIPCHILDREN);
 
-std::wstring HeadlessDataDir() {
+std::string HeadlessDataDir() {
     wchar_t t[MAX_PATH];
     DWORD n = GetTempPathW(MAX_PATH, t);
-    return std::wstring(t, n) + L"aribplayer-headless-data";
+    return wvp::ToUtf8(std::wstring(t, n) + L"aribplayer-headless-data");
 }
 
-void DisableLegacyFileDrops(HWND h) {
-    if (h && (GetWindowLongPtrW(h, GWL_EXSTYLE) & WS_EX_ACCEPTFILES)) DragAcceptFiles(h, FALSE);
-}
 }
 
 class AppDropTarget final : public IDropTarget {
@@ -210,8 +207,8 @@ private:
 App* App::Instance() { return g_app; }
 
 App::App(const AppOptions& o) : opt_(o), dw_(MakeDw()), d2d_p_(std::make_unique<pui::D2dRenderer>(dw_.Get())), d2d_(*d2d_p_), dbgPainter_(dw_.Get()) {
-    dataDir_ = o.headless ? HeadlessDataDir() : wvp::SettingsStore::AppDataDir();
-    svc_ = o.headless ? std::make_unique<Services>(dataDir_) : std::make_unique<Services>();
+    dataDir_ = o.headless ? HeadlessDataDir() : wvp::platform::AppDataDir();
+    svc_ = o.headless ? std::make_unique<Services>(wvp::ToWide(dataDir_)) : std::make_unique<Services>();
     lr_ = std::make_unique<LayerRenderer>(d2d_);
 }
 
@@ -248,6 +245,17 @@ void App::SetTimerMs(UINT ms) {
 bool App::Create(bool hidden) {
     hidden_ = hidden;
     g_app = this;
+    // The first open waits for the GPU probe's plan: the probe child runs while the window is created.
+    startMs_ = Now();
+    platform_ = std::make_unique<wvp::win32::WindowsVideoPlatform>(opt_.video);
+    const std::vector<wvp::AdapterEntry> startupAdapters = PhysicalAdapters();
+    adapterProbeBusy_ = true;
+    probeThread_ = std::thread([startupAdapters, platform = platform_.get()] {
+        // VideoPlatform::Probe runs each probe in a short-lived child process (--probe-gpu, one per hardware adapter, in
+        // parallel): the GPU drivers keep tens of MB of per-process state after probing even with every device released.
+        std::vector<wvp::AdapterCandidate> cands = ProbeAdapters(*platform, startupAdapters);
+        if (App* a = App::Instance()) a->PostToUi([a, cands = std::move(cands)]() mutable { a->OnAdaptersProbed(std::move(cands), "startup"); });
+    });
     HINSTANCE inst = GetModuleHandleW(nullptr);
     WNDCLASSEXW wc{sizeof wc};
     wc.style = CS_DBLCLKS;   // WM_LBUTTONDBLCLK -> clickCount 2 (list rows invoke on double click)
@@ -275,6 +283,7 @@ bool App::Create(bool hidden) {
     Step("create_main_window", hwnd_ ? S_OK : HRESULT_FROM_WIN32(GetLastError()));
     if (!hwnd_) return false;
     g_postHwnd = hwnd_;
+    PostMessageW(hwnd_, WM_RUN_QUEUE, 0, 0);   // work posted before the window existed (the probe may have finished)
     float real = GetDpiForWindow(hwnd_) / 96.f;
     if (std::fabs(real - scale_) > 0.001f) {
         scale_ = real;
@@ -298,7 +307,7 @@ bool App::Create(bool hidden) {
 
     HRESULT hr = gfx_.Init(hwnd_, [this](const char* n, HRESULT r) { Step(n, r); });
     gfxOk_ = SUCCEEDED(hr);
-    if (gfxOk_) {   // z-order: kLayerStack
+    if (gfxOk_) {
         for (Layer l : kLayerStack)
             if (SUCCEEDED(hr)) hr = gfx_.CreateVisual(LayerSurf(l));
         Step("dcomp_visuals", hr);
@@ -351,31 +360,11 @@ bool App::Create(bool hidden) {
     log::ApplyDebugLogging(svc_->settings.debugLogging, log::LogsDir(svc_->settingsStore.Path()));
     log::InstallEngineHooks();
     log::Event("app", std::string("start: libffplay ") + wvp::FfPlayer::Version() + ", debug overlay: Tab");
-    const bool plannerOff = opt_.plannerOff;
     char vendor[8];
     snprintf(vendor, sizeof vendor, "%04x", gfx_.adapterVendor);
     log::Event("adapter", "UI device: " + wvp::ToUtf8(gfx_.adapterName) + " (vendor 0x" + vendor + ", luid " + gfx_.adapterLuid + ")");
-    wvp::FfPlayer::SetProbeOptions(wvp::ToUtf8(ProbeOptions(L"", opt_)));
-    std::vector<HwAdapter> hw = PhysicalAdapters("startup");
-    adapterProbeBusy_ = !plannerOff;
-    probeThread_ = std::thread([plannerOff, hw, o = opt_] {
-        // The probes run in short-lived child processes (--probe-gpu, one per hardware adapter, in parallel): the GPU drivers
-        // keep tens of MB of per-process state after probing (~50-70 MB private here) even with every device released.
-        // In-process probing of the default adapter stays the fallback when no child answers.
-        std::vector<wvp::AdapterCandidate> cands = ProbeAdapters(plannerOff ? std::vector<HwAdapter>{} : hw, o);
-        if (plannerOff) {
-            if (App* a = App::Instance()) a->PostToUi([] { log::Event("caps", "planner disabled (--planner=off)"); });
-            return;
-        }
-        if (cands.empty()) {
-            if (std::optional<wvp::CapabilitySet> caps = wvp::FfPlayer::ProbeCaps()) {
-                wvp::AdapterCandidate c;
-                c.luid = caps->adapter.luid; c.name = caps->adapter.name; c.vendorId = caps->adapter.vendorId; c.caps = std::move(*caps);
-                cands.push_back(std::move(c));
-            }
-        }
-        if (App* a = App::Instance()) a->PostToUi([a, cands = std::move(cands)]() mutable { a->OnAdaptersProbed(std::move(cands), "startup"); });
-    });
+    LogAdapters("startup");
+    log::Event("caps", "probing " + std::to_string(startupAdapters.size()) + " adapter(s): startup");
     autoHide_.SetEnabled(false, Now());
     Relayout();
     ApplyWindowTopmost();
@@ -474,8 +463,7 @@ void App::ApplyTheme(pui::ThemeMode mode, uint32_t accent) {
     if (hwnd_) {
         BOOL dark = light ? FALSE : TRUE;
         DwmSetWindowAttribute(hwnd_, 20, &dark, sizeof dark);
-        // The 1 px DWM frame is translucent: it takes the tint of whatever lies behind it (Mica in the strip, the dark body below),
-        // so it looked bright around the title strip and dark under it. One opaque colour keeps it even along the whole edge.
+        // The 1 px DWM frame is translucent and takes the tint of what lies behind it; one opaque colour keeps the edge even.
         const COLORREF border = themeHighContrast_ ? 0xFFFFFFFFu /*DWMWA_COLOR_DEFAULT*/ : (light ? RGB(0xA0, 0xA0, 0xA0) : RGB(0x3C, 0x3C, 0x3C));
         DwmSetWindowAttribute(hwnd_, 34 /*DWMWA_BORDER_COLOR*/, &border, sizeof border);
     }
@@ -628,8 +616,7 @@ void App::SizeWindowToVideo(double scale, std::optional<PxSize> knownVideo) {
         for (const auto& st : mi->Streams)
             if (st.Type == wvp::StreamType::Video && (!vs || st.Selected)) vs = &st;
         if (vs) {
-            wvp::Rotation rot = svc_->filters.Settings().rotation;
-            size = VideoDisplaySize(vs->Width, vs->Height, vs->SarNum, vs->SarDen, rot == wvp::Rotation::Cw90 || rot == wvp::Rotation::Ccw90);
+            size = VideoDisplaySize(vs->Width, vs->Height, vs->SarNum, vs->SarDen);
             haveVideo = size.has_value();
         }
     }
@@ -698,20 +685,42 @@ LRESULT CALLBACK App::VideoProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
             a->ChromeHittableAt(a->Now(), {xDip, yDip}))
             return HTTRANSPARENT;
     }
-    if (a && a->hwnd_ && !a->destroyed_ &&
-        (m == WM_LBUTTONDOWN || m == WM_RBUTTONDOWN || m == WM_MBUTTONDOWN || m == WM_LBUTTONDBLCLK || m == WM_RBUTTONDBLCLK || m == WM_MBUTTONDBLCLK))
+    if (!a || !a->hwnd_ || a->destroyed_) return DefWindowProcW(h, m, wp, lp);
+    switch (m) {
+    case WM_DROPFILES:   // OLE handles all accepted drops
+        DragFinish(reinterpret_cast<HDROP>(wp));
+        return 0;
+    case WM_KEYDOWN: case WM_KEYUP: case WM_SYSKEYDOWN: case WM_SYSKEYUP: case WM_CHAR: case WM_MOUSEWHEEL:
+        return SendMessageW(a->hwnd_, m, wp, lp);   // keys and the wheel behave the same over the video and the shell
+    case WM_MOUSEMOVE:
+        a->OnVideoInput({VideoInput::Kind::Move, GET_X_LPARAM(lp), GET_Y_LPARAM(lp), 0});
+        return 0;
+    case WM_LBUTTONDOWN: case WM_RBUTTONDOWN: case WM_MBUTTONDOWN:
+    case WM_LBUTTONDBLCLK: case WM_RBUTTONDBLCLK: case WM_MBUTTONDBLCLK: {
         a->NotePlayerPressed();
-    // Bottom of the chain: SDL's procedure (above) has already queued its button-down event when the press gets here.
-    if (m == WM_LBUTTONDOWN && a && a->hwnd_ && !a->destroyed_) a->VideoPressDrag(h, lp);
-    return DefWindowProcW(h, m, wp, lp);
+        const int button = (m == WM_LBUTTONDOWN || m == WM_LBUTTONDBLCLK) ? 1 : (m == WM_MBUTTONDOWN || m == WM_MBUTTONDBLCLK) ? 2 : 3;
+        const int x = GET_X_LPARAM(lp), y = GET_Y_LPARAM(lp);
+        a->OnVideoInput({VideoInput::Kind::Down, x, y, button});
+        if (m == WM_LBUTTONDBLCLK || m == WM_RBUTTONDBLCLK || m == WM_MBUTTONDBLCLK)
+            a->OnVideoInput({VideoInput::Kind::DoubleClick, x, y, button});
+        else if (m == WM_LBUTTONDOWN)
+            a->VideoPressDrag(h, lp);
+        return 0;
+    }
+    case WM_LBUTTONUP: case WM_RBUTTONUP: case WM_MBUTTONUP: {
+        const int button = m == WM_LBUTTONUP ? 1 : m == WM_MBUTTONUP ? 2 : 3;
+        a->OnVideoInput({VideoInput::Kind::Up, GET_X_LPARAM(lp), GET_Y_LPARAM(lp), button});
+        return 0;
+    }
+    default:
+        return DefWindowProcW(h, m, wp, lp);
+    }
 }
 
 // Dragging the video moves the window (native move loop: Aero Snap, drag-to-restore from maximized). The move
-// loop starts synchronously inside the real WM_LBUTTONDOWN dispatch, exactly like a title-bar press: started later from
-// the posted INPUT events (UI -> libffplay loop thread -> UI round trip, the loop nested in FfPlayer::DispatchPendingEvents)
-// it missed presses that moved at once. DragDetect / the move loop eat the real WM_LBUTTONUP, so a posted one resyncs
-// SDL (it ignores a press while it still thinks the button is down: no down / double click after that) and gives the app
-// its Up event; a plain click therefore stays a click (Down + Up) and double click still reaches SDL as a second press.
+// loop starts synchronously inside the real WM_LBUTTONDOWN dispatch, exactly like a title-bar press. DragDetect / the
+// move loop eat the real WM_LBUTTONUP, so a posted one gives the app its Up event; a plain click therefore stays a click
+// (Down + Up) and a double click still arrives as WM_LBUTTONDBLCLK.
 void App::VideoPressDrag(HWND video, LPARAM lp) {
     if (modes_.fullscreen || modes_.mini || !IsWindowVisible(hwnd_) || !(GetAsyncKeyState(VK_LBUTTON) & 0x8000)) return;
     POINT press{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
@@ -733,31 +742,6 @@ void App::VideoPressDrag(HWND video, LPARAM lp) {
     GetCursorPos(&cur);
     ScreenToClient(video, &cur);
     PostMessageW(video, WM_LBUTTONUP, 0, MAKELPARAM((short)cur.x, (short)cur.y));
-}
-
-namespace { WNDPROC g_videoPrevProc = nullptr; }
-
-LRESULT CALLBACK App::VideoDropProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
-    if (m == WM_DROPFILES) {   // OLE handles all accepted drops; never leak legacy drops into SDL's ignored SDL_DROPFILE path.
-        DragFinish(reinterpret_cast<HDROP>(wp));
-        return 0;
-    }
-    return g_videoPrevProc ? CallWindowProcW(g_videoPrevProc, h, m, wp, lp) : DefWindowProcW(h, m, wp, lp);
-}
-
-void App::EnsureVideoDropHook() {
-    if (!video_) return;
-    DisableLegacyFileDrops(video_);   // SDL may toggle WS_EX_ACCEPTFILES while attaching its Win32 drop handler.
-    if (VideoDropHooked()) return;
-    LONG_PTR cur = GetWindowLongPtrW(video_, GWLP_WNDPROC);
-    if (cur == reinterpret_cast<LONG_PTR>(&App::VideoProc)) return;   // SDL has not subclassed yet: hooking now would sit BELOW SDL's proc
-    g_videoPrevProc = reinterpret_cast<WNDPROC>(cur);
-    SetWindowLongPtrW(video_, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(&App::VideoDropProc));
-    DisableLegacyFileDrops(video_);
-}
-
-void App::UnhookVideoDrop() {
-    if (video_ && g_videoPrevProc && VideoDropHooked()) SetWindowLongPtrW(video_, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(g_videoPrevProc));
 }
 
 DropRoute App::RouteDropAtClient(POINT client) const {
@@ -899,7 +883,6 @@ void App::OnClose() {
     uia_.reset();                       // disconnect providers before the tree goes away
     host_.CloseAllPopups();
     RevokeDropTargets();
-    UnhookVideoDrop();
     ctl_.reset();                       // dispose controller + player before the video child HWND goes away
     player_.reset();
     log::Event("app", "closed");
@@ -1035,30 +1018,11 @@ bool App::SpaceIsPlayPause() const {
     return SpaceTogglesPlayback(host_.PopupCount() > 0, focusUsesSpace);
 }
 
-void App::HandleGlobalKey(int vk, unsigned mods, bool repeat) {
-    if (vk == VK_TAB && !(mods & (pui::ModCtrl | pui::ModAlt))) {
-        const dbg::TabAction tab = DecideTabNow(mods);
-        if (tab == dbg::TabAction::ToggleOverlay) {
-            ToggleDebugOverlay("video-key");
-        } else if (tab == dbg::TabAction::FocusTraversal) {
-            host_.KeyDown(vk, mods);
-            if (host_.Focused() && hwnd_ && IsWindowVisible(hwnd_)) SetFocus(hwnd_);
-        }
-        return;
-    }
-    if (vk == VK_SPACE && mods == 0 && SpaceIsPlayPause()) { Execute(CommandId::PlayPause); return; }
-    if (host_.PopupCount() > 0 && host_.KeyDown(vk, mods)) return;   // a popup / menu first (Esc closes it, Enter invokes)
-    if (TextInputOwnsKey(vk, mods)) return;
-    if (PanelKey(vk, mods)) return;   // an active playlist panel owns its accelerators (Del, Enter, Ctrl+O/U/T/S ...) before the key table
-    CommandId c = LookupKey(vk, mods);
-    if (c != CommandId::None) RunKeyCommand(vk, c, repeat);
-}
-
-void App::OnVideoInput(const wvp::InputEventArgs& e) {
-    using wvp::InputKind;
+void App::OnVideoInput(const VideoInput& e) {
+    using Kind = VideoInput::Kind;
     uint64_t now = Now();
-    switch (e.Kind) {
-    case InputKind::Move: {
+    switch (e.kind) {
+    case Kind::Move: {
         POINT p; GetCursorPos(&p);
         if (p.x != lastCur_.x || p.y != lastCur_.y) {   // synthetic moves (ShowCursor) are not activity
             lastCur_ = p;
@@ -1067,40 +1031,25 @@ void App::OnVideoInput(const wvp::InputEventArgs& e) {
         host_.PointerLeave();
         break;
     }
-    case InputKind::Down:
-        if (e.Button == 1) {
+    case Kind::Down:
+        if (e.button == 1) {
             StartBarAnim(autoHide_.Activity(now));
             host_.SetFocus(nullptr);
             host_.CancelCapture();   // nothing from an earlier press may stay pressed / captured (the window drag: VideoPressDrag)
             ForPanels([](PlaylistPanel& p) { p.SetActive(false); });
         }
         break;
-    case InputKind::Up:
-        if (e.Button == 1) {
+    case Kind::Up:
+        if (e.button == 1) {
             StartBarAnim(autoHide_.Activity(now));   // a single click does nothing else (VideoClickCommand(1) == None)
-        } else if (e.Button == 3) {
+        } else if (e.button == 3) {
             StartBarAnim(autoHide_.Activity(now));
-            ShowMainMenu(*this, {(e.X + layout_.video.l) / scale_, (e.Y + layout_.video.t) / scale_});
+            ShowMainMenu(*this, {(e.x + layout_.video.l) / scale_, (e.y + layout_.video.t) / scale_});
         }
         break;
-    case InputKind::DoubleClick:
+    case Kind::DoubleClick:
         if (CommandId c = VideoClickCommand(2); c != CommandId::None) Execute(c);
         break;
-    case InputKind::Wheel: AdjustVolume(e.Delta); break;   // 1 % per notch
-    case InputKind::KeyDown: {
-        autoHide_.KeyPress();   // keys never reveal the OSD nor keep it alive
-        KeyInputScope keyScope(keyInput_);
-        unsigned mods = ((int)e.Modifiers & 1 ? pui::ModShift : 0u) | ((int)e.Modifiers & 2 ? pui::ModCtrl : 0u) | ((int)e.Modifiers & 4 ? pui::ModAlt : 0u);
-        const bool repeat = e.VirtualKey == videoKeyVk_;   // the video child reports no repeat flag: a second keydown before keyup is one
-        videoKeyVk_ = e.VirtualKey;
-        HandleGlobalKey(e.VirtualKey, mods, repeat);
-        break;
-    }
-    case InputKind::KeyUp:
-        frameStep_.KeyUp(e.VirtualKey);
-        if (e.VirtualKey == videoKeyVk_) videoKeyVk_ = 0;
-        break;
-    default: break;
     }
     Flush();
 }
@@ -1250,7 +1199,6 @@ LRESULT App::Proc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
             settingsWin_->StartFocusCycle(hwnd_);
         }
         break;
-    case WM_NOTIFY_PLAYER: wvp::FfPlayer::HandleNotify(wp, lp); return 0;
     case WM_RUN_QUEUE: {
         std::deque<std::function<void()>> q;
         { std::lock_guard<std::mutex> lk(g_qmu); q.swap(g_queue); }
@@ -1390,7 +1338,7 @@ LRESULT App::Proc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
         return 0;
     case WM_RBUTTONUP: {
         // While any popup (even a toast / InfoBar notice) is open the video child is HTTRANSPARENT, so a right-click over
-        // the video lands here instead of OnVideoInput: open the video context menu unless it hit a popup or visible chrome.
+        // the video lands here instead of the video child: open the video context menu unless it hit a popup or visible chrome.
         const pui::PointF dip{GET_X_LPARAM(lp) / scale_, GET_Y_LPARAM(lp) / scale_};
         const pui::Widget* hit = host_.HitTest(dip);
         const bool onPopup = hit && shell_ && hit != shell_ && !shell_->IsAncestorOf(hit);
@@ -1460,7 +1408,7 @@ LRESULT App::Proc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
         return 0;
     }
     case WM_DROPFILES:
-        DragFinish(reinterpret_cast<HDROP>(wp));   // all accepted drops use OLE; discard any unexpected legacy delivery
+        DragFinish(reinterpret_cast<HDROP>(wp));   // drops arrive through OLE only; discard WM_DROPFILES
         return 0;
     case WM_COPYDATA:
         if (HandleCopyData(*this, reinterpret_cast<const COPYDATASTRUCT*>(lp))) return TRUE;

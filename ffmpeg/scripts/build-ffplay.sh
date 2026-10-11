@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build libffplay.dll / ffplay.exe / ffmpeg.exe + libav* for Windows (win64) by
+# Build libffplay.dll / ffmpeg.exe + libav* for Windows (win64) by
 # mirroring builder-ffmpeg's CI `build-windows` job, with our patches layered on top.
 # Runs in WSL or natively on Linux (CI); needs Docker usable without sudo.
 #
@@ -17,8 +17,9 @@
 #   --keep-dev-image  keep the finished build container as docker image ffplay-dev:win64
 #                     (deps + built ffmpeg tree) for `author.sh build` incremental rebuilds
 #
-# Output: ffmpeg/dist/win64/{libffplay.dll,ffplay.exe,ffmpeg.exe,ffprobe.exe,av*/sw* dlls,
-#         libffplay.dll.a,ffplay.h,ffcapsdump.exe,licenses/ffmpeg/{COPYING*,LICENSE.md},.stamp}.
+# Output: ffmpeg/dist/win64/{libffplay.dll,ffmpeg.exe,ffprobe.exe,av*/sw* dlls,
+#         libffplay.dll.a,ffplay.h,ffcapsdump.exe,include/libavutil/*.h,lib/avutil.lib,
+#         licenses/ffmpeg/{COPYING*,LICENSE.md},.stamp}.
 #         Log: ffmpeg/.work/build.log (the only thing this script keeps in ffmpeg/.work)
 set -euo pipefail
 
@@ -62,7 +63,8 @@ DIST="${FFP_ROOT}/dist/win64"
 DIGEST="$(compute_digest)"
 load_lock
 
-if [ "${FORCE}" = 0 ] && [ "${CHECK_ONLY}" = 0 ] && [ -f "${DIST}/.stamp" ] \
+# an incremental `author.sh build` (.dev-build) is never the result of the full build of its digest
+if [ "${FORCE}" = 0 ] && [ "${CHECK_ONLY}" = 0 ] && [ -f "${DIST}/.stamp" ] && [ ! -f "${DIST}/.dev-build" ] \
    && [ "$(cat "${DIST}/.stamp")" = "${DIGEST}" ] && [ -f "${DIST}/libffplay.dll" ] \
    && [ -f "${DIST}/ffcapsdump.exe" ] && [ -f "${DIST}/licenses/ffmpeg/LICENSE.md" ]; then
     log "dist/win64 is up to date (digest ${DIGEST}); use --force to rebuild."
@@ -149,7 +151,9 @@ for f in "${TREE}"/COPYING* "${TREE}/LICENSE.md"; do
     [ -f "$f" ] || die "FFmpeg license file missing in staged source: $f"
     cp "$f" "${LIC}/"
 done
-for f in ffplay.exe ffmpeg.exe ffprobe.exe ffcapsdump.exe libffplay.dll libffplay.dll.a ffplay.h; do
+for f in ffmpeg.exe ffprobe.exe ffcapsdump.exe libffplay.dll libffplay.dll.a ffplay.h \
+         include/libavutil/hwcontext_d3d11va.h include/libavutil/avconfig.h \
+         lib/avutil.lib; do
     [ -f "${DIST}/${f}" ] || die "${f} missing from ${ZIP}"
 done
 printf '%s\n' "${DIGEST}" > "${DIST}/.stamp"

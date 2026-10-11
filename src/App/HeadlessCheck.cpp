@@ -1,4 +1,4 @@
-// --headless-check: hidden window, real libffplay with SDL_AUDIODRIVER=dummy, every composition layer drawn, mode/page
+// --headless-check: hidden window, real libffplay with the dummy audio driver, every composition layer drawn, mode/page
 // transitions, resize and full-screen state changes on the hidden window, clean destruction. Writes a JSON result.
 #include <algorithm>
 #include <cmath>
@@ -65,7 +65,6 @@ HWND CreateOwnedWindowStandIn(HWND owner, const wchar_t* title) {
 }
 
 int App::RunHeadlessCheck() {
-    SetEnvironmentVariableW(L"SDL_AUDIODRIVER", L"dummy");
     SetUiLanguage(UiLanguage::English);   // the steps compare English texts, whatever the Windows UI language is
     OsDialogsBlocked() = true;            // the steps never show an OS dialog on the desktop
     // Synthetic messages must not inherit the physical Shift/Ctrl/Alt state from CurrentMods().
@@ -167,13 +166,14 @@ int App::RunHeadlessCheck() {
         ForceRender();
     }
 
-    // player: ffp_create with the topmost composition target already present
-    bool madePlayer = PumpUntil([&] { return player_ != nullptr || playerFailed_; }, 20000);
-    Step("ffp_create_with_comp_target", (madePlayer && player_) ? S_OK : E_FAIL);
+    // player: FfPlayer::Create with a presenter on the video child, the topmost composition target already present
+    Step("player_created_with_presenter", (player_ && player_->CurrentPresenter()) ? S_OK : E_FAIL);
     if (player_ && !opt_.inputs.empty()) {
         OpenPaths(*this, {opt_.inputs[0]});
         bool prep = PumpUntil([&] { return model_.prepared && state_ == wvp::PlayerState::Playing; }, 20000);
         Step("open_prepared_and_playing", prep ? S_OK : E_FAIL);
+        Note("startup_probe_ms", std::to_string(startupProbeMs_));
+        Note("startup_first_prepared_ms", std::to_string(firstPreparedMs_));
         // Steps that need running, seekable media call this: the suite runs on short clips (~3-6 s, which end while earlier
         // steps wait) and long ones (the 90 s broadcast fixture), and a drop / reopen may still be preparing. An ended or
         // paused item is restarted; one still opening is only waited for (PlayPause would toggle the pending open).
@@ -276,7 +276,7 @@ int App::RunHeadlessCheck() {
             bool expectsAribCaption = false;
             if (auto media = player_->GetMediaInfo()) {
                 for (const auto& stream : media->Streams) {
-                    if (stream.Type == wvp::StreamType::Subtitle && stream.Codec == L"arib_caption" && stream.AribType != L"superimpose") {
+                    if (stream.Type == wvp::StreamType::Subtitle && stream.Codec == "arib_caption" && stream.AribType != "superimpose") {
                         expectsAribCaption = true;
                         break;
                     }
@@ -332,8 +332,8 @@ int App::RunHeadlessCheck() {
             }
         }
         {
-            // legacy first open asks for "auto"; once the capability probe finished (a race with the first open) the planner picks the
-            // device and reopens the item: a sample taken during that reopen is empty, so wait for one from a decoding player
+            // the first open waited for the plan; the planner's content reopen right after it gives an empty sample, so wait for
+            // one from a decoding player
             wvp::DebugInfo di;
             PumpUntil([&] {
                 auto js = player_->GetDebugInfoJson();
@@ -341,7 +341,7 @@ int App::RunHeadlessCheck() {
                 return di.Valid && model_.prepared && !di.Video.HwaccelRequested.empty() && !di.Video.FramePath.empty();
             }, 8000);
             const wvp::Plan* plan = svc_->filters.CurrentPlan();
-            bool reqOk = di.Valid && (di.Video.HwaccelRequested == "auto" || (plan && !plan->hwaccel.empty() && di.Video.HwaccelRequested == plan->hwaccel));
+            bool reqOk = di.Valid && plan && (plan->hwaccel.empty() || di.Video.HwaccelRequested == plan->hwaccel);
             Step("hwaccel_requested_on_first_open", reqOk ? S_OK : E_FAIL);
             bool hw = di.Video.HwaccelDevice != "none" && !di.Video.HwaccelDevice.empty() &&
                       (di.Video.FramePath == "hw_download" || di.Video.FramePath == "hw_direct");
@@ -411,12 +411,13 @@ int App::RunHeadlessCheck() {
                 wchar_t tmpDir[MAX_PATH] = {};
                 GetTempPathW(MAX_PATH, tmpDir);
                 const std::wstring tmp = std::wstring(tmpDir) + L"aribplayer-history-write-probe.json";
+                const std::string tmpUtf8 = wvp::ToUtf8(tmp);
                 const std::string payload(16 * 1024, 'x');
                 for (bool durable : {true, false}) {
                     double mx = 0, sum = 0;
                     for (int i = 0; i < 10; ++i) {
                         const double t = qpcUs();
-                        wvp::fileio::AtomicWriteFile(tmp, payload, durable);
+                        wvp::platform::AtomicWriteFile(tmpUtf8, payload, durable);
                         const double d = (qpcUs() - t) / 1000.0;
                         mx = std::max(mx, d); sum += d;
                     }
@@ -500,12 +501,9 @@ int App::RunHeadlessCheck() {
             };
             measure("play_pause_bar_button_click", [&] { clickAt(Shell()->Bar()->ButtonWidget(B_Play)); });
             measure("play_pause_video_double_click", [&] {
-                wvp::InputEventArgs dbl{};   // the presenter INPUT event a second button-down on the video produces
-                dbl.Kind = wvp::InputKind::DoubleClick;
-                dbl.Button = 1;
-                dbl.X = layout_.video.w() / 2;
-                dbl.Y = layout_.video.h() / 2;
-                OnVideoInput(dbl);
+                const LPARAM at = MAKELPARAM(layout_.video.w() / 2, layout_.video.h() / 2);
+                SendMessageW(video_, WM_LBUTTONDBLCLK, MK_LBUTTON, at);   // the second press of a double click on the video child
+                SendMessageW(video_, WM_LBUTTONUP, 0, at);
             });
             measure("play_pause_space_key", [&] { SendMessageW(hwnd_, WM_KEYDOWN, VK_SPACE, 0); SendMessageW(hwnd_, WM_KEYUP, VK_SPACE, 0); });
             SetMiniPlayer(true);
@@ -531,25 +529,24 @@ int App::RunHeadlessCheck() {
             int filterErrors = 0;
             auto tok = player_->FilterError.add([&](const wvp::FilterErrorInfo&) { filterErrors++; });
             wvp::FilterSettings fs = svc_->filters.Settings();
-            fs.brightness = 0.1;
+            fs.speed = 1.25;
             SendFilterChange(*this, svc_->filters.Apply(fs));
-            fs.brightness = 0.2;
+            fs.speed = 1.5;
             SendFilterChange(*this, svc_->filters.Apply(fs));
             int before = positionEvents_;
             bool still = PumpUntil([&] { return positionEvents_ >= before + 2; }, 6000);
             Step("live_filter_change_no_error", (still && filterErrors == 0 && state_ == wvp::PlayerState::Playing) ? S_OK : E_FAIL);
             Note("filter_errors", std::to_string(filterErrors));
-            // overlay / log / ffplay line follow the live graph, not just the open-time options
-            // graph (-vf eq) or, when the d3d11 presenter absorbs the eq, -presenter_params
-            Step("live_filter_change_updates_effective_ffplay_cmd",
-                 ((LastOpenCmd().find(L"-vf") != std::wstring::npos || LastOpenCmd().find(L"-presenter_params") != std::wstring::npos) &&
-                  LastOpenCmd().find(L"brightness") != std::wstring::npos) ? S_OK : E_FAIL);
+            // overlay / log follow the live graph, not just the open-time options
+            bool liveVf = false;
+            for (const auto& [k, v] : effOpts_) liveVf = liveVf || (k == "vf" && v.find("setpts=PTS/1.5") != std::string::npos);
+            Step("live_filter_change_updates_effective_options", liveVf ? S_OK : E_FAIL);
             SendFilterChange(*this, svc_->filters.Reset());
             player_->FilterError.remove(tok);
         }
         Step("opening_media_switches_to_now_playing", (Mode() == ShellMode::NowPlaying && VideoVisible()) ? S_OK : E_FAIL);
         if (ctl_ && ctl_->Current()) {   // a drop on a playlist view (here: the current playlist) only appends
-            const std::wstring cur = ctl_->Current()->url;
+            const std::string cur = ctl_->Current()->url;
             const int idx = ctl_->CurrentIndex();
             const size_t before = ctl_->Items().size();
             bool done = false;
@@ -559,10 +556,9 @@ int App::RunHeadlessCheck() {
                  done && ctl_->Items().size() == before + 1 && ctl_->CurrentIndex() == idx && ctl_->Current() &&
                  ctl_->Current()->url == cur ? S_OK : E_FAIL);
         }
-        {   // OLE uses the shared route at DragOver and Drop; the child target prevents SDL's legacy file-drop style from intercepting.
-            Step("video_drop_hook_installed", PumpUntil([&] {
-                return VideoDropHooked() && DropTargetsReady() && !(GetWindowLongPtrW(VideoHwnd(), GWL_EXSTYLE) & WS_EX_ACCEPTFILES);
-            }, 5000) ? S_OK : E_FAIL);
+        {   // OLE uses the shared route at DragOver and Drop on the main window and the video child.
+            Step("video_drop_targets_ready",
+                 (DropTargetsReady() && !(GetWindowLongPtrW(VideoHwnd(), GWL_EXSTYLE) & WS_EX_ACCEPTFILES)) ? S_OK : E_FAIL);
             std::wstring first = opt_.inputs[0], dropPath = first;
             {   // A different file is required: dropping the playing file again does not replace the queue. Paths are compared
                 // as normalized full paths (the input may use '/' and be relative). Deterministic choice: the known small
@@ -622,7 +618,9 @@ int App::RunHeadlessCheck() {
                 std::wstring leaf = dropPath.substr(dropPath.find_last_of(L"\\/") + 1);
                 bool opened = PumpUntil([&] {
                     auto* cur = ctl_ ? ctl_->Current() : nullptr;
-                    return cur && cur->url.size() >= leaf.size() && _wcsicmp(cur->url.c_str() + cur->url.size() - leaf.size(), leaf.c_str()) == 0;
+                    if (!cur) return false;
+                    const std::wstring url = wvp::ToWide(cur->url);
+                    return url.size() >= leaf.size() && _wcsicmp(url.c_str() + url.size() - leaf.size(), leaf.c_str()) == 0;
                 }, 6000);
                 Step("video_drop_opens_dropped_file", opened ? S_OK : E_FAIL);
                 Step("video_drop_replaces_unnamed_and_plays", opened && currentPlaylistName_.empty() && ctl_ && ctl_->Items().size() == 1 &&
@@ -819,12 +817,12 @@ int App::RunHeadlessCheck() {
                 Step((pre + "_resume_in_sync_without_drops").c_str(),
                      (playing && drops == 0 && (!audioRunning || (avWhileAudio > -100 && avWhileAudio < 100))) ? S_OK : E_FAIL);
             };
-            const std::wstring configuredDecoder = svc_->settings.hwDecoder;
+            const std::string configuredDecoder = svc_->settings.hwDecoder;
             pausedReopen("baseline_pause_play", [] {}, false);   // no reopen: the drop / caption numbers to compare with
             pausedReopen("ui_loss_paused", [&] { SimulateUiDeviceLoss(); });
             pausedReopen("settings_reopen_paused", [&] {
                 wvp::AppSettings before = svc_->settings, after = before;   // a decoder change reopens at the position
-                after.hwDecoder = before.hwDecoder == L"off" ? L"auto" : L"off";
+                after.hwDecoder = before.hwDecoder == "off" ? "auto" : "off";
                 svc_->settings = after;
                 ApplySettingsLive(*ctl_, svc_->filters, before, after);
             });
@@ -862,7 +860,7 @@ int App::RunHeadlessCheck() {
                     const std::string prefix = "reopen_sample_" + std::to_string(i + 1);
                     pausedReopen(prefix.c_str(), [&] {
                         wvp::AppSettings before = svc_->settings, after = before;
-                        after.hwDecoder = before.hwDecoder == configuredDecoder ? (configuredDecoder == L"off" ? L"auto" : L"off") : configuredDecoder;
+                        after.hwDecoder = before.hwDecoder == configuredDecoder ? (configuredDecoder == "off" ? "auto" : "off") : configuredDecoder;
                         svc_->settings = after;
                         ApplySettingsLive(*ctl_, svc_->filters, before, after);
                     });
@@ -898,7 +896,7 @@ int App::RunHeadlessCheck() {
             }
             auto hasAll = [&] {
                 std::string t = DebugText();
-                return t.find("renderer  ") != std::string::npos && t.find("renderer  ?") == std::string::npos && t.find("decoder ") != std::string::npos &&
+                return t.find("output    ") != std::string::npos && t.find("output    ?") == std::string::npos && t.find("decoder ") != std::string::npos &&
                        t.find("frame_path ") != std::string::npos && t.find("A-V ") != std::string::npos && t.find("codec ") != std::string::npos &&
                        t.find("hwaccel") != std::string::npos && t.find("master ") != std::string::npos && t.find("no debug info") == std::string::npos;
             };
@@ -971,16 +969,17 @@ int App::RunHeadlessCheck() {
         Step("resize_hidden_video_follows", (frameOk && vidOk) ? S_OK : E_FAIL);
         ForceRender();
         Step("resize_redraw", lastDrawHr_);
-        {   // Always on top "While fullscreen": the real enter / exit re-evaluate it (the window stays hidden)
+        {   // Always on top "While fullscreen": the real enter / exit re-evaluate it. The window stays hidden, and Windows
+            // does not reliably keep a hidden, never-activated full-screen popup in the topmost band, so this checks the
+            // decision ApplyWindowTopmost made rather than WS_EX_TOPMOST.
             const auto savedAot = svc_->settings.alwaysOnTop;
-            auto topmost = [&] { return (GetWindowLongPtrW(hwnd_, GWL_EXSTYLE) & WS_EX_TOPMOST) != 0; };
             svc_->settings.alwaysOnTop = wvp::AlwaysOnTop::WhenFullscreen;
             ApplyWindowTopmost();
-            const bool windowedBefore = !topmost();
+            const bool windowedBefore = !topmostWanted_;
             SetFullscreen(true);
-            const bool inFullscreen = Mode() == ShellMode::FullScreen && topmost();
+            const bool inFullscreen = Mode() == ShellMode::FullScreen && topmostWanted_;
             SetFullscreen(false);
-            const bool windowedAfter = Mode() == ShellMode::NowPlaying && !topmost();
+            const bool windowedAfter = Mode() == ShellMode::NowPlaying && !topmostWanted_;
             svc_->settings.alwaysOnTop = savedAot;
             ApplyWindowTopmost();
             Step("aot_while_fullscreen_follows_fullscreen_enter_exit",
@@ -1035,12 +1034,8 @@ int App::RunHeadlessCheck() {
         auto checkFullscreenContextMenu = [&](const char* openStep, const char* invokeStep, pui::PointF cursor) {
             host_.CloseAllPopups();
             nativemenu::ClearLastShown();
-            wvp::InputEventArgs rightUp{};
-            rightUp.Kind = wvp::InputKind::Up;
-            rightUp.Button = 3;
-            rightUp.X = (int)std::lround(cursor.x * scale_) - layout_.video.l;
-            rightUp.Y = (int)std::lround(cursor.y * scale_) - layout_.video.t;
-            OnVideoInput(rightUp);   // same presenter INPUT event path as a right-button release over the video child
+            const int x = (int)std::lround(cursor.x * scale_) - layout_.video.l, y = (int)std::lround(cursor.y * scale_) - layout_.video.t;
+            SendMessageW(video_, WM_RBUTTONUP, 0, MAKELPARAM(x, y));   // a right-button release over the video child
             ForceRender();
             auto items = nativemenu::LastShown();   // the native menu was not shown (tests): its descriptors were recorded
             Step(openStep, (items.size() > 10 && host_.PopupCount() == 0) ? S_OK : E_FAIL);
@@ -1249,7 +1244,7 @@ int App::RunHeadlessCheck() {
         std::ifstream in(log::Global().FilePath(false), std::ios::binary);
         std::string txt((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
         // The events follow docs/debugging.md; the seek is the Skip -10 key issued above.
-        std::vector<const char*> want = {"] open: url: ", "] open: options: ", "hwaccel=", "] open: ffplay: ffplay.exe ", "-hwaccel ",
+        std::vector<const char*> want = {"] open: url: ", "] open: options: ",
                                          "] player: prepared: ", "] player: state: Playing", "] mode: now-playing",
                                          "] seek: key relative -10", "] filter: vf (", "] av: "};
         if (opt_.stats) { want.push_back(" A-V:"); want.push_back("stats=1"); }
@@ -1257,7 +1252,7 @@ int App::RunHeadlessCheck() {
         for (const char* n : want)
             if (txt.find(n) == std::string::npos) missing += std::string(missing.empty() ? "" : " | ") + n;
         const bool ok = missing.empty();
-        Step("log_file_has_open_options_ffplay_cmd_prepared_av_and_status_lines", (ok && !txt.empty()) ? S_OK : E_FAIL);
+        Step("log_file_has_open_options_prepared_av_and_status_lines", (ok && !txt.empty()) ? S_OK : E_FAIL);
         Note("log_file_bytes", std::to_string(txt.size()));
         Note("log_status_lines", std::to_string(log::Global().StatusLinesWritten()));
         if (!ok) {

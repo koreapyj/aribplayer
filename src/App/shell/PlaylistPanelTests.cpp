@@ -5,7 +5,7 @@
 using namespace app;
 
 namespace {
-wvp::MediaItem Item(const wchar_t* url, const wchar_t* title = L"", std::optional<double> dur = std::nullopt) {
+wvp::MediaItem Item(const char* url, const char* title = "", std::optional<double> dur = std::nullopt) {
     return wvp::MediaItem(url, title, dur);
 }
 }
@@ -38,27 +38,27 @@ LOGIC_TEST(playlist_panel_marquee_offset) {
 }
 
 LOGIC_TEST(playlist_panel_total_duration_skips_unknown) {
-    std::vector<wvp::MediaItem> items{Item(L"a", L"", 60.0), Item(L"b"), Item(L"c", L"", 30.5), Item(L"d", L"", -4.0), Item(L"e", L"", 0.0)};
+    std::vector<wvp::MediaItem> items{Item("a", "", 60.0), Item("b"), Item("c", "", 30.5), Item("d", "", -4.0), Item("e", "", 0.0)};
     LT_CHECK_EQ(plp::TotalKnownDuration(items), 90.5);
     LT_CHECK_EQ(plp::TotalKnownDuration({}), 0.0);
 }
 
 LOGIC_TEST(playlist_panel_filter_is_case_insensitive_on_title) {
-    wvp::MediaItem a = Item(L"C:\\x\\Lecture 03.mp4", L"Intro To Binding");
+    wvp::MediaItem a = Item("C:\\x\\Lecture 03.mp4", "Intro To Binding");
     LT_CHECK(plp::FilterMatches(a, L""));
     LT_CHECK(plp::FilterMatches(a, L"binding"));
     LT_CHECK(plp::FilterMatches(a, L"TO BIND"));
     LT_CHECK(!plp::FilterMatches(a, L"lecture"));   // title only, not the path
-    wvp::MediaItem untitled = Item(L"C:\\x\\Lecture 03.mp4");
+    wvp::MediaItem untitled = Item("C:\\x\\Lecture 03.mp4");
     LT_CHECK(plp::FilterMatches(untitled, L"LECTURE"));   // falls back to the display title (file name)
 }
 
 LOGIC_TEST(playlist_panel_chip_label_of_unnamed_playlist) {
     SetUiLanguage(UiLanguage::English);
-    LT_CHECK(plp::ChipLabel(L"") == L"Default playlist");
-    LT_CHECK(plp::ChipLabel(L"Watch later") == L"Watch later");
+    LT_CHECK(plp::ChipLabel("") == L"Default playlist");
+    LT_CHECK(plp::ChipLabel("Watch later") == L"Watch later");
     SetUiLanguage(UiLanguage::Korean);
-    LT_CHECK(plp::ChipLabel(L"") == L"기본 재생목록");
+    LT_CHECK(plp::ChipLabel("") == L"기본 재생목록");
     SetUiLanguage(UiLanguage::English);
 }
 
@@ -71,7 +71,7 @@ LOGIC_TEST(playlist_panel_accelerators) {
     LT_CHECK(plp::ActionForKey('U', pui::ModCtrl, false) == A::AddUrl);
     LT_CHECK(plp::ActionForKey('T', pui::ModCtrl, false) == A::RemoveMissing);
     LT_CHECK(plp::ActionForKey(pui::key::Delete, pui::ModCtrl, true) == A::RemoveUnselected);
-    LT_CHECK(plp::ActionForKey(pui::key::Delete, pui::ModAlt, true) == A::None);   // Remove all is gone
+    LT_CHECK(plp::ActionForKey(pui::key::Delete, pui::ModAlt, true) == A::None);   // Alt+Delete is unbound
     LT_CHECK(plp::ActionForKey(pui::key::Home, pui::ModCtrl, true) == A::MoveTop);
     LT_CHECK(plp::ActionForKey(pui::key::End, pui::ModCtrl, true) == A::MoveBottom);
     LT_CHECK(plp::ActionForKey('1', pui::ModCtrl, true) == A::Sort);

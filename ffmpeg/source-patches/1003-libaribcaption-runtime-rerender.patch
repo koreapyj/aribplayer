@@ -239,11 +239,10 @@
                  image->dst_x, image->dst_y, image->width, image->height,
                  rect->x, rect->y, rect->w, rect->h,
                  rect_idx, ctx->clut_idx);
-@@ -856,6 +943,468 @@ fail:
+@@ -856,6 +943,467 @@ fail:
      return ret;
  }
  
-+/* DRCS bitmaps are included. */
 +static size_t aribcaption_caption_bytes(const aribcc_caption_t *c)
 +{
 +    size_t bytes = sizeof(*c);
@@ -708,7 +707,7 @@
  static int aribcaption_decode(AVCodecContext *avctx, AVSubtitle *sub,
                                int *got_sub_ptr, const AVPacket *avpkt)
  {
-@@ -867,6 +1416,11 @@ static int aribcaption_decode(AVCodecCon
+@@ -867,6 +1415,11 @@ static int aribcaption_decode(AVCodecCon
          avpriv_request_sample(ctx, "Different Version of Segment asked Twice");
          return AVERROR_PATCHWELCOME;
      }
@@ -720,7 +719,7 @@
      hex_dump_debug(ctx, avpkt->data, avpkt->size);
  
      ctx->sub = sub;
-@@ -880,6 +1434,8 @@ static int aribcaption_decode(AVCodecCon
+@@ -880,6 +1433,8 @@ static int aribcaption_decode(AVCodecCon
          ctx->pts = ARIBCC_PTS_NOPTS;
      else
          ctx->pts = av_rescale_q(avpkt->pts, ctx->time_base, (AVRational){1, 1000});
@@ -729,7 +728,7 @@
  
      status = aribcc_decoder_decode(ctx->decoder, avpkt->data, avpkt->size,
                                     ctx->pts, &ctx->caption);
-@@ -913,7 +1469,7 @@ static int aribcaption_decode(AVCodecCon
+@@ -913,7 +1468,7 @@ static int aribcaption_decode(AVCodecCon
          break;
  
      case SUBTITLE_BITMAP:
@@ -738,7 +737,7 @@
          break;
  
      case SUBTITLE_NONE:
-@@ -941,6 +1497,15 @@ static int aribcaption_decode(AVCodecCon
+@@ -941,6 +1496,15 @@ static int aribcaption_decode(AVCodecCon
              sub->end_display_time = UINT32_MAX;
          else
              sub->end_display_time = (uint32_t)ctx->caption.wait_duration;
@@ -754,7 +753,7 @@
      }
  
      aribcc_caption_cleanup(&ctx->caption);
-@@ -955,6 +1520,9 @@ static void aribcaption_flush(AVCodecCon
+@@ -955,6 +1519,9 @@ static void aribcaption_flush(AVCodecCon
          aribcc_decoder_flush(ctx->decoder);
      if (ctx->renderer)
          aribcc_renderer_flush(ctx->renderer);
@@ -764,7 +763,7 @@
      if (!(avctx->flags2 & AV_CODEC_FLAG2_RO_FLUSH_NOOP))
          ctx->readorder = 0;
  }
-@@ -968,6 +1536,7 @@ static av_cold int aribcaption_close(AVC
+@@ -968,6 +1535,7 @@ static av_cold int aribcaption_close(AVC
          aribcc_renderer_free(ctx->renderer);
          ctx->renderer = NULL;
      }
@@ -772,7 +771,7 @@
      av_freep(&ctx->clut);
      if (ctx->decoder) {
          aribcc_decoder_free(ctx->decoder);
-@@ -988,6 +1557,10 @@ static av_cold int aribcaption_init(AVCo
+@@ -988,6 +1556,10 @@ static av_cold int aribcaption_init(AVCo
      int ret = 0;
  
      ctx->avctx = avctx;
@@ -783,7 +782,7 @@
  
      switch (avctx->profile) {
      case AV_PROFILE_ARIB_PROFILE_A:
-@@ -1038,13 +1611,6 @@ static av_cold int aribcaption_init(AVCo
+@@ -1038,13 +1610,6 @@ static av_cold int aribcaption_init(AVCo
      aribcc_decoder_set_replace_msz_fullwidth_japanese(ctx->decoder,
                                                        ctx->replace_msz_japanese);
  
@@ -797,7 +796,7 @@
      switch ((enum AVSubtitleType) ctx->subtitle_type) {
      case SUBTITLE_ASS:
          ret = set_ass_header(ctx);
-@@ -1067,19 +1633,14 @@ static av_cold int aribcaption_init(AVCo
+@@ -1067,19 +1632,14 @@ static av_cold int aribcaption_init(AVCo
              av_log(avctx, AV_LOG_ERROR, "Failed to initialize libaribcaption renderer.\n");
              return AVERROR_EXTERNAL;
          }
@@ -820,7 +819,7 @@
          if (!(ctx->clut = av_mallocz(AVPALETTE_SIZE)))
              return AVERROR(ENOMEM);
  
-@@ -1130,6 +1691,14 @@ static av_cold int aribcaption_init(AVCo
+@@ -1130,6 +1690,14 @@ static av_cold int aribcaption_init(AVCo
  
      ctx->readorder = 0;
  
@@ -835,7 +834,7 @@
      return 0;
  }
  
-@@ -1183,7 +1752,8 @@ static const AVOption options[] = {
+@@ -1183,7 +1751,8 @@ static const AVOption options[] = {
      { "replace_msz_glyph", "replace MSZ characters with halfwidth glyphs [bitmap]",
        OFFSET(replace_msz_glyph), AV_OPT_TYPE_BOOL, { .i64 = 1 }, 0, 1, SD },
      {"canvas_size", "set input video size (WxH or abbreviation) [bitmap]",
@@ -845,7 +844,7 @@
      { "caption_type", "ARIB caption type",
        OFFSET(caption_type), AV_OPT_TYPE_INT,
        { .i64 = ARIBCC_CAPTIONTYPE_CAPTION },
-@@ -1193,6 +1763,22 @@ static const AVOption options[] = {
+@@ -1193,6 +1762,22 @@ static const AVOption options[] = {
        { .i64 = ARIBCC_CAPTIONTYPE_CAPTION }, .flags = SD, .unit = "caption_type" },
      { "superimpose", "superimpose service", 0, AV_OPT_TYPE_CONST,
        { .i64 = ARIBCC_CAPTIONTYPE_SUPERIMPOSE }, .flags = SD, .unit = "caption_type" },
@@ -868,7 +867,7 @@
      { NULL }
  };
  
-@@ -1209,6 +1795,7 @@ const FFCodec ff_libaribcaption_decoder
+@@ -1209,6 +1794,7 @@ const FFCodec ff_libaribcaption_decoder
      .p.type         = AVMEDIA_TYPE_SUBTITLE,
      .p.id           = AV_CODEC_ID_ARIB_CAPTION,
      .priv_data_size = sizeof(ARIBCaptionContext),

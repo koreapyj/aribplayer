@@ -19,6 +19,7 @@
 #include "features/FxModel.h"
 #include "features/FxUtil.h"
 #include "features/SettingsLogic.h"
+#include "wvp/win32/Utf.h"
 
 namespace app {
 
@@ -174,7 +175,6 @@ void ApplyPlayback(AppContext& ctx) {
     auto* c = ctx.Controller();
     if (!c) return;
     const wvp::AppSettings& s = ctx.Svc().settings;
-    ApplyHwDecoder(*c, s.hwDecoder);
     c->Player().SetSubtitleVisible(wvp::SubtitleLayer::Caption, s.showCaptions);
     c->Player().SetSubtitleVisible(wvp::SubtitleLayer::Superimpose, s.showSuperimpose);
     // Volume is never remembered across launches: the controller keeps its default (100, unmuted).
@@ -195,11 +195,11 @@ void ApplyCaptionOpenOptions(wvp::PlaybackController& ctl, const wvp::AppSetting
     CaptionStyle style = ReadSystemCaptionStyle();
     g_appliedCaptionStyle = style;
     g_captionStyleKnown = true;
-    std::wstring fontPath = settings.aribFont.empty() ? BundledAribFontPath() : settings.aribFont;
-    ctl.SetBaseOption(L"arib_font", fontPath);
-    ctl.SetBaseOption(L"superimpose", settings.showSuperimpose ? L"1" : L"0");
-    ctl.SetBaseOption(L"arib_ignore_background", style.ignoreBackground ? L"1" : L"0");
-    ctl.SetBaseOption(L"arib_force_outline", style.forceOutline ? L"1" : L"0");
+    std::string fontPath = settings.aribFont.empty() ? wvp::ToUtf8(BundledAribFontPath()) : settings.aribFont;
+    ctl.SetBaseOption("arib_font", wvp::AribFontOption(fontPath));
+    ctl.SetBaseOption("superimpose", settings.showSuperimpose ? "1" : "0");
+    ctl.SetBaseOption("arib_ignore_background", style.ignoreBackground ? "1" : "0");
+    ctl.SetBaseOption("arib_force_outline", style.forceOutline ? "1" : "0");
 }
 
 std::wstring FormatBuildTime(unsigned long long ft) {
@@ -229,57 +229,21 @@ std::wstring ExeBuildStamp() {
 }
 std::wstring LibffplayBuildStamp() { return StampOf(LibffplayPath()); }
 
-void ApplyHwDecoder(wvp::PlaybackController& ctl, const std::wstring& decoder) {
-    auto& o = ctl.BaseOptions;
-    o.erase(std::remove_if(o.begin(), o.end(), [](const auto& kv) { return kv.first == L"hwaccel"; }), o.end());
-    ctl.SetHwDecoder(LegacyHwDecoder(decoder));
-}
-
-std::wstring LegacyHwDecoder(const std::wstring& decoder) {
-    // "gpu" (Prefer GPU) is a planner preference; the legacy open path has no such value and treats it as auto
-    if (decoder == L"gpu") return L"auto";
-    return wvp::IsValidHwDecoder(decoder) ? decoder : std::wstring(L"auto");
-}
-
 LiveApplyResult ApplySettingsLive(wvp::PlaybackController& ctl, wvp::FilterManager& fm, const wvp::AppSettings& before,
                                   const wvp::AppSettings& after) {
     LiveApplyResult r;
-    const bool prefsChanged = before.hwDecoder != after.hwDecoder || before.presenter != after.presenter;
-    if (fm.PlannerActive()) {
-        // Planner mode: the plan encodes the decoder + presenter preference. The controller property is kept in sync (legacy
-        // fallback), the preferences go through FilterManager and a decoder/presenter change reopens the item.
-        ApplyHwDecoder(ctl, after.hwDecoder);
-        if (prefsChanged) {
-            wvp::PlanPrefs pp = wvp::PlanPrefsFor(after.hwDecoder, after.presenter);
-            wvp::FilterChange fc = fm.SetPlanPreferences(pp.decoder, pp.forcedDecoder, pp.presenter);
-            auto st = ctl.Player().State();
-            if (fc.reopen && ctl.Current() && (st == wvp::PlayerState::Playing || st == wvp::PlayerState::Paused)) {
-                r.reopened = ctl.ReopenCurrentHere();
-            } else if (!fc.reopen) {
-                ctl.ApplyFilterChange(fc);
-            }
-            const auto& hw = sl::HwDecoderChoices()[(size_t)sl::HwDecoderIndex(after.hwDecoder)];
-            const auto& vo = sl::VideoOutputChoices()[(size_t)sl::VideoOutputIndex(after.presenter)];
-            if (before.hwDecoder != after.hwDecoder)
-                r.toast = std::wstring(Tr(L"Hardware decoding: ", L"하드웨어 디코딩: ")) + hw.label + (r.reopened ? Tr(L"  — reopened", L"  — 다시 열림") : L"");
-            else
-                r.toast = std::wstring(Tr(L"Video output: ", L"영상 출력: ")) + vo.label + (r.reopened ? Tr(L"  — reopened", L"  — 다시 열림") : L"");
+    if (before.hwDecoder != after.hwDecoder) {
+        // the plan encodes the decoder preference: a decoder change reopens the item (before capabilities it is remembered)
+        wvp::PlanPrefs pp = wvp::PlanPrefsFor(after.hwDecoder);
+        wvp::FilterChange fc = fm.SetPlanPreferences(pp.decoder, pp.forcedDecoder);
+        auto st = ctl.Player().State();
+        if (fc.reopen && ctl.Current() && (st == wvp::PlayerState::Playing || st == wvp::PlayerState::Paused)) {
+            r.reopened = ctl.ReopenCurrentHere();
+        } else {
+            ctl.ApplyFilterChange(fc);
         }
-    } else {
-        if (prefsChanged) {   // remembered for when capabilities arrive
-            wvp::PlanPrefs pp = wvp::PlanPrefsFor(after.hwDecoder, after.presenter);
-            fm.SetPlanPreferences(pp.decoder, pp.forcedDecoder, pp.presenter);
-        }
-        if (before.hwDecoder != after.hwDecoder || ctl.HwDecoder() != LegacyHwDecoder(after.hwDecoder)) {
-            bool changed = ctl.HwDecoder() != LegacyHwDecoder(after.hwDecoder);
-            ApplyHwDecoder(ctl, after.hwDecoder);
-            auto st = ctl.Player().State();
-            if (changed && ctl.Current() && (st == wvp::PlayerState::Playing || st == wvp::PlayerState::Paused)) {
-                r.reopened = ctl.ReopenCurrentHere();
-            }
-            const auto& ch = sl::HwDecoderChoices()[(size_t)sl::HwDecoderIndex(after.hwDecoder)];
-            if (changed) r.toast = std::wstring(Tr(L"Hardware decoding: ", L"하드웨어 디코딩: ")) + ch.label + (r.reopened ? Tr(L"  — reopened", L"  — 다시 열림") : L"");
-        }
+        const auto& hw = sl::HwDecoderChoices()[(size_t)sl::HwDecoderIndex(after.hwDecoder)];
+        r.toast = std::wstring(Tr(L"Hardware decoding: ", L"하드웨어 디코딩: ")) + hw.label + (r.reopened ? Tr(L"  — reopened", L"  — 다시 열림") : L"");
     }
     const bool captionDecoderChanged = before.showSuperimpose != after.showSuperimpose || before.aribFont != after.aribFont;
     const auto state = ctl.Player().State();
@@ -297,7 +261,7 @@ void LoadSettingsAtStartup(AppContext& ctx) {
     const wvp::AppSettings& s = svc.settings;
     // Populate the provider before any path can open the first media item.
     (void)svc.filters.Apply(s.filters);
-    fx::Zoom().on = s.filters.customVideoFilter.find(fx::kZoomInstance) != std::wstring::npos;
+    fx::Zoom().on = s.filters.customVideoFilter.find(fx::kZoomInstance) != std::string::npos;
     fx::Zoom().aspect = 16.0 / 9.0;   // refreshed from the actual video area on media prepare
 
     g_appliedAccent = s.accentColor;
@@ -306,9 +270,9 @@ void LoadSettingsAtStartup(AppContext& ctx) {
 
     // playback settings once the controller exists (ffp_create is asynchronous)
     g_appliedSettings = s;
-    {   // planner preferences (decoder / video output); they only matter once capabilities arrive
-        wvp::PlanPrefs pp = wvp::PlanPrefsFor(s.hwDecoder, s.presenter);
-        svc.filters.SetPlanPreferences(pp.decoder, pp.forcedDecoder, pp.presenter);
+    {   // planner preference (decoder); it only matters once capabilities arrive
+        wvp::PlanPrefs pp = wvp::PlanPrefsFor(s.hwDecoder);
+        svc.filters.SetPlanPreferences(pp.decoder, pp.forcedDecoder);
     }
     ApplyPlayback(ctx);   // no-op now; the controller does not exist yet
     if (!g_hooked) {
