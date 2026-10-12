@@ -807,18 +807,18 @@ std::vector<pui::MenuItemDesc> PlaylistPanel::BuildItemMenu(int row) {
         for (int r : rows) if (r >= 0 && r < (int)Items().size()) out.push_back(Items()[(size_t)r]);
         return out;
     };
+    m.push_back(pui::MenuItemDesc::Separator());
     m.push_back(pui::MenuItemDesc::Sub(Tr(L"Copy", L"복사"), lists::AddToPlaylistItems(ctx_, pick, viewed_), G::Copy));
-    auto above = Item(L"Delete items above", L"위쪽 항목 삭제", PanelAction::RemoveAbove, !rows.empty() && rows.front() > 0);
-    auto del = pui::MenuItemDesc::Sub(Tr(L"Delete", L"삭제"),
-                                      {Item(L"Delete", L"삭제", PanelAction::RemoveSelected),
-                                       Item(L"Delete others", L"다른 항목 삭제", PanelAction::RemoveUnselected),
-                                       Item(L"Delete missing files", L"없는 파일 삭제", PanelAction::RemoveMissing),
-                                       std::move(above)}, G::Delete);
-    if (!Editable()) del.Disabled();
-    m.push_back(std::move(del));
     m.push_back(pui::MenuItemDesc::Separator());
     m.push_back(Item(L"Move to top", L"맨 위로", PanelAction::MoveTop, !rows.empty()));
     m.push_back(Item(L"Move to bottom", L"맨 아래로", PanelAction::MoveBottom, !rows.empty()));
+    m.push_back(pui::MenuItemDesc::Separator());
+    auto del = Item(L"Delete", L"삭제", PanelAction::RemoveSelected);
+    del.glyph = G::Delete;
+    m.push_back(std::move(del));
+    m.push_back(Item(L"Delete others", L"다른 항목 삭제", PanelAction::RemoveUnselected));
+    m.push_back(Item(L"Delete missing files", L"없는 파일 삭제", PanelAction::RemoveMissing));
+    m.push_back(Item(L"Delete items above", L"위쪽 항목 삭제", PanelAction::RemoveAbove, !rows.empty() && rows.front() > 0));
     return m;
 }
 

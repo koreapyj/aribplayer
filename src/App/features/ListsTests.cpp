@@ -756,35 +756,31 @@ LOGIC_TEST(lists_panel_item_menu_has_copy_delete_and_move) {
         auto* menu = ShownMenu();
         LT_CHECK(menu != nullptr);
         if (menu) {
-            LT_CHECK(MenuTexts(*menu) == (std::vector<std::wstring>{L"Play", L"Copy", L"Delete", L"", L"Move to top", L"Move to bottom"}));
-            LT_CHECK(menu->Item(0).enabled && menu->Item(1).enabled && menu->Item(2).enabled && menu->Item(4).enabled && menu->Item(5).enabled);
+            LT_CHECK(MenuTexts(*menu) == (std::vector<std::wstring>{L"Play", L"", L"Copy", L"", L"Move to top", L"Move to bottom", L"",
+                                                                     L"Delete", L"Delete others", L"Delete missing files", L"Delete items above"}));
+        }
+        if (menu && menu->ItemCount() == 11) {
+            for (int i : {0, 2, 4, 5, 7, 8, 9, 10}) LT_CHECK(menu->Item(i).enabled);   // row 1 is the topmost selected: row 0 lies above
             LT_CHECK_EQ(menu->Item(0).accelerator, L"Enter");
             LT_CHECK_EQ(menu->Item(4).accelerator, L"Ctrl+Home");
             LT_CHECK_EQ(menu->Item(5).accelerator, L"Ctrl+End");
-            auto del = menu->Item(2).sub;
-            LT_CHECK(MenuTexts(MenuProbe{del}) == (std::vector<std::wstring>{L"Delete", L"Delete others", L"Delete missing files", L"Delete items above"}));
-            if (del.size() == 4) {
-                LT_CHECK_EQ(del[0].accelerator, L"Del");
-                LT_CHECK_EQ(del[1].accelerator, L"Ctrl+Del");
-                LT_CHECK_EQ(del[2].accelerator, L"Ctrl+T");
-                LT_CHECK(del[3].accelerator.empty() && del[3].enabled);   // row 1 is the topmost selected: row 0 lies above
-            }
+            LT_CHECK_EQ(menu->Item(7).accelerator, L"Del");
+            LT_CHECK_EQ(menu->Item(8).accelerator, L"Ctrl+Del");
+            LT_CHECK_EQ(menu->Item(9).accelerator, L"Ctrl+T");
+            LT_CHECK(menu->Item(10).accelerator.empty());
             // no other playlist: a disabled placeholder, then a separator and "New playlist…"
-            auto copy = menu->Item(1).sub;
+            auto copy = menu->Item(2).sub;
             LT_CHECK(MenuTexts(MenuProbe{copy}) == (std::vector<std::wstring>{L"(No playlists)", L"", L"New playlist…"}));
             if (copy.size() == 3) LT_CHECK(!copy[0].enabled && copy[2].enabled);
             // Delete items above removes row 0 only
-            nativemenu::InvokeItem(del, L"Delete items above");
+            menu->ActivateIndex(10);
             LT_CHECK_EQ(ctx.svc.playlists.Load("Alpha").size(), (size_t)2);
         }
         // the topmost selected item is row 0: nothing above, the entry is disabled
         panel->List()->onContextMenu(0, pui::PointF{0, 0}, false);
         menu = ShownMenu();
         LT_CHECK(menu != nullptr);
-        if (menu) {
-            auto del = menu->Item(2).sub;
-            LT_CHECK(del.size() == 4 && !del[3].enabled);
-        }
+        if (menu) LT_CHECK(menu->ItemCount() == 11 && !menu->Item(10).enabled);
         ctx.host.SetRoot(nullptr);
     }
     RemoveDir(dir);
@@ -803,7 +799,7 @@ LOGIC_TEST(lists_panel_item_menu_copy_lists_other_playlists) {
         auto* menu = ShownMenu();
         LT_CHECK(menu != nullptr);
         if (menu) {
-            auto copy = menu->Item(1).sub;
+            auto copy = menu->Item(2).sub;
             LT_CHECK(MenuTexts(MenuProbe{copy}) == (std::vector<std::wstring>{L"Beta", L"", L"New playlist…"}));
             nativemenu::InvokeItem(copy, L"Beta");
             LT_CHECK_EQ(ctx.svc.playlists.Load("Beta").size(), (size_t)2);
@@ -826,8 +822,8 @@ LOGIC_TEST(lists_panel_read_only_item_menu_disables_delete_and_move) {
         auto* menu = ShownMenu();
         LT_CHECK(menu != nullptr);
         if (menu) {
-            LT_CHECK(menu->Item(0).enabled && menu->Item(1).enabled);
-            LT_CHECK(!menu->Item(2).enabled && !menu->Item(4).enabled && !menu->Item(5).enabled);
+            LT_CHECK(menu->ItemCount() == 11 && menu->Item(0).enabled && menu->Item(2).enabled);
+            if (menu->ItemCount() == 11) for (int i : {4, 5, 7, 8, 9, 10}) LT_CHECK(!menu->Item(i).enabled);
         }
         ctx.host.SetRoot(nullptr);
     }
