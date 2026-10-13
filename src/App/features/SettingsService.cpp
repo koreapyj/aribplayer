@@ -24,29 +24,53 @@
 namespace app {
 
 namespace {
+namespace cc = winrt::Windows::Media::ClosedCaptioning;
+static_assert((int)cc::ClosedCaptionStyle::Default == 0 && (int)cc::ClosedCaptionStyle::SmallCapitals == 7);
+static_assert((int)cc::ClosedCaptionSize::Default == 0 && (int)cc::ClosedCaptionSize::TwoHundredPercent == 4);
+static_assert((int)cc::ClosedCaptionColor::Default == 0 && (int)cc::ClosedCaptionColor::White == 1 &&
+              (int)cc::ClosedCaptionColor::Black == 2 && (int)cc::ClosedCaptionColor::Cyan == 8);
+static_assert((int)cc::ClosedCaptionOpacity::Default == 0 && (int)cc::ClosedCaptionOpacity::OneHundredPercent == 1 &&
+              (int)cc::ClosedCaptionOpacity::ZeroPercent == 4);
+static_assert((int)cc::ClosedCaptionEdgeEffect::Default == 0 && (int)cc::ClosedCaptionEdgeEffect::None == 1 &&
+              (int)cc::ClosedCaptionEdgeEffect::Uniform == 4 && (int)cc::ClosedCaptionEdgeEffect::DropShadow == 5);
+
+wvp::WindowsCaptionProperties ReadWindowsCaptionProperties() {
+    wvp::WindowsCaptionProperties p;
+    try {
+        using P = cc::ClosedCaptionProperties;
+        p.fontStyle = (int)P::FontStyle();
+        p.fontSize = (int)P::FontSize();
+        p.fontColor = (int)P::FontColor();
+        p.fontOpacity = (int)P::FontOpacity();
+        p.fontEffect = (int)P::FontEffect();
+        p.backgroundColor = (int)P::BackgroundColor();
+        p.backgroundOpacity = (int)P::BackgroundOpacity();
+    } catch (...) {
+        p = {};   // Windows may reject the property read: everything "Default"
+    }
+    return p;
+}
+
 struct CaptionStyle {
     bool ignoreBackground = false;
     bool forceOutline = false;
     bool operator==(const CaptionStyle&) const = default;
 };
 
-CaptionStyle ReadSystemCaptionStyle() {
+CaptionStyle AribCaptionStyle(const wvp::WindowsCaptionProperties& p) {
+    // ARIB draws one box per character cell, which is the Windows text background; the caption
+    // window (region) has no ARIB counterpart, so only a transparent text background drops the box.
     CaptionStyle style;
-    try {
-        using namespace winrt::Windows::Media::ClosedCaptioning;
-        // ARIB draws one box per character cell, which is the Windows text background; the caption
-        // window (region) has no ARIB counterpart, so only a transparent text background drops the box.
-        style.ignoreBackground = ClosedCaptionProperties::BackgroundOpacity() == ClosedCaptionOpacity::ZeroPercent;
-        const auto effect = ClosedCaptionProperties::FontEffect();
-        style.forceOutline = effect == ClosedCaptionEdgeEffect::Uniform || effect == ClosedCaptionEdgeEffect::DropShadow;
-    } catch (...) {
-        // Windows may reject the property read; preserve libaribcaption's broadcast defaults.
-    }
+    style.ignoreBackground = p.backgroundOpacity == (int)cc::ClosedCaptionOpacity::ZeroPercent;
+    style.forceOutline = p.fontEffect == (int)cc::ClosedCaptionEdgeEffect::Uniform ||
+                         p.fontEffect == (int)cc::ClosedCaptionEdgeEffect::DropShadow;
     return style;
 }
 
 std::uint32_t g_appliedAccent = 0;
 wvp::AppSettings g_appliedSettings;   // what the running playback was last configured with (diff base for ApplySettingsLive)
+wvp::WindowsCaptionProperties g_windowsCaption{};
+bool g_windowsCaptionKnown = false;
 CaptionStyle g_appliedCaptionStyle{};
 bool g_captionStyleKnown = false;
 bool g_hooked = false;
@@ -186,7 +210,7 @@ void ApplyPlayback(AppContext& ctx) {
     const wvp::AppSettings& s = ctx.Svc().settings;
     c->Player().SetSubtitleVisible(wvp::SubtitleLayer::Caption, s.showCaptions);
     c->Player().SetSubtitleVisible(wvp::SubtitleLayer::Superimpose, s.showSuperimpose);
-    c->Player().SetSubtitleStyle(s.subtitle);
+    ApplySubtitleStyle(ctx);
     // Volume is never remembered across launches: the controller keeps its default (100, unmuted).
     c->SetShuffle(s.shuffle);
     c->SetRepeat(static_cast<wvp::RepeatMode>(std::clamp(s.repeat, 0, 2)));
@@ -201,12 +225,23 @@ std::wstring LibffplayPath() {
 
 std::wstring BundledAribFontPath() { return ExeDir() + L"\\fonts\\WLCMARU2004ARIBU.TTF"; }
 
+void ApplySubtitleStyle(AppContext& ctx) {
+    auto* player = ctx.Player();
+    if (!player) return;
+    if (!g_windowsCaptionKnown) {
+        g_windowsCaption = ReadWindowsCaptionProperties();
+        g_windowsCaptionKnown = true;
+    }
+    player->SetSubtitleStyle(wvp::ResolveSubtitleStyle(ctx.Svc().settings.subtitle, g_windowsCaption));
+}
+
 void ApplyCaptionOpenOptions(wvp::PlaybackController& ctl, const wvp::AppSettings& settings) {
-    CaptionStyle style = ReadSystemCaptionStyle();
+    g_windowsCaption = ReadWindowsCaptionProperties();   // the text subtitle style is sent with it at the next Prepared
+    g_windowsCaptionKnown = true;
+    CaptionStyle style = AribCaptionStyle(g_windowsCaption);
     g_appliedCaptionStyle = style;
     g_captionStyleKnown = true;
-    std::string fontPath = settings.aribFont.empty() ? wvp::ToUtf8(BundledAribFontPath()) : settings.aribFont;
-    ctl.SetBaseOption("arib_font", wvp::AribFontOption(fontPath));
+    ctl.SetBaseOption("arib_font", wvp::AribFontOption(wvp::ToUtf8(BundledAribFontPath())));
     std::wstring fontsDir = ExeDir() + L"\\fonts";
     std::replace(fontsDir.begin(), fontsDir.end(), L'\\', L'/');
     ctl.SetBaseOption("sub_fontsdir", wvp::ToUtf8(fontsDir));
@@ -244,7 +279,7 @@ std::wstring LibffplayBuildStamp() { return StampOf(LibffplayPath()); }
 
 LiveApplyResult ApplySettingsLive(wvp::PlaybackController& ctl, const wvp::AppSettings& before, const wvp::AppSettings& after) {
     LiveApplyResult r;
-    const bool captionDecoderChanged = before.showSuperimpose != after.showSuperimpose || before.aribFont != after.aribFont;
+    const bool captionDecoderChanged = before.showSuperimpose != after.showSuperimpose;
     const auto state = ctl.Player().State();
     if (captionDecoderChanged && ctl.Current() && (state == wvp::PlayerState::Playing || state == wvp::PlayerState::Paused)) {
         r.reopened = ctl.ReopenCurrentHere();
@@ -360,7 +395,13 @@ void StopSystemCaptionSettingsWatch() {
 }
 
 void OnSystemCaptionSettingsChanged(AppContext& ctx) {
-    const CaptionStyle current = ReadSystemCaptionStyle();
+    const wvp::WindowsCaptionProperties props = ReadWindowsCaptionProperties();
+    if (!g_windowsCaptionKnown || !(props == g_windowsCaption)) {
+        g_windowsCaption = props;
+        g_windowsCaptionKnown = true;
+        if (ctx.Svc().settings.subtitle.useSystemCaptionStyle) ApplySubtitleStyle(ctx);
+    }
+    const CaptionStyle current = AribCaptionStyle(props);
     if (!g_captionStyleKnown) {
         g_appliedCaptionStyle = current;
         g_captionStyleKnown = true;
@@ -402,7 +443,7 @@ void OnSettingsChanged(AppContext& ctx) {
             c->Player().SetSubtitleVisible(wvp::SubtitleLayer::Caption, s.showCaptions);
         if (before.showSuperimpose != s.showSuperimpose)
             c->Player().SetSubtitleVisible(wvp::SubtitleLayer::Superimpose, s.showSuperimpose);
-        if (!(before.subtitle == s.subtitle)) c->Player().SetSubtitleStyle(s.subtitle);
+        if (!(before.subtitle == s.subtitle)) ApplySubtitleStyle(ctx);
         // live: caption decoder changes re-open the current item at its position
         TrackRestore saved = CaptureTrackRestore(ctx);
         EnsureTrackRestoreCancellationHooks(ctx);

@@ -9,6 +9,7 @@
 
 #include "Event.h"
 #include "PlayerTypes.h"
+#include "SubtitleStyle.h"
 
 namespace wvp {
 
@@ -68,7 +69,7 @@ public:
     /// Milliseconds, positive = subtitles later; reset to 0 by Open().
     virtual int SetSubtitleDelay(std::int64_t ms) { (void)ms; return -22; }
     virtual std::int64_t SubtitleDelay() const { return 0; }
-    virtual int SetSubtitleStyle(const SubtitleStyle& style) { (void)style; return -22; }
+    virtual int SetSubtitleStyle(const SubtitleRenderStyle& style) { (void)style; return -22; }
     /// ARIB TS (MediaInfo::AribAudio.Present): 0 = audio 1, 1 = audio 2 wherever it has samples and audio 1 otherwise
     /// (gapless, never announced). Every Open() starts on audio 1. Unsupported backends return -22.
     virtual int SetAudioPreference(int pref) { (void)pref; return -22; }

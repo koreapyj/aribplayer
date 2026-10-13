@@ -1,12 +1,14 @@
 #include "pages/SettingsPage.h"
 
 #include <windows.h>
+#include <commdlg.h>
+#include <dlgs.h>
 #include <shellapi.h>
-#include <shobjidl.h>
-#include <wrl/client.h>
 
 #include <algorithm>
+#include <cmath>
 #include <memory>
+#include <optional>
 #include <vector>
 
 #include "AppContext.h"
@@ -189,54 +191,103 @@ public:
     }
 };
 
-std::wstring PickAribFont(HWND owner) {
-    if (OsDialogsBlocked()) return {};   // tests never show an OS dialog: cancelled
-    using Microsoft::WRL::ComPtr;
-    ComPtr<IFileOpenDialog> dlg;
-    if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dlg)))) return {};
-    constexpr GUID kGuid = {0x9c0f3fd2, 0x18a1, 0x4c5f, {0xb3, 0x8c, 0x84, 0x35, 0x15, 0x68, 0x03, 0x29}};
-    dlg->SetClientGuid(kGuid);
-    DWORD opts = 0;
-    dlg->GetOptions(&opts);
-    dlg->SetOptions(opts | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST | FOS_FILEMUSTEXIST);
-    dlg->SetTitle(Tr(L"Select ARIB caption font", L"ARIB 자막 글꼴 선택"));
-    COMDLG_FILTERSPEC spec[] = {{Tr(L"TrueType font", L"TrueType 글꼴"), L"*.ttf"}, {Tr(L"OpenType font", L"OpenType 글꼴"), L"*.otf"}, {Tr(L"All files", L"모든 파일"), L"*.*"}};
-    dlg->SetFileTypes(3, spec);
-    if (FAILED(dlg->Show(owner))) return {};
-    ComPtr<IShellItem> it;
-    PWSTR p = nullptr;
-    std::wstring out;
-    if (SUCCEEDED(dlg->GetResult(&it)) && SUCCEEDED(it->GetDisplayName(SIGDN_FILESYSPATH, &p)) && p) {
-        out = p;
-        CoTaskMemFree(p);
-    }
-    return out;
+struct PickedFont {
+    std::string family;
+    int weight = 400;
+    bool italic = false;
+    double points = 0;
+    std::uint32_t rgba = 0xFFFFFFFFu;
+};
+
+// The renderer has no underline / strikeout: hide the dialog's two effect check boxes and keep its colour list.
+UINT_PTR CALLBACK SubtitleFontHook(HWND dlg, UINT msg, WPARAM, LPARAM) {
+    if (msg == WM_INITDIALOG)
+        for (int id : {chx1, chx2})
+            if (HWND c = GetDlgItem(dlg, id)) ShowWindow(c, SW_HIDE);
+    return 0;
 }
 
-int CALLBACK CollectFontFamily(const LOGFONTW* lf, const TEXTMETRICW*, DWORD, LPARAM lp) {
-    if (lf->lfFaceName[0] != L'@') reinterpret_cast<std::vector<std::wstring>*>(lp)->push_back(lf->lfFaceName);
-    return 1;
-}
-
-// Installed font families, sorted; the stored family is always listed so the combo can show it.
-std::vector<std::wstring> SubtitleFontChoices(const std::string& current) {
-    std::vector<std::wstring> v;
+std::optional<PickedFont> PickSubtitleFont(HWND owner, const wvp::SubtitleStyle& current) {
+    if (OsDialogsBlocked()) return std::nullopt;   // tests never show an OS dialog: cancelled
+    HDC dc = GetDC(nullptr);   // the DC the dialog converts sizes with when CHOOSEFONTW.hDC is null
+    const int dpiY = dc ? GetDeviceCaps(dc, LOGPIXELSY) : 96;
     LOGFONTW lf{};
+    lf.lfHeight = -MulDiv((int)std::lround(current.fontSizePt * 10), dpiY, 720);
+    lf.lfWeight = current.fontWeight;
+    lf.lfItalic = current.italic ? TRUE : FALSE;
     lf.lfCharSet = DEFAULT_CHARSET;
-    if (HDC dc = GetDC(nullptr)) {
-        EnumFontFamiliesExW(dc, &lf, CollectFontFamily, reinterpret_cast<LPARAM>(&v), 0);
+    wcsncpy_s(lf.lfFaceName, wvp::ToWide(current.font).c_str(), _TRUNCATE);
+    // The dialog preselects only an exact entry of its list, which shows localized family names and needs the font's
+    // charset: let GDI resolve the stored name ("Malgun Gothic" is listed as "맑은 고딕" on Korean Windows).
+    if (dc) {
+        if (HFONT probe = CreateFontIndirectW(&lf)) {
+            HGDIOBJ old = SelectObject(dc, probe);
+            wchar_t face[LF_FACESIZE] = {};
+            TEXTMETRICW tm{};
+            if (GetTextFaceW(dc, LF_FACESIZE, face) && GetTextMetricsW(dc, &tm)) {
+                wcsncpy_s(lf.lfFaceName, face, _TRUNCATE);
+                lf.lfCharSet = tm.tmCharSet;
+            }
+            SelectObject(dc, old);
+            DeleteObject(probe);
+        }
         ReleaseDC(nullptr, dc);
     }
-    v.push_back(wvp::ToWide(current));
-    std::sort(v.begin(), v.end());
-    v.erase(std::unique(v.begin(), v.end()), v.end());
-    return v;
+    CHOOSEFONTW cf{sizeof cf};
+    cf.hwndOwner = owner;
+    cf.lpLogFont = &lf;
+    cf.Flags = CF_SCREENFONTS | CF_INITTOLOGFONTSTRUCT | CF_FORCEFONTEXIST | CF_NOSCRIPTSEL | CF_NOVERTFONTS | CF_LIMITSIZE |
+               CF_EFFECTS | CF_ENABLEHOOK;
+    cf.lpfnHook = SubtitleFontHook;
+    cf.rgbColors = RGB(current.primaryRgba >> 24, (current.primaryRgba >> 16) & 0xFF, (current.primaryRgba >> 8) & 0xFF);
+    cf.nSizeMin = 4;
+    cf.nSizeMax = 400;
+    if (!ChooseFontW(&cf) || !lf.lfFaceName[0]) return std::nullopt;
+    PickedFont f;
+    f.family = wvp::ToUtf8(lf.lfFaceName);
+    f.weight = std::clamp(lf.lfWeight ? (int)lf.lfWeight : 400, 100, 900);
+    f.italic = lf.lfItalic != 0;
+    f.points = cf.iPointSize > 0 ? cf.iPointSize / 10.0 : current.fontSizePt;
+    // the dialog has no alpha: the opacity of the current colour is kept
+    f.rgba = ((std::uint32_t)GetRValue(cf.rgbColors) << 24) | ((std::uint32_t)GetGValue(cf.rgbColors) << 16) |
+             ((std::uint32_t)GetBValue(cf.rgbColors) << 8) | (current.primaryRgba & 0xFFu);
+    return f;
 }
 
-std::wstring CaptionFontDescription(const wvp::AppSettings& settings) {
-    if (settings.aribFont.empty()) return Tr(L"Using the bundled WLC Maru ARIB font; the decoder falls back to Windows fonts if unavailable.", L"내장된 WLC Maru ARIB 글꼴을 사용합니다. 사용할 수 없으면 디코더가 Windows 글꼴로 대체합니다.");
-    return std::wstring(Tr(L"Custom font: ", L"사용자 지정 글꼴: ")) + wvp::ToWide(settings.aribFont);
+/// 0xRRGGBBAA in and out; the dialog has no alpha, so the alpha is kept.
+std::optional<std::uint32_t> PickSubtitleColor(HWND owner, std::uint32_t rgba) {
+    if (OsDialogsBlocked()) return std::nullopt;   // tests never show an OS dialog: cancelled
+    static COLORREF custom[16] = {0xFFFFFF, 0xFFFFFF, 0xFFFFFF, 0xFFFFFF, 0xFFFFFF, 0xFFFFFF, 0xFFFFFF, 0xFFFFFF,
+                                  0xFFFFFF, 0xFFFFFF, 0xFFFFFF, 0xFFFFFF, 0xFFFFFF, 0xFFFFFF, 0xFFFFFF, 0xFFFFFF};   // kept for the session
+    CHOOSECOLORW cc{sizeof cc};
+    cc.hwndOwner = owner;
+    cc.rgbResult = RGB(rgba >> 24, (rgba >> 16) & 0xFF, (rgba >> 8) & 0xFF);
+    cc.lpCustColors = custom;
+    cc.Flags = CC_FULLOPEN | CC_RGBINIT;
+    if (!ChooseColorW(&cc)) return std::nullopt;
+    return ((std::uint32_t)GetRValue(cc.rgbResult) << 24) | ((std::uint32_t)GetGValue(cc.rgbResult) << 16) |
+           ((std::uint32_t)GetBValue(cc.rgbResult) << 8) | (rgba & 0xFFu);
 }
+
+class ColorSwatch final : public pui::Widget {
+public:
+    static constexpr float kSize = 20;
+    ColorSwatch() : pui::Widget(pui::Role::Image) {}
+    void SetRgba(std::uint32_t rgba) {
+        if (rgba_ == rgba) return;
+        rgba_ = rgba;
+        Invalidate();
+    }
+    pui::SizeF DesiredSize(pui::IRenderer*) override { return {kSize, kSize}; }
+    void Paint(pui::IRenderer& r, const pui::Theme& t) override {
+        pui::RectF b = Bounds();
+        pui::RectF sq = pui::RectF::XYWH(b.cx() - kSize / 2, b.cy() - kSize / 2, kSize, kSize);
+        r.FillRoundRect(sq, 4, pui::Color(0xFF000000u | (rgba_ >> 8)));
+        r.StrokeRoundRect(sq.Deflate(0.5f, 0.5f, 0.5f, 0.5f), 4, t.textSecondary, 1);
+    }
+private:
+    std::uint32_t rgba_ = 0;
+};
 
 class SettingsPageImpl final : public pui::Widget {
 public:
@@ -413,47 +464,78 @@ private:
             Commit();
         });
 
-        auto* fontRow = Row(L'\xE8D2', Tr(L"Subtitle font", L"자막 글꼴"), Tr(L"Font family for text subtitles (SRT, SAMI, WebVTT, ASS/SSA).", L"텍스트 자막(SRT, SAMI, WebVTT, ASS/SSA)에 사용할 글꼴입니다."));
-        fonts_ = SubtitleFontChoices(st.font);
-        int fontSel = (int)(std::find(fonts_.begin(), fonts_.end(), wvp::ToWide(st.font)) - fonts_.begin());
-        Combo(fontRow, Tr(L"Subtitle font", L"자막 글꼴"), L"SubtitleFontCombo", fonts_, fontSel, [this, edit](int i) {
-            edit([&](wvp::SubtitleStyle& v) { v.font = wvp::ToUtf8(fonts_[(size_t)i]); });
+        auto* sysRow = Row(L'\xE8D2', Tr(L"Use Windows caption settings", L"Windows 자막 설정 사용"),
+                           Tr(L"Text subtitles (SRT, SAMI, WebVTT, ASS/SSA) take the font, size, text colour and opacity, edge effect and background from the Windows caption settings where the subtitle does not set them; the app's own font, colour and outline settings are hidden while this is on. Raised and depressed edges and the caption window are not applied.",
+                              L"텍스트 자막(SRT, SAMI, WebVTT, ASS/SSA)은 자막이 지정하지 않은 글꼴, 크기, 글자 색과 불투명도, 가장자리 효과, 배경을 Windows 자막 설정에서 가져오며, 켜져 있는 동안 앱의 글꼴, 색, 외곽선 설정은 숨겨집니다. 돋을새김/오목 가장자리와 자막 창은 적용되지 않습니다."));
+        Toggle(sysRow, Tr(L"Use Windows caption settings", L"Windows 자막 설정 사용"), L"SubtitleUseWindowsToggle", st.useSystemCaptionStyle, [this, edit](bool on) {
+            edit([&](wvp::SubtitleStyle& v) { v.useSystemCaptionStyle = on; });
+            Refresh();
         });
-        Toggle(Row(L'\xE8D2', Tr(L"Always use this font", L"항상 이 글꼴 사용"), Tr(L"Off keeps the font of SRT, SAMI and WebVTT as the player's default; ASS/SSA keep their own styles.", L"끄면 자막 파일 형식에 맞는 기본 글꼴을 사용합니다. ASS/SSA는 자체 스타일을 유지합니다.")),
-               Tr(L"Always use this font", L"항상 이 글꼴 사용"), L"SubtitleOverrideFontToggle", st.overrideFont,
-               [edit](bool on) { edit([&](wvp::SubtitleStyle& v) { v.overrideFont = on; }); });
 
-        auto* sizeRow = Row(L'\xE8D2', Tr(L"Subtitle size", L"자막 크기"), {});
-        std::vector<std::wstring> scales;
-        for (double v : sl::kSubtitleScalePresets) scales.push_back(sl::PercentLabel(v));
-        Combo(sizeRow, Tr(L"Subtitle size", L"자막 크기"), L"SubtitleSizeCombo", scales, sl::NearestPreset(sl::kSubtitleScalePresets, st.fontScale),
-              [edit](int i) { edit([&](wvp::SubtitleStyle& v) { v.fontScale = sl::kSubtitleScalePresets[(size_t)i]; }); });
-        Toggle(Row(L'\xE8D2', Tr(L"Apply the size", L"크기 적용"), {}), Tr(L"Apply the size", L"크기 적용"), L"SubtitleOverrideSizeToggle", st.overrideSize,
+        subFontRow_ = Row(L'\xE8D2', Tr(L"Subtitle font", L"자막 글꼴"), {});
+        auto fontPanel = std::make_unique<pui::StackPanel>(pui::Orientation::Horizontal, 8.f);
+        fontPanel->SetCrossAlign(pui::CrossAlign::Center);
+        fontPanel->SetName(Tr(L"Subtitle font", L"자막 글꼴"));
+        textSwatch_ = fontPanel->Add<ColorSwatch>();
+        textSwatch_->SetName(Tr(L"Text colour", L"글자 색"));
+        subFontButton_ = fontPanel->Add<pui::Button>(Tr(L"Choose font\x2026", L"글꼴 선택\x2026"));
+        subFontRow_->SetControl(std::move(fontPanel));
+        subFontButton_->SetName(Tr(L"Choose subtitle font", L"자막 글꼴 선택"));
+        subFontButton_->SetAutomationId(L"SubtitleFontButton");
+        subFontButton_->onClick = [this, edit] {
+            auto f = PickSubtitleFont(DialogOwner(), ctx_.Svc().settings.subtitle);
+            if (!f) return;
+            edit([&](wvp::SubtitleStyle& v) {
+                v.font = f->family;
+                v.fontWeight = f->weight;
+                v.italic = f->italic;
+                v.fontSizePt = f->points;
+                v.primaryRgba = f->rgba;
+            });
+            Refresh();
+        };
+        Toggle(Row(L'\xE8D2', Tr(L"Override font", L"글꼴 재정의"), Tr(L"Also replaces the font and font style the subtitle sets itself.", L"자막이 직접 지정한 글꼴과 글꼴 스타일도 바꿉니다.")),
+               Tr(L"Override font", L"글꼴 재정의"), L"SubtitleOverrideFontToggle", st.overrideFont,
+               [edit](bool on) { edit([&](wvp::SubtitleStyle& v) { v.overrideFont = on; }); });
+        Toggle(Row(L'\xE8D2', Tr(L"Override size", L"크기 재정의"), Tr(L"Also replaces the size the subtitle sets itself.", L"자막이 직접 지정한 크기도 바꿉니다.")),
+               Tr(L"Override size", L"크기 재정의"), L"SubtitleOverrideSizeToggle", st.overrideSize,
                [edit](bool on) { edit([&](wvp::SubtitleStyle& v) { v.overrideSize = on; }); });
 
-        auto colorNames = [] {
-            std::vector<std::wstring> v;
-            for (const auto& c : sl::SubtitleColorPresets()) v.push_back(c.name);
-            return v;
+        auto colorRow = [this, edit](const wchar_t* title, const wchar_t* buttonName, const wchar_t* id, std::uint32_t wvp::SubtitleStyle::*field,
+                                     SettingRow*& row, ColorSwatch*& swatch, pui::Button*& button) {
+            row = Row(L'\xE8D2', title, {});
+            auto panel = std::make_unique<pui::StackPanel>(pui::Orientation::Horizontal, 8.f);
+            panel->SetCrossAlign(pui::CrossAlign::Center);
+            panel->SetName(title);
+            swatch = panel->Add<ColorSwatch>();
+            swatch->SetName(title);
+            button = panel->Add<pui::Button>(Tr(L"Choose\x2026", L"선택\x2026"));
+            button->SetName(buttonName);
+            button->SetAutomationId(id);
+            button->onClick = [this, edit, field] {
+                auto c = PickSubtitleColor(DialogOwner(), ctx_.Svc().settings.subtitle.*field);
+                if (!c) return;
+                edit([&](wvp::SubtitleStyle& v) { v.*field = *c; });
+                Refresh();
+            };
+            row->SetControl(std::move(panel));
         };
-        auto* textRow = Row(L'\xE8D2', Tr(L"Text colour", L"글자 색"), {});
-        Combo(textRow, Tr(L"Text colour", L"글자 색"), L"SubtitleTextColorCombo", colorNames(), sl::ColorPresetIndex(st.primaryRgba),
-              [edit](int i) { edit([&](wvp::SubtitleStyle& v) { v.primaryRgba = sl::SubtitleColorPresets()[(size_t)i].rgba; }); });
-        auto* outlineColorRow = Row(L'\xE8D2', Tr(L"Outline colour", L"외곽선 색"), {});
-        Combo(outlineColorRow, Tr(L"Outline colour", L"외곽선 색"), L"SubtitleOutlineColorCombo", colorNames(), sl::ColorPresetIndex(st.outlineRgba),
-              [edit](int i) { edit([&](wvp::SubtitleStyle& v) { v.outlineRgba = sl::SubtitleColorPresets()[(size_t)i].rgba; }); });
-        Toggle(Row(L'\xE8D2', Tr(L"Apply the colours", L"색 적용"), {}), Tr(L"Apply the colours", L"색 적용"), L"SubtitleOverrideColorsToggle", st.overrideColors,
+        colorRow(Tr(L"Outline colour", L"외곽선 색"), Tr(L"Choose outline colour", L"외곽선 색 선택"), L"SubtitleOutlineColorButton",
+                 &wvp::SubtitleStyle::outlineRgba, outlineColorRow_, outlineSwatch_, outlineColorButton_);
+        Toggle(Row(L'\xE8D2', Tr(L"Override colours", L"색 재정의"), Tr(L"Also replaces the colours and the background the subtitle sets itself.", L"자막이 직접 지정한 색과 배경도 바꿉니다.")),
+               Tr(L"Override colours", L"색 재정의"), L"SubtitleOverrideColorsToggle", st.overrideColors,
                [edit](bool on) { edit([&](wvp::SubtitleStyle& v) { v.overrideColors = on; }); });
 
-        auto* borderRow = Row(L'\xE8D2', Tr(L"Outline width", L"외곽선 두께"), {});
+        borderRow_ = Row(L'\xE8D2', Tr(L"Outline width", L"외곽선 두께"), Tr(L"Pixels at 1080 lines of video, scaled with the video.", L"1080줄 영상 기준 픽셀이며 영상 크기에 맞춰 조정됩니다."));
         std::vector<std::wstring> widths;
         for (double v : sl::kSubtitleOutlinePresets) widths.push_back(sl::PixelLabel(v));
-        Combo(borderRow, Tr(L"Outline width", L"외곽선 두께"), L"SubtitleOutlineWidthCombo", widths, sl::NearestPreset(sl::kSubtitleOutlinePresets, st.outlineWidth),
-              [edit](int i) { edit([&](wvp::SubtitleStyle& v) { v.outlineWidth = sl::kSubtitleOutlinePresets[(size_t)i]; }); });
-        Toggle(Row(L'\xE8D2', Tr(L"Apply the outline", L"외곽선 적용"), {}), Tr(L"Apply the outline", L"외곽선 적용"), L"SubtitleOverrideBorderToggle", st.overrideBorder,
+        outlineWidthCombo_ = Combo(borderRow_,Tr(L"Outline width", L"외곽선 두께"), L"SubtitleOutlineWidthCombo", widths, sl::NearestPreset(sl::kSubtitleOutlinePresets, st.outlineWidth),
+                                   [edit](int i) { edit([&](wvp::SubtitleStyle& v) { v.outlineWidth = sl::kSubtitleOutlinePresets[(size_t)i]; }); });
+        Toggle(Row(L'\xE8D2', Tr(L"Override outline", L"외곽선 재정의"), Tr(L"Also replaces the outline and shadow the subtitle sets itself.", L"자막이 직접 지정한 외곽선과 그림자도 바꿉니다.")),
+               Tr(L"Override outline", L"외곽선 재정의"), L"SubtitleOverrideBorderToggle", st.overrideBorder,
                [edit](bool on) { edit([&](wvp::SubtitleStyle& v) { v.overrideBorder = on; }); });
 
-        Toggle(Row(L'\xE8D2', Tr(L"Also apply to ASS/SSA subtitles", L"ASS/SSA 자막에도 적용"), Tr(L"The settings above normally leave ASS/SSA subtitles with their own styles.", L"위 설정은 기본적으로 ASS/SSA 자막의 자체 스타일에는 적용되지 않습니다.")),
+        Toggle(Row(L'\xE8D2', Tr(L"Also apply to ASS/SSA subtitles", L"ASS/SSA 자막에도 적용"), Tr(L"The switches above normally leave ASS/SSA subtitles with their own styles.", L"위 스위치는 기본적으로 ASS/SSA 자막의 자체 스타일에는 적용되지 않습니다.")),
                Tr(L"Also apply to ASS/SSA subtitles", L"ASS/SSA 자막에도 적용"), L"SubtitleOverrideAssToggle", st.applyToAss,
                [edit](bool on) { edit([&](wvp::SubtitleStyle& v) { v.applyToAss = on; }); });
 
@@ -468,21 +550,7 @@ private:
             Commit();
         });
 
-        captionFontRow_ = Row(L'\xE8D2', Tr(L"ARIB caption font", L"ARIB 자막 글꼴"), CaptionFontDescription(settings));
-        auto buttons = std::make_unique<pui::StackPanel>(pui::Orientation::Horizontal, 8.f);
-        buttons->SetName(Tr(L"Caption font buttons", L"자막 글꼴 단추"));
-        auto* choose = buttons->Add<pui::Button>(Tr(L"Choose font\x2026", L"글꼴 선택\x2026"));
-        choose->SetName(Tr(L"Choose caption font", L"자막 글꼴 선택"));
-        choose->SetAutomationId(L"CaptionFontBrowseButton");
-        choose->onClick = [this] { BrowseCaptionFont(); };
-        auto* reset = buttons->Add<pui::Button>(Tr(L"Reset", L"초기화"));
-        reset->SetName(Tr(L"Reset caption font", L"자막 글꼴 초기화"));
-        reset->SetAutomationId(L"CaptionFontResetButton");
-        reset->onClick = [this] { ResetCaptionFont(); };
-        captionFontReset_ = reset;
-        captionFontRow_->SetControl(std::move(buttons));
-
-        auto* styleRow = Row(L'\xE8D2', Tr(L"Caption style", L"자막 스타일"), Tr(L"Caption colours, size and background follow the Windows caption settings.", L"자막 색, 크기 및 배경은 Windows 자막 설정을 따릅니다."));
+        auto* styleRow = Row(L'\xE8D2', Tr(L"Caption style", L"자막 스타일"), Tr(L"ARIB captions follow two Windows caption settings: a background opacity of 0 % removes the caption background, and the uniform or drop shadow edge effect draws an outline.", L"ARIB 자막은 Windows 자막 설정 중 두 가지를 따릅니다. 배경 불투명도가 0%이면 자막 배경을 없애고, 가장자리 효과가 균일 또는 그림자이면 외곽선을 그립니다."));
         auto link = std::make_unique<pui::HyperlinkButton>(Tr(L"Open Windows caption settings", L"Windows 자막 설정 열기"));
         link->SetName(Tr(L"Open Windows caption settings", L"Windows 자막 설정 열기"));
         link->SetAutomationId(L"CaptionStyleSettingsLink");
@@ -514,8 +582,17 @@ private:
         bool visChanged = accentRow_->Visible() != showAccent;
         accentRow_->SetVisible(showAccent);
         swatches_->SetSelected(state_.useSystemAccent ? -1 : sl::AccentIndexFor(ctx_.Svc().settings.accentColor));
-        captionFontReset_->SetEnabled(!ctx_.Svc().settings.aribFont.empty());
-        captionFontRow_->SetDescription(CaptionFontDescription(ctx_.Svc().settings));
+        const wvp::SubtitleStyle& sub = ctx_.Svc().settings.subtitle;
+        const bool own = !sub.useSystemCaptionStyle;
+        subFontRow_->SetDescription(sl::SubtitleFontSummary(sub.font, sub.fontWeight, sub.italic, sub.fontSizePt) + L", " +
+                                    sl::RgbaHex(sub.primaryRgba));
+        outlineColorRow_->SetDescription(sl::RgbaHex(sub.outlineRgba));
+        textSwatch_->SetRgba(sub.primaryRgba);
+        outlineSwatch_->SetRgba(sub.outlineRgba);
+        for (SettingRow* row : {subFontRow_, outlineColorRow_, borderRow_}) {
+            visChanged |= row->Visible() != own;
+            row->SetVisible(own);
+        }
         if (sysAccent_->IsOn() != state_.useSystemAccent) sysAccent_->SetOn(state_.useSystemAccent);
         if (visChanged) col_->RequestLayout();
         UpdateExtent();
@@ -527,20 +604,7 @@ private:
         sv_->SetExtentHeight(col_->HeightForWidth(nullptr, w));
         sv_->UpdateLayout();
     }
-    void BrowseCaptionFont() {
-        std::wstring picked = PickAribFont(env_.owner ? env_.owner : ctx_.MainHwnd());
-        if (picked.empty()) return;
-        ctx_.Svc().settings.aribFont = wvp::ToUtf8(picked);
-        Commit();
-        Refresh();
-        ctx_.ShowToast(Tr(L"Caption font saved", L"자막 글꼴을 저장했습니다"));
-    }
-    void ResetCaptionFont() {
-        ctx_.Svc().settings.aribFont.clear();
-        Commit();
-        Refresh();
-        ctx_.ShowToast(Tr(L"Caption font reset to the bundled font", L"자막 글꼴을 내장 글꼴로 되돌렸습니다"));
-    }
+    HWND DialogOwner() const { return env_.owner ? env_.owner : ctx_.MainHwnd(); }
 
     AppContext& ctx_;
     SettingsPageEnv env_;
@@ -553,9 +617,14 @@ private:
     pui::ToggleSwitch* sysAccent_ = nullptr;
     SettingRow* accentRow_ = nullptr;
     SwatchGrid* swatches_ = nullptr;
-    std::vector<std::wstring> fonts_;
-    SettingRow* captionFontRow_ = nullptr;
-    pui::Button* captionFontReset_ = nullptr;
+    SettingRow* subFontRow_ = nullptr;
+    pui::Button* subFontButton_ = nullptr;
+    SettingRow* outlineColorRow_ = nullptr;
+    ColorSwatch* textSwatch_ = nullptr;
+    ColorSwatch* outlineSwatch_ = nullptr;
+    pui::Button* outlineColorButton_ = nullptr;
+    pui::ComboBox* outlineWidthCombo_ = nullptr;
+    SettingRow* borderRow_ = nullptr;
     int listener_ = 0;
 };
 }
@@ -640,6 +709,46 @@ LOGIC_TEST(settings_caption_style_row_opens_windows_caption_settings) {
             LT_CHECK_EQ(launched.size(), (size_t)1);
             if (!launched.empty()) LT_CHECK(launched[0] == L"ms-settings:easeofaccess-closedcaptioning");
         }
+    }
+    RemoveDirectoryW(dir.c_str());
+}
+
+LOGIC_TEST(settings_subtitle_dialogs_refuse_under_tests) {
+    LT_CHECK(app::OsDialogsBlocked());
+    LT_CHECK(!app::PickSubtitleFont(nullptr, wvp::SubtitleStyle{}).has_value());
+    LT_CHECK(!app::PickSubtitleColor(nullptr, 0xFFFFFFFFu).has_value());
+    wchar_t tmp[MAX_PATH];
+    GetTempPathW(MAX_PATH, tmp);
+    std::wstring dir = std::wstring(tmp) + L"aribplayer-settings-subdlg-" + std::to_wstring(GetCurrentProcessId());
+    CreateDirectoryW(dir.c_str(), nullptr);
+    {
+        SettingsTestContext ctx(dir);
+        ctx.Svc().settings.subtitle.useSystemCaptionStyle = false;
+        const wvp::SubtitleStyle before = ctx.Svc().settings.subtitle;
+        auto page = app::CreateSettingsPage(ctx, app::SettingsPageEnv{});
+        for (const wchar_t* id : {L"SubtitleFontButton", L"SubtitleOutlineColorButton"}) {
+            auto* b = dynamic_cast<pui::Button*>(FindByAutomationId(page.get(), id));
+            LT_CHECK(b != nullptr);
+            if (b) {
+                LT_CHECK(b->Enabled());
+                b->Invoke();
+            }
+        }
+        LT_CHECK(ctx.Svc().settings.subtitle == before);
+    }
+    {
+        SettingsTestContext ctx(dir);
+        ctx.Svc().settings.subtitle.useSystemCaptionStyle = true;
+        auto page = app::CreateSettingsPage(ctx, app::SettingsPageEnv{});
+        auto rowVisible = [&](const wchar_t* id) {
+            pui::Widget* w = FindByAutomationId(page.get(), id);
+            for (; w; w = w->Parent())
+                if (!w->Visible()) return false;
+            return true;
+        };
+        for (const wchar_t* id : {L"SubtitleFontButton", L"SubtitleOutlineColorButton", L"SubtitleOutlineWidthCombo"})
+            LT_CHECK(!rowVisible(id));
+        LT_CHECK(rowVisible(L"SubtitleOverrideFontToggle"));
     }
     RemoveDirectoryW(dir.c_str());
 }

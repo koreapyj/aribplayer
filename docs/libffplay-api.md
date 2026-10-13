@@ -466,7 +466,7 @@ The installed header defines `FFP_SUBTITLE_CAPTION`, `FFP_SUBTITLE_SUPERIMPOSE` 
 
 ### Open options and stream classification
 
-The `arib_font` open option selects the ARIB font file. The host normally resolves the bundled file beside the executable and passes its plain path as `arib_font`; libffplay converts it to the decoder's `font=file:<path>` option. An empty or unavailable override falls back to libaribcaption's platform defaults. `arib_ignore_background` and `arib_force_outline` are boolean options applied to the caption decoder only. `superimpose=0|1` controls whether a superimpose decoder is opened (default `1`). The ARIB decoders use bitmap output, the layer's `caption_type` (`caption` or `superimpose`), and a canvas matching the presenter's video rectangle in pixels.
+The `arib_font` open option selects the ARIB font file. The host passes the bundled file beside the executable as `arib_font`; libffplay converts it to the decoder's `font=file:<path>` option. An empty or unavailable font falls back to libaribcaption's platform defaults. `arib_ignore_background` and `arib_force_outline` are boolean options applied to the caption decoder only. `superimpose=0|1` controls whether a superimpose decoder is opened (default `1`). The ARIB decoders use bitmap output, the layer's `caption_type` (`caption` or `superimpose`), and a canvas matching the presenter's video rectangle in pixels.
 
 Subtitle stream entries in `ffp_get_media_info` may include `arib_type` (`"caption"` or `"superimpose"`) and `component_tag` (integer). Caption selection excludes streams classified as superimpose. A stream without `arib_type` remains an ordinary selectable subtitle stream.
 
@@ -526,18 +526,31 @@ The superimpose layer is ARIB only.
 ### Style: `ffp_set_subtitle_style`
 
 `FFPSubtitleStyle` (`struct_size = sizeof(FFPSubtitleStyle)`, else `FFP_EINVAL`) persists across opens and applies
-live (a paused picture is redrawn). The override applies to plain-text codecs (every text codec except `ass` / `ssa`);
-with `apply_to_ass = 1` also to ASS / SSA. On a track it applies to, the selective style override of libass is
-enabled with the bits of `override_flags`, on events that look like dialogue (not on positioned ones):
+live (a paused picture is redrawn). Each `FFP_SUBSTYLE_*` flag names a property. The properties replaced on a track:
+
+* plain-text codecs (every text codec except `ass` / `ssa`; their decoders write a default style that the host treats
+  as "not set"): `override_flags | fallback_flags`;
+* ASS / SSA: `override_flags` when `apply_to_ass = 1`, else none.
+
+The replacement is the selective style override of libass, on events that look like dialogue (not on positioned ones):
 
 | flag | libass | value |
 |---|---|---|
 | `FFP_SUBSTYLE_FONT` | `ASS_OVERRIDE_BIT_FONT_NAME` | `font_family` (`""` = Malgun Gothic) |
-| `FFP_SUBSTYLE_SIZE` | `ass_set_font_scale` | `font_scale` (1.0 = 100 %) |
-| `FFP_SUBSTYLE_COLORS` | `ASS_OVERRIDE_BIT_COLORS` | `primary_rgba` (primary + secondary), `outline_rgba`; `0xRRGGBBAA`, AA = 0xFF opaque |
-| `FFP_SUBSTYLE_BORDER` | `ASS_OVERRIDE_BIT_BORDER` | outline style, `outline_width` px at 1080 lines of video (scaled with the frame), no shadow |
+| `FFP_SUBSTYLE_FONT_STYLE` | `ASS_OVERRIDE_BIT_ATTRIBUTES` | `font_weight` (100 .. 900, given to libass as the weight) and `italic` |
+| `FFP_SUBSTYLE_SIZE` | `ASS_OVERRIDE_BIT_FONT_SIZE_FIELDS` (when `font_size > 0`), `ass_set_font_scale` | `font_size` points at 1080 lines of video, `font_scale` (1.0 = 100 %) on top |
+| `FFP_SUBSTYLE_TEXT_COLOR` | `ASS_OVERRIDE_BIT_COLORS` | `primary_rgba` (primary + secondary); `0xRRGGBBAA`, AA = 0xFF opaque |
+| `FFP_SUBSTYLE_OUTLINE_COLOR` | `ASS_OVERRIDE_BIT_COLORS` | `outline_rgba` |
+| `FFP_SUBSTYLE_BORDER` | `ASS_OVERRIDE_BIT_BORDER` | outline style (BorderStyle 1), `outline_width` and `shadow` px at 1080 lines of video (scaled with the frame) |
+| `FFP_SUBSTYLE_BACKGROUND` | `ASS_OVERRIDE_BIT_BORDER` + `COLORS` | `back_rgba`: BorderStyle 4, one box around each event, padded 4 px at 1080 lines; no shadow is drawn then |
 
-A track the override does not apply to renders with its own styles and font scale 1.0.
+libass replaces fields in groups (all four colours, BorderStyle + Outline + Shadow, ...). The override style starts
+as the track's default style (rescaled to PlayResY 288, the unit of the override style), so a field of an overridden
+group that no flag covers keeps the track's default-style value; on an ASS track with several styles that value comes
+from its default style for every dialogue event. `font_size` is converted as points at 96 DPI on a 1080-line picture
+(`font_size * 96 / 72` px) into ASS `FontSize`, which libass treats as a cell height like VSFilter, so text is a little
+smaller than the same point size in a word processor. A track nothing applies to renders with its own styles and font
+scale 1.0.
 
 ### Delay: `ffp_set_subtitle_delay` / `ffp_get_subtitle_delay`
 

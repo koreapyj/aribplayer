@@ -129,8 +129,11 @@ std::string SettingsStore::ToJson(const AppSettings& s) {
     w.Prop("showCaptions", s.showCaptions);
     w.Prop("showSuperimpose", s.showSuperimpose);
     w.Key("subtitle").BeginObject();
+    w.Prop("useWindowsCaptionStyle", s.subtitle.useSystemCaptionStyle);
     w.Prop("font", s.subtitle.font);
-    w.Prop("fontScale", s.subtitle.fontScale);
+    w.Prop("fontWeight", s.subtitle.fontWeight);
+    w.Prop("italic", s.subtitle.italic);
+    w.Prop("fontSize", s.subtitle.fontSizePt);
     w.Prop("primaryRgba", s.subtitle.primaryRgba);
     w.Prop("outlineRgba", s.subtitle.outlineRgba);
     w.Prop("outlineWidth", s.subtitle.outlineWidth);
@@ -140,7 +143,6 @@ std::string SettingsStore::ToJson(const AppSettings& s) {
     w.Prop("overrideBorder", s.subtitle.overrideBorder);
     w.Prop("overrideAss", s.subtitle.applyToAss);
     w.EndObject();
-    w.Prop("aribFont", s.aribFont);
     w.Prop("currentPlaylist", s.currentPlaylist);
     w.EndObject();
     return w.Str();
@@ -185,10 +187,13 @@ bool SettingsStore::FromJson(const std::string& utf8, AppSettings& out) {
     GetBool(r, "showSuperimpose", out.showSuperimpose);
     if (auto* sub = Member(r, "subtitle", Value::Kind::Object)) {
         SubtitleStyle& st = out.subtitle;
+        GetBool(*sub, "useWindowsCaptionStyle", st.useSystemCaptionStyle);
         GetStr(*sub, "font", st.font);
         if (st.font.empty() || st.font.size() > 127) st.font = SubtitleStyle{}.font;
-        GetNum(*sub, "fontScale", st.fontScale);
-        st.fontScale = std::clamp(st.fontScale, 0.25, 4.0);
+        GetInt(*sub, "fontWeight", st.fontWeight, 100, 900);
+        GetBool(*sub, "italic", st.italic);
+        GetNum(*sub, "fontSize", st.fontSizePt);
+        st.fontSizePt = std::clamp(st.fontSizePt, 4.0, 400.0);
         GetNum(*sub, "outlineWidth", st.outlineWidth);
         st.outlineWidth = std::clamp(st.outlineWidth, 0.0, 20.0);
         auto rgba = [&](const char* k, std::uint32_t& dst) {
@@ -203,7 +208,6 @@ bool SettingsStore::FromJson(const std::string& utf8, AppSettings& out) {
         GetBool(*sub, "overrideBorder", st.overrideBorder);
         GetBool(*sub, "overrideAss", st.applyToAss);
     }
-    GetStr(r, "aribFont", out.aribFont);
     GetStr(r, "currentPlaylist", out.currentPlaylist);
     return true;
 }

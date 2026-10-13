@@ -369,18 +369,28 @@ std::int64_t FfPlayer::SubtitleDelay() const {
     return p_ ? ffp_get_subtitle_delay(p_) : 0;
 }
 
-int FfPlayer::SetSubtitleStyle(const SubtitleStyle& style) {
+static_assert((unsigned)kSubFont == FFP_SUBSTYLE_FONT && (unsigned)kSubSize == FFP_SUBSTYLE_SIZE &&
+              (unsigned)kSubTextColor == FFP_SUBSTYLE_TEXT_COLOR && (unsigned)kSubBorder == FFP_SUBSTYLE_BORDER &&
+              (unsigned)kSubOutlineColor == FFP_SUBSTYLE_OUTLINE_COLOR && (unsigned)kSubFontStyle == FFP_SUBSTYLE_FONT_STYLE &&
+              (unsigned)kSubBackground == FFP_SUBSTYLE_BACKGROUND);
+
+int FfPlayer::SetSubtitleStyle(const SubtitleRenderStyle& style) {
     if (!p_) return FFP_EINVAL;
     FFPSubtitleStyle s{};
     s.struct_size = (int)sizeof(s);
     std::snprintf(s.font_family, sizeof(s.font_family), "%s", style.font.c_str());
+    s.override_flags = style.overrideFlags;
+    s.fallback_flags = style.fallbackFlags;
+    s.apply_to_ass = style.applyToAss ? 1 : 0;
+    s.font_weight = style.fontWeight;
+    s.italic = style.italic ? 1 : 0;
+    s.font_size = style.fontSizePt;
     s.font_scale = style.fontScale;
     s.primary_rgba = style.primaryRgba;
     s.outline_rgba = style.outlineRgba;
+    s.back_rgba = style.backRgba;
     s.outline_width = style.outlineWidth;
-    s.override_flags = (style.overrideFont ? FFP_SUBSTYLE_FONT : 0u) | (style.overrideSize ? FFP_SUBSTYLE_SIZE : 0u)
-                     | (style.overrideColors ? FFP_SUBSTYLE_COLORS : 0u) | (style.overrideBorder ? FFP_SUBSTYLE_BORDER : 0u);
-    s.apply_to_ass = style.applyToAss ? 1 : 0;
+    s.shadow = style.shadow;
     return ffp_set_subtitle_style(p_, &s);
 }
 

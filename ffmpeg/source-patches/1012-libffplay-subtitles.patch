@@ -1,7 +1,5 @@
-Index: quilt-tree/fftools/Makefile
-===================================================================
---- quilt-tree.orig/fftools/Makefile
-+++ quilt-tree/fftools/Makefile
+--- a/fftools/Makefile
++++ b/fftools/Makefile
 @@ -72,8 +72,8 @@ LIBFFPLAY_LDFLAGS = -shared -Wl,-soname,
  LIBFFPLAY_CFLAGS  = -fPIC
  LIBFFPLAY_DLLDIR  = $(SHLIBDIR)
@@ -22,10 +20,8 @@ Index: quilt-tree/fftools/Makefile
  
  ifneq ($(LIBFFPLAY_IMPLIB),$(LIBFFPLAY_SO))
  $(LIBFFPLAY_IMPLIB): $(LIBFFPLAY_SO) ;
-Index: quilt-tree/fftools/ffplay.c
-===================================================================
---- quilt-tree.orig/fftools/ffplay.c
-+++ quilt-tree/fftools/ffplay.c
+--- a/fftools/ffplay.c
++++ b/fftools/ffplay.c
 @@ -69,6 +69,7 @@
  
  #include "ffplay.h"
@@ -44,6 +40,7 @@ Index: quilt-tree/fftools/ffplay.c
 +
 +#define FFP_SUB_DEFAULT_FAMILY "Malgun Gothic"
 +#define FFP_SUB_DEFAULT_DURATION_MS 5000      /* a cue without a known end */
++#define FFP_SUB_BOX_PADDING 4.0               /* FFP_SUBSTYLE_BACKGROUND box padding, px at 1080 lines of video */
 +#define FFP_SUB_MAX_BITMAP_BYTES (256 << 20)  /* external bitmap tracks keep at most this much of decoded cues */
 +#define FFP_ASS_MAX_BANDS 4
 +#define FFP_ASS_BAND_GAP 24
@@ -84,8 +81,7 @@ Index: quilt-tree/fftools/ffplay.c
 +    int external;                   /* track times are file times, not stream times */
 +    int serial;                     /* packet serial of the embedded events */
 +    int64_t read_order;
-+    unsigned style_gen;             /* FFPlayer.sub_style_gen last applied, 0 = none */
-+    int style_plain;
++    unsigned style_gen;             /* FFPlayer.sub_style_gen last applied to this track, 0 = none */
 +    char family[128];               /* default family given to ass_set_fonts */
 +    int frame_w, frame_h;           /* frame size of the last display render, 0 = set again */
 +    int storage_w, storage_h;
@@ -211,7 +207,7 @@ Index: quilt-tree/fftools/ffplay.c
          d->pkt_serial != request->serial ||
          !ffp_subtitle_snapshot_state_matches(layer, request)) {
          ret = AVERROR(EAGAIN);
-@@ -2420,6 +2497,573 @@ static int ffp_subtitle_queue_attime(Sub
+@@ -2420,6 +2497,611 @@ static int ffp_subtitle_queue_attime(Sub
      return ret;
  }
  
@@ -357,52 +353,89 @@ Index: quilt-tree/fftools/ffplay.c
 +    return 0;
 +}
 +
-+/* FFPAss.mutex held, renderer present. The override ASS_Style is in PlayResY 288 units (libass rescales it to the
-+ * script); it has to be complete, a zero ScaleX / ScaleY or BorderStyle renders nothing. */
++/* FFPAss.mutex held, renderer present. libass replaces style fields in groups (ASS_OVERRIDE_BIT_*), so the override
++ * ASS_Style starts as the track's default style and only the flagged fields change; the fields of a group no flag
++ * covers keep the track's values. The override ASS_Style is in PlayResY 288 units (libass rescales it to the script);
++ * it has to be complete, a zero ScaleX / ScaleY or BorderStyle renders nothing. */
 +static void ffp_ass_apply_style(VideoState *is)
 +{
 +    FFPAss *a = &is->ass;
++    const ASS_Track *t = a->track;
 +    FFPSubtitleStyle s;
 +    ASS_Style st = { 0 };
-+    unsigned gen;
-+    int applies, bits = 0;
++    unsigned gen, flags;
++    double scale = 1.0;
++    int bits = 0;
 +
 +    SDL_LockMutex(is->ffp->mutex);
 +    s = is->ffp->sub_style;
 +    gen = is->ffp->sub_style_gen;
 +    SDL_UnlockMutex(is->ffp->mutex);
-+    if (gen == a->style_gen && a->plain == a->style_plain)
++    if (gen == a->style_gen)
 +        return;
 +    a->style_gen = gen;
-+    a->style_plain = a->plain;
 +    if (strcmp(s.font_family[0] ? s.font_family : FFP_SUB_DEFAULT_FAMILY, a->family)) {
 +        av_strlcpy(a->family, s.font_family[0] ? s.font_family : FFP_SUB_DEFAULT_FAMILY, sizeof(a->family));
 +        ass_set_fonts(a->renderer, NULL, a->family, ASS_FONTPROVIDER_AUTODETECT, NULL, 1);
 +    }
-+    applies = a->plain || s.apply_to_ass;
-+    if (applies) {
-+        if (s.override_flags & FFP_SUBSTYLE_FONT)
-+            bits |= ASS_OVERRIDE_BIT_FONT_NAME;
-+        if (s.override_flags & FFP_SUBSTYLE_COLORS)
-+            bits |= ASS_OVERRIDE_BIT_COLORS;
-+        if (s.override_flags & FFP_SUBSTYLE_BORDER)
-+            bits |= ASS_OVERRIDE_BIT_BORDER;
++    flags = a->plain ? s.override_flags | s.fallback_flags : s.apply_to_ass ? s.override_flags : 0;
++    if (t && t->n_styles > 0) {
++        double to288 = t->PlayResY > 0 ? 288.0 / t->PlayResY : 1.0;
++        st = t->styles[t->default_style >= 0 && t->default_style < t->n_styles ? t->default_style : 0];
++        st.FontSize *= to288;
++        st.Spacing *= to288;
++        st.Outline *= to288;
++        st.Shadow *= to288;
++        st.Blur *= to288;
++    } else {
++        st.FontSize = 16;
++        st.PrimaryColour = st.SecondaryColour = 0xffffff00;
++        st.ScaleX = st.ScaleY = 1.0;
++        st.BorderStyle = 1;
++        st.Outline = 1;
++        st.Alignment = 2;
++        st.MarginL = st.MarginR = st.MarginV = 10;
++        st.Encoding = 1;
 +    }
++    st.Name = (char *)"";
 +    st.FontName = a->family;
-+    st.FontSize = 18;
-+    st.PrimaryColour = st.SecondaryColour = ffp_ass_color(s.primary_rgba);
-+    st.OutlineColour = ffp_ass_color(s.outline_rgba);
-+    st.BackColour = 0x00000080;
-+    st.ScaleX = st.ScaleY = 1.0;
-+    st.BorderStyle = 1;
-+    st.Outline = FFMAX(s.outline_width, 0.0) * 288.0 / 1080.0;
-+    st.Alignment = 2;
-+    st.MarginL = st.MarginR = st.MarginV = 10;
-+    st.Encoding = 1;
++    if (flags & FFP_SUBSTYLE_FONT)
++        bits |= ASS_OVERRIDE_BIT_FONT_NAME;
++    if (flags & FFP_SUBSTYLE_FONT_STYLE) {
++        bits |= ASS_OVERRIDE_BIT_ATTRIBUTES;
++        st.Bold = av_clip(s.font_weight ? s.font_weight : 400, 100, 900);   /* libass: values above 1 are weights */
++        st.Italic = !!s.italic;
++    }
++    if (flags & FFP_SUBSTYLE_SIZE) {
++        if (s.font_size > 0) {
++            bits |= ASS_OVERRIDE_BIT_FONT_SIZE_FIELDS;
++            st.FontSize = s.font_size * 96.0 / 72.0 * 288.0 / 1080.0;
++        }
++        if (s.font_scale > 0)
++            scale = s.font_scale;
++    }
++    if (flags & (FFP_SUBSTYLE_TEXT_COLOR | FFP_SUBSTYLE_OUTLINE_COLOR | FFP_SUBSTYLE_BACKGROUND))
++        bits |= ASS_OVERRIDE_BIT_COLORS;
++    if (flags & FFP_SUBSTYLE_TEXT_COLOR)
++        st.PrimaryColour = st.SecondaryColour = ffp_ass_color(s.primary_rgba);
++    if (flags & FFP_SUBSTYLE_OUTLINE_COLOR)
++        st.OutlineColour = ffp_ass_color(s.outline_rgba);
++    if (flags & (FFP_SUBSTYLE_BORDER | FFP_SUBSTYLE_BACKGROUND))
++        bits |= ASS_OVERRIDE_BIT_BORDER;
++    if (flags & FFP_SUBSTYLE_BORDER) {
++        st.BorderStyle = 1;
++        st.Outline = FFMAX(s.outline_width, 0.0) * 288.0 / 1080.0;
++        st.Shadow = FFMAX(s.shadow, 0.0) * 288.0 / 1080.0;
++    }
++    if (flags & FFP_SUBSTYLE_BACKGROUND) {
++        /* libass BorderStyle 4: one BackColour box around the whole event, padded by Shadow; no shadow is drawn */
++        st.BorderStyle = 4;
++        st.BackColour = ffp_ass_color(s.back_rgba);
++        st.Shadow = FFP_SUB_BOX_PADDING * 288.0 / 1080.0;
++    }
 +    ass_set_selective_style_override(a->renderer, &st);
 +    ass_set_selective_style_override_enabled(a->renderer, bits);
-+    ass_set_font_scale(a->renderer, applies && (s.override_flags & FFP_SUBSTYLE_SIZE) && s.font_scale > 0 ?
-+                                    s.font_scale : 1.0);
++    ass_set_font_scale(a->renderer, scale);
 +}
 +
 +static void ffp_ass_set_size(FFPAss *a, int w, int h, int storage_w, int storage_h)
@@ -450,6 +483,7 @@ Index: quilt-tree/fftools/ffplay.c
 +        a->external = 0;
 +        a->serial = -1;
 +        a->changed = 1;
++        a->style_gen = 0;
 +    }
 +    SDL_UnlockMutex(a->mutex);
 +    return ret;
@@ -785,7 +819,7 @@ Index: quilt-tree/fftools/ffplay.c
  static void ffp_subtitle_update_layer(SubtitleLayer *layer, double pts, int serial)
  {
      Frame *sp;
-@@ -2431,13 +3075,27 @@ static void ffp_subtitle_update_layer(Su
+@@ -2431,13 +3113,27 @@ static void ffp_subtitle_update_layer(Su
      int attime_valid, attime_serial = 0, attime_width = 0, attime_height = 0;
      int packet_serial;
  
@@ -814,7 +848,7 @@ Index: quilt-tree/fftools/ffplay.c
          layer->attime_requested_serial != packet_serial &&
          ffp_subtitle_queue_attime(layer, pts, packet_serial) >= 0)
          layer->attime_requested_serial = packet_serial;
-@@ -2600,7 +3258,7 @@ static void ffp_subtitle_check_resize(Vi
+@@ -2600,7 +3296,7 @@ static void ffp_subtitle_check_resize(Vi
      for (i = 0; i < FFP_SUBTITLE_LAYER_COUNT; i++) {
          SubtitleLayer *layer = &is->subtitles[i];
          int width, height;
@@ -823,7 +857,7 @@ Index: quilt-tree/fftools/ffplay.c
              layer->resize_candidate_width <= 0 || layer->resize_candidate_height <= 0 ||
              now - layer->resize_candidate_since < 100000)
              continue;
-@@ -3426,18 +4084,8 @@ static int ffp_overlay_build(VideoState
+@@ -3426,18 +4122,8 @@ static int ffp_overlay_build(VideoState
      if (!layer->active_valid || layer->active.format != 0 || !layer->active.num_rects)
          return 0;
      n = layer->active.num_rects;
@@ -844,7 +878,7 @@ Index: quilt-tree/fftools/ffplay.c
  
      for (i = 0; i < n; i++) {
          AVSubtitleRect *r = layer->active.rects[i];
-@@ -3502,6 +4150,16 @@ static void ffp_overlay_layers(VideoStat
+@@ -3502,6 +4188,16 @@ static void ffp_overlay_layers(VideoStat
          SubtitleLayer *layer = &is->subtitles[i];
          int width, height, ret;
  
@@ -861,7 +895,7 @@ Index: quilt-tree/fftools/ffplay.c
          SDL_LockMutex(is->dbg_mutex);
          width = layer->canvas_width;
          height = layer->canvas_height;
-@@ -3624,6 +4282,10 @@ static void stream_component_close(Video
+@@ -3624,6 +4320,10 @@ static void stream_component_close(Video
          packet_queue_abort_routed(&sl->packets, &sl->routing_stream_index);
          decoder_abort(&sl->decoder, &sl->frames);
          decoder_destroy(&sl->decoder);
@@ -872,7 +906,7 @@ Index: quilt-tree/fftools/ffplay.c
          if (sl->startup_sem)
              SDL_DestroySemaphore(sl->startup_sem);
          sl->startup_sem = NULL;
-@@ -3652,7 +4314,7 @@ static void stream_component_close(Video
+@@ -3652,7 +4352,7 @@ static void stream_component_close(Video
          ffp_dbg_subtitle_closed(is, subtitle_layer);
          sl->st = NULL;
          sl->stream_index = -1;
@@ -881,7 +915,7 @@ Index: quilt-tree/fftools/ffplay.c
      } else {
          ffp_dbg_stream_closed(is, codecpar->codec_type);
      }
-@@ -3707,6 +4369,15 @@ static void stream_close(VideoState *is)
+@@ -3707,6 +4407,15 @@ static void stream_close(VideoState *is)
          avsubtitle_free(&is->subtitles[i].active);
          ffp_overlay_release(&is->subtitles[i]);
      }
@@ -897,7 +931,7 @@ Index: quilt-tree/fftools/ffplay.c
      SDL_DestroyCond(is->continue_read_thread);
      sws_freeContext(is->subtitle_rgba_ctx);
      av_free(is->filename);
-@@ -4250,6 +4921,34 @@ static int ffp_keep_hw_frame(VideoState
+@@ -4250,6 +4959,34 @@ static int ffp_keep_hw_frame(VideoState
      return !empty;
  }
  
@@ -932,7 +966,7 @@ Index: quilt-tree/fftools/ffplay.c
  static int get_video_frame(VideoState *is, AVFrame *frame)
  {
      const FFPOptions *o = is->o;
-@@ -4263,6 +4962,9 @@ static int get_video_frame(VideoState *i
+@@ -4263,6 +5000,9 @@ static int get_video_frame(VideoState *i
      if (got_picture && frame->colorspace == AVCOL_SPC_UNSPECIFIED)
          frame->colorspace = frame->height > 576 ? AVCOL_SPC_BT709 : AVCOL_SPC_SMPTE170M;
  
@@ -942,7 +976,7 @@ Index: quilt-tree/fftools/ffplay.c
      /* After a keyframe step the decoder can output frames in front of the keyframe (open-GOP leading B pictures
       * that still decode); the step lands on the keyframe, so those never reach the audio alignment or the queue. */
      if (got_picture && SDL_AtomicGet(&is->kf_drop_left) > 0) {
-@@ -6602,10 +7304,17 @@ static int subtitle_thread(void *arg)
+@@ -6602,10 +7342,17 @@ static int subtitle_thread(void *arg)
  
          if ((got_subtitle = decoder_decode_frame(dec, NULL, &sp->sub)) < 0)
              break;
@@ -962,7 +996,7 @@ Index: quilt-tree/fftools/ffplay.c
              pts = sp->sub.pts != AV_NOPTS_VALUE ? sp->sub.pts / (double)AV_TIME_BASE :
                    dec->subtitle_packet_pts != AV_NOPTS_VALUE ? dec->subtitle_packet_pts / (double)AV_TIME_BASE : 0.0;
              sp->pts = pts;
-@@ -7222,31 +7931,6 @@ static void ffp_history_key(AVFormatCont
+@@ -7222,31 +7969,6 @@ static void ffp_history_key(AVFormatCont
      snprintf(key, size, "%s|%"PRId64"|%"PRId64"|%d|%d", url, file_size, (int64_t)st.st_mtime, stream_index, layer);
  }
  
@@ -994,7 +1028,7 @@ Index: quilt-tree/fftools/ffplay.c
  /* open a given stream. Return 0 if OK */
  static int stream_component_open(VideoState *is, int stream_index, int subtitle_layer)
  {
-@@ -7286,8 +7970,7 @@ static int stream_component_open(VideoSt
+@@ -7286,8 +8008,7 @@ static int stream_component_open(VideoSt
  
      switch(codec_type){
          case AVMEDIA_TYPE_AUDIO   : is->last_audio_stream    = stream_index; forced_codec_name =    o->audio_codec_name; break;
@@ -1004,7 +1038,7 @@ Index: quilt-tree/fftools/ffplay.c
          case AVMEDIA_TYPE_VIDEO   : is->last_video_stream    = stream_index; forced_codec_name =    o->video_codec_name; break;
      }
      if (forced_codec_name)
-@@ -7356,6 +8039,13 @@ static int stream_component_open(VideoSt
+@@ -7356,6 +8077,13 @@ static int stream_component_open(VideoSt
          }
      }
  
@@ -1018,7 +1052,7 @@ Index: quilt-tree/fftools/ffplay.c
      av_dict_set(&opts, "flags", "+copy_opaque", AV_DICT_MULTIKEY);
  
      if (codec_type == AVMEDIA_TYPE_VIDEO) {
-@@ -7489,6 +8179,8 @@ static int stream_component_open(VideoSt
+@@ -7489,6 +8217,8 @@ static int stream_component_open(VideoSt
              goto fail;
          is->viddec.reorder_pts = o->decoder_reorder_pts;
          is->viddec.vs = is;
@@ -1027,7 +1061,7 @@ Index: quilt-tree/fftools/ffplay.c
          if ((ret = decoder_start(&is->viddec, stream_index, video_thread, "video_decoder", is)) < 0)
              goto out;
          is->queue_attachments_req = 1;
-@@ -7501,12 +8193,12 @@ static int stream_component_open(VideoSt
+@@ -7501,12 +8231,12 @@ static int stream_component_open(VideoSt
          if (arib) {
              sl->stream_index = -1;
              sl->st = NULL;
@@ -1042,7 +1076,7 @@ Index: quilt-tree/fftools/ffplay.c
              sl->startup_stream_index = -1;
          }
          if (arib) {
-@@ -7566,7 +8258,7 @@ static int stream_component_open(VideoSt
+@@ -7566,7 +8296,7 @@ static int stream_component_open(VideoSt
                  sl->startup_stream_index = -1;
                  sl->stream_index = -1;
                  sl->st = NULL;
@@ -1051,7 +1085,7 @@ Index: quilt-tree/fftools/ffplay.c
                  ic->streams[stream_index]->discard = AVDISCARD_ALL;
                  goto out;
              }
-@@ -7593,7 +8285,7 @@ static int stream_component_open(VideoSt
+@@ -7593,7 +8323,7 @@ static int stream_component_open(VideoSt
                  sl->startup_stream_index = -1;
                  sl->stream_index = -1;
                  sl->st = NULL;
@@ -1060,7 +1094,7 @@ Index: quilt-tree/fftools/ffplay.c
                  goto out;
              }
              SDL_DestroySemaphore(sl->startup_sem);
-@@ -7603,24 +8295,35 @@ static int stream_component_open(VideoSt
+@@ -7603,24 +8333,35 @@ static int stream_component_open(VideoSt
              sl->startup_stream_index = -1;
              sl->stream_index = stream_index;
              sl->st = ic->streams[stream_index];
@@ -1098,7 +1132,7 @@ Index: quilt-tree/fftools/ffplay.c
                  ic->streams[stream_index]->discard = AVDISCARD_ALL;
                  goto out;
              }
-@@ -7648,7 +8351,7 @@ fail:
+@@ -7648,7 +8389,7 @@ fail:
          sl->startup_stream_index = -1;
          sl->stream_index = -1;
          sl->st = NULL;
@@ -1107,7 +1141,7 @@ Index: quilt-tree/fftools/ffplay.c
          ic->streams[stream_index]->discard = AVDISCARD_ALL;
      }
      if (avctx)
-@@ -7787,7 +8490,9 @@ static void ffp_build_media_info(VideoSt
+@@ -7787,7 +8528,9 @@ static void ffp_build_media_info(VideoSt
      av_bprintf(bp, ",\"seekable\":%s,\"bit_rate\":%"PRId64",\"streams\":[",
                 ffp_is_seekable(is) ? "true" : "false", (int64_t)ic->bit_rate);
  
@@ -1118,7 +1152,7 @@ Index: quilt-tree/fftools/ffplay.c
          AVStream *st = ic->streams[i];
          AVCodecParameters *par = st->codecpar;
          const char *type;
-@@ -7825,6 +8530,22 @@ static void ffp_build_media_info(VideoSt
+@@ -7825,6 +8568,22 @@ static void ffp_build_media_info(VideoSt
              json_string(bp, pf ? pf : "");
              av_bprintf(bp, ",\"color_transfer\":");
              json_string(bp, av_color_transfer_name(par->color_trc));
@@ -1141,7 +1175,7 @@ Index: quilt-tree/fftools/ffplay.c
          } else if (par->codec_type == AVMEDIA_TYPE_AUDIO) {
              av_bprintf(bp, ",\"sample_rate\":%d,\"channels\":%d",
                         par->sample_rate, par->ch_layout.nb_channels);
-@@ -7844,6 +8565,9 @@ static void ffp_build_media_info(VideoSt
+@@ -7844,6 +8603,9 @@ static void ffp_build_media_info(VideoSt
              }
              av_bprintf(bp, ",\"component_tag\":%ld", component_tag);
          }
@@ -1151,7 +1185,7 @@ Index: quilt-tree/fftools/ffplay.c
          av_bprintf(bp, ",\"selected\":%s,\"language\":", selected ? "true" : "false");
          t = av_dict_get(st->metadata, "language", NULL, 0);
          json_string(bp, t && t->value[0] ? t->value : "und");
-@@ -7854,6 +8578,24 @@ static void ffp_build_media_info(VideoSt
+@@ -7854,6 +8616,24 @@ static void ffp_build_media_info(VideoSt
          }
          av_bprintf(bp, "}");
      }
@@ -1176,7 +1210,7 @@ Index: quilt-tree/fftools/ffplay.c
      av_bprintf(bp, "]");
      if (is->arib) {
          /* roles at the time of the call; audio 2 may appear later (index -1 now) */
-@@ -8903,7 +9645,6 @@ static VideoState *stream_open(FFPlayer
+@@ -8903,7 +9683,6 @@ static VideoState *stream_open(FFPlayer
      is->id = SDL_AtomicAdd(&g_ffp.next_id, 1) + 1;
      is->last_video_stream = is->video_stream = -1;
      is->last_audio_stream = is->audio_stream = -1;
@@ -1184,7 +1218,7 @@ Index: quilt-tree/fftools/ffplay.c
      is->last_seek_pos = NAN;
      is->pt_want = -1;
      is->displayed_video_pts = NAN;
-@@ -8918,6 +9659,8 @@ static VideoState *stream_open(FFPlayer
+@@ -8918,6 +9697,8 @@ static VideoState *stream_open(FFPlayer
          is->subtitles[i].stream_index = -1;
          SDL_AtomicSet(&is->subtitles[i].routing_stream_index, -1);
          is->subtitles[i].startup_stream_index = -1;
@@ -1193,7 +1227,7 @@ Index: quilt-tree/fftools/ffplay.c
          is->subtitles[i].active_serial = -1;
          is->subtitles[i].active_start = is->subtitles[i].active_end = NAN;
          is->subtitles[i].ov_generation = UINT64_MAX;
-@@ -8950,7 +9693,7 @@ static VideoState *stream_open(FFPlayer
+@@ -8950,7 +9731,7 @@ static VideoState *stream_open(FFPlayer
          av_log(NULL, AV_LOG_FATAL, "SDL_CreateCond(): %s\n", SDL_GetError());
          goto fail;
      }
@@ -1202,7 +1236,7 @@ Index: quilt-tree/fftools/ffplay.c
          av_log(NULL, AV_LOG_FATAL, "SDL_CreateMutex(): %s\n", SDL_GetError());
          goto fail;
      }
-@@ -8995,8 +9738,7 @@ static void stream_cycle_channel(VideoSt
+@@ -8995,8 +9776,7 @@ static void stream_cycle_channel(VideoSt
          start_index = is->last_audio_stream;
          old_index = is->audio_stream;
      } else {
@@ -1212,7 +1246,7 @@ Index: quilt-tree/fftools/ffplay.c
      }
      stream_index = start_index;
  
-@@ -9016,12 +9758,6 @@ static void stream_cycle_channel(VideoSt
+@@ -9016,12 +9796,6 @@ static void stream_cycle_channel(VideoSt
      for (;;) {
          if (++stream_index >= nb_streams)
          {
@@ -1225,7 +1259,7 @@ Index: quilt-tree/fftools/ffplay.c
              if (start_index == -1)
                  return;
              stream_index = 0;
-@@ -9039,10 +9775,6 @@ static void stream_cycle_channel(VideoSt
+@@ -9039,10 +9813,6 @@ static void stream_cycle_channel(VideoSt
                  break;
              case AVMEDIA_TYPE_VIDEO:
                  goto the_end;
@@ -1236,7 +1270,7 @@ Index: quilt-tree/fftools/ffplay.c
              default:
                  break;
              }
-@@ -9056,8 +9788,117 @@ static void stream_cycle_channel(VideoSt
+@@ -9056,8 +9826,118 @@ static void stream_cycle_channel(VideoSt
             old_index,
             stream_index);
  
@@ -1282,6 +1316,7 @@ Index: quilt-tree/fftools/ffplay.c
 +            is->ass.plain = ffp_subtitle_plain(x->codec_id);
 +            is->ass.external = 1;
 +            is->ass.changed = 1;
++            is->ass.style_gen = 0;
 +        }
 +        SDL_UnlockMutex(is->ass.mutex);
 +        if (ret < 0)
@@ -1356,7 +1391,7 @@ Index: quilt-tree/fftools/ffplay.c
  }
  
  
-@@ -9477,7 +10318,7 @@ static void ffp_cmd_refresh_caption_styl
+@@ -9477,7 +10357,7 @@ static void ffp_cmd_refresh_caption_styl
      is->o->arib_ignore_background = !!(flags & 1);
      is->o->arib_force_outline = !!(flags & 2);
      layer = &is->subtitles[FFP_SUBTITLE_CAPTION];
@@ -1365,7 +1400,7 @@ Index: quilt-tree/fftools/ffplay.c
          return;
      stream_index = layer->stream_index;
      stream_component_close(is, stream_index, FFP_SUBTITLE_CAPTION);
-@@ -9488,6 +10329,28 @@ static void ffp_cmd_refresh_caption_styl
+@@ -9488,6 +10368,28 @@ static void ffp_cmd_refresh_caption_styl
      is->force_refresh = 1;
  }
  
@@ -1394,7 +1429,7 @@ Index: quilt-tree/fftools/ffplay.c
  /* returns 1 if the instance was destroyed (and must not be touched anymore) */
  static int ffp_exec_cmd(FFPlayer *ffp, FFPCmd *c)
  {
-@@ -9542,6 +10405,23 @@ static int ffp_exec_cmd(FFPlayer *ffp, F
+@@ -9542,6 +10444,23 @@ static int ffp_exec_cmd(FFPlayer *ffp, F
      case FFP_CMD_REFRESH_CAPTION_STYLE:
          ffp_cmd_refresh_caption_style(ffp, c->i);
          break;
@@ -1418,7 +1453,7 @@ Index: quilt-tree/fftools/ffplay.c
      }
      return destroyed;
  }
-@@ -9668,6 +10548,17 @@ static void ffp_tick(FFPlayer *ffp, doub
+@@ -9668,6 +10587,17 @@ static void ffp_tick(FFPlayer *ffp, doub
          if (pending)
              is->force_refresh = 1;
      }
@@ -1436,7 +1471,7 @@ Index: quilt-tree/fftools/ffplay.c
      if (SDL_AtomicGet(&is->prepared) && !is->video_st && !is->cleared_audio_only) {
          is->cleared_audio_only = 1;
          ffp_pres_clear(ffp);
-@@ -10057,6 +10948,12 @@ FFP_API FFPlayer *FFP_CALL ffp_create(co
+@@ -10057,6 +10987,13 @@ FFP_API FFPlayer *FFP_CALL ffp_create(co
      SDL_AtomicSet(&ffp->muted, 0);
      SDL_AtomicSet(&ffp->subtitle_visible[FFP_SUBTITLE_CAPTION], 1);
      SDL_AtomicSet(&ffp->subtitle_visible[FFP_SUBTITLE_SUPERIMPOSE], 1);
@@ -1445,11 +1480,12 @@ Index: quilt-tree/fftools/ffplay.c
 +    ffp->sub_style.primary_rgba = 0xffffffffu;
 +    ffp->sub_style.outline_rgba = 0x000000ffu;
 +    ffp->sub_style.outline_width = 3.0;
++    ffp->sub_style.font_weight = 400;
 +    ffp->sub_style_gen = 1;
  
  #if CONFIG_AVDEVICE
      avdevice_register_all();
-@@ -10180,6 +11077,7 @@ static const FFPOptDef ffp_optdefs[] = {
+@@ -10180,6 +11117,7 @@ static const FFPOptDef ffp_optdefs[] = {
      { "filter_hw_device", OT_STRING, OO(filter_hw_device) },
      { "hwframes",         OT_STRING, OO(hwframes) },
      { "start_paused",     OT_BOOL,   OO(start_paused) },
@@ -1457,7 +1493,7 @@ Index: quilt-tree/fftools/ffplay.c
      { NULL }
  };
  
-@@ -10392,6 +11290,7 @@ FFP_API int FFP_CALL ffp_open(FFPlayer *
+@@ -10392,6 +11330,7 @@ FFP_API int FFP_CALL ffp_open(FFPlayer *
      c->o = o;
  
      ffp_close_media(ffp);
@@ -1465,7 +1501,7 @@ Index: quilt-tree/fftools/ffplay.c
  
      SDL_LockMutex(ffp->mutex);
      if (ov.has_vf) {
-@@ -10556,7 +11455,7 @@ FFP_API char *FFP_CALL ffp_get_media_inf
+@@ -10556,7 +11495,7 @@ FFP_API char *FFP_CALL ffp_get_media_inf
  
  FFP_API int FFP_CALL ffp_cycle_stream(FFPlayer *ffp, int type)
  {
@@ -1474,7 +1510,7 @@ Index: quilt-tree/fftools/ffplay.c
          return FFP_EINVAL;
      return ffp_post_simple(ffp, FFP_CMD_CYCLE, 0, type);
  }
-@@ -10900,7 +11799,8 @@ FFP_API int FFP_CALL ffp_snapshot_ex(FFP
+@@ -10900,7 +11839,8 @@ FFP_API int FFP_CALL ffp_snapshot_ex(FFP
      int canvas_w[FFP_SUBTITLE_LAYER_COUNT] = { 0, 0 };
      int canvas_h[FFP_SUBTITLE_LAYER_COUNT] = { 0, 0 };
      int visible[FFP_SUBTITLE_LAYER_COUNT] = { 0, 0 };
@@ -1484,7 +1520,7 @@ Index: quilt-tree/fftools/ffplay.c
      int serial[FFP_SUBTITLE_LAYER_COUNT] = { 0, 0 };
      int stream_index[FFP_SUBTITLE_LAYER_COUNT] = { -1, -1 };
      uint64_t generation[FFP_SUBTITLE_LAYER_COUNT] = { 0, 0 };
-@@ -10919,7 +11819,8 @@ FFP_API int FFP_CALL ffp_snapshot_ex(FFP
+@@ -10919,7 +11859,8 @@ FFP_API int FFP_CALL ffp_snapshot_ex(FFP
          visible[i] = SDL_AtomicGet(&ffp->subtitle_visible[i]) && ffp->last_subtitle_visible[i];
          canvas_w[i] = ffp->last_subtitle_width[i];
          canvas_h[i] = ffp->last_subtitle_height[i];
@@ -1494,7 +1530,7 @@ Index: quilt-tree/fftools/ffplay.c
          serial[i] = ffp->last_subtitle_serial[i];
          stream_index[i] = ffp->last_subtitle_stream_index[i];
          generation[i] = ffp->last_subtitle_generation[i];
-@@ -10944,8 +11845,14 @@ FFP_API int FFP_CALL ffp_snapshot_ex(FFP
+@@ -10944,8 +11885,14 @@ FFP_API int FFP_CALL ffp_snapshot_ex(FFP
          goto end;
      }
      for (i = 0; i < FFP_SUBTITLE_LAYER_COUNT; i++) {
@@ -1511,7 +1547,7 @@ Index: quilt-tree/fftools/ffplay.c
                  (canvas_w[i] != *width || canvas_h[i] != *height)) {
                  AVSubtitle rerendered = { 0 };
                  int rerender_ret = AVERROR(EAGAIN);
-@@ -10953,7 +11860,7 @@ FFP_API int FFP_CALL ffp_snapshot_ex(FFP
+@@ -10953,7 +11900,7 @@ FFP_API int FFP_CALL ffp_snapshot_ex(FFP
                  /* Keep the video frame and its cue snapshot paired. The mutex also prevents the media
                   * from being destroyed while the request is queued and serviced by its decoder thread. */
                  SDL_LockMutex(ffp->snap_mutex);
@@ -1520,7 +1556,7 @@ Index: quilt-tree/fftools/ffplay.c
                      ffp->last_subtitle_stream_index[i] == stream_index[i] &&
                      ffp->last_subtitle_serial[i] == serial[i] &&
                      ffp->last_subtitle_generation[i] == generation[i] &&
-@@ -11779,3 +12686,274 @@ FFP_API void FFP_CALL ffp_set_log_callba
+@@ -11779,3 +12726,274 @@ FFP_API void FFP_CALL ffp_set_log_callba
      SDL_AtomicUnlock(&g_ffp_log.lock);
      av_log_set_callback(cb ? ffp_log_trampoline : av_log_default_callback);
  }
@@ -1795,10 +1831,8 @@ Index: quilt-tree/fftools/ffplay.c
 +{
 +    return ffp ? SDL_AtomicGet(&ffp->sub_delay_ms) : 0;
 +}
-Index: quilt-tree/fftools/ffplay.h
-===================================================================
---- quilt-tree.orig/fftools/ffplay.h
-+++ quilt-tree/fftools/ffplay.h
+--- a/fftools/ffplay.h
++++ b/fftools/ffplay.h
 @@ -75,17 +75,20 @@ enum {
                                          "removed_reason":"..."}; see FFPPresenterSink.failed */
      FFP_EVENT_STEP_DONE    = 10,     /* json: {"direction":1|-1,"moved":0|1}; see ffp_step_frame */
@@ -1833,7 +1867,7 @@ Index: quilt-tree/fftools/ffplay.h
  FFP_API int         FFP_CALL ffp_open(FFPlayer *p, const char *url, const char *options_kv);
  FFP_API int         FFP_CALL ffp_stop(FFPlayer *p);               /* closes media; the presenter is cleared to black */
  
-@@ -361,7 +365,44 @@ FFP_API double      FFP_CALL ffp_get_pos
+@@ -361,7 +365,54 @@ FFP_API double      FFP_CALL ffp_get_pos
  FFP_API double      FFP_CALL ffp_get_duration(FFPlayer *p);       /* seconds; <= 0 if unknown/live */
  FFP_API char       *FFP_CALL ffp_get_media_info(FFPlayer *p);     /* JSON (see below) or NULL; ffp_free */
  
@@ -1851,23 +1885,33 @@ Index: quilt-tree/fftools/ffplay.h
 + * AVERROR. */
 +FFP_API int         FFP_CALL ffp_add_subtitle_file(FFPlayer *p, const char *path_utf8);
 +
-+/* Subtitle style of the libass renderer (every subtitle codec except ARIB and hdmv_pgs_subtitle). */
++/* Subtitle style of the libass renderer (every subtitle codec except ARIB and hdmv_pgs_subtitle). Each flag names a
++ * property and the fields it takes. */
 +enum {
-+    FFP_SUBSTYLE_FONT   = 1 << 0,   /* override font family */
-+    FFP_SUBSTYLE_SIZE   = 1 << 1,   /* apply font_scale */
-+    FFP_SUBSTYLE_COLORS = 1 << 2,   /* override primary + outline colour */
-+    FFP_SUBSTYLE_BORDER = 1 << 3,   /* override outline width */
++    FFP_SUBSTYLE_FONT          = 1 << 0,   /* font_family */
++    FFP_SUBSTYLE_SIZE          = 1 << 1,   /* font_size (when > 0) and font_scale */
++    FFP_SUBSTYLE_TEXT_COLOR    = 1 << 2,   /* primary_rgba */
++    FFP_SUBSTYLE_BORDER        = 1 << 3,   /* outline_width, shadow */
++    FFP_SUBSTYLE_OUTLINE_COLOR = 1 << 4,   /* outline_rgba */
++    FFP_SUBSTYLE_FONT_STYLE    = 1 << 5,   /* font_weight, italic */
++    FFP_SUBSTYLE_BACKGROUND    = 1 << 6,   /* back_rgba: a box behind each subtitle event */
 +};
 +
 +typedef struct FFPSubtitleStyle {
 +    int      struct_size;           /* sizeof(FFPSubtitleStyle) */
 +    char     font_family[128];      /* UTF-8; also the libass default family; "" = "Malgun Gothic" */
-+    double   font_scale;            /* 1.0 = 100 % */
++    double   font_scale;            /* 1.0 = 100 % of the style's size */
 +    uint32_t primary_rgba;          /* 0xRRGGBBAA, AA = 0xFF opaque */
 +    uint32_t outline_rgba;
 +    double   outline_width;         /* px at 1080 lines of video, scaled with the frame */
-+    unsigned override_flags;        /* FFP_SUBSTYLE_* */
-+    int      apply_to_ass;          /* 0: overrides only for plain-text codecs; 1: also ASS/SSA */
++    unsigned override_flags;        /* FFP_SUBSTYLE_*: plain-text tracks, and ASS/SSA tracks with apply_to_ass */
++    int      apply_to_ass;
++    unsigned fallback_flags;        /* FFP_SUBSTYLE_*: plain-text tracks only */
++    int      font_weight;           /* 100 .. 900, 400 = regular, 700 = bold */
++    int      italic;
++    double   font_size;             /* points at 1080 lines of video, scaled with the frame; 0 = the style's size */
++    double   shadow;                /* drop shadow offset, px at 1080 lines of video */
++    uint32_t back_rgba;
 +} FFPSubtitleStyle;
 +
 +/* Live; persists across opens. 0 or FFP_EINVAL. */
@@ -1878,7 +1922,7 @@ Index: quilt-tree/fftools/ffplay.h
  
  /* ARIB audio model. For an ARIB transport stream (media info "arib_audio" present) the video program's audio is
   * "audio 1" (ADTS AAC with component tag 0x10 / 0x83 / 0x85, else the first untagged AAC) and "audio 2" (tag 0x11),
-@@ -408,9 +449,10 @@ FFP_API int         FFP_CALL ffp_filter_
+@@ -408,9 +459,10 @@ FFP_API int         FFP_CALL ffp_filter_
  FFP_API int         FFP_CALL ffp_snapshot(FFPlayer *p, uint8_t **out_bgra, int *width,
                                            int *height, int *stride);
  /* ffp_snapshot_ex uses the same native-size video path. FFP_SNAPSHOT_SUBTITLES composites the
@@ -1891,10 +1935,8 @@ Index: quilt-tree/fftools/ffplay.h
  enum { FFP_SNAPSHOT_SUBTITLES = 1 };
  FFP_API int         FFP_CALL ffp_snapshot_ex(FFPlayer *p, unsigned flags, uint8_t **out_bgra,
                                               int *width, int *height, int *stride);
-Index: quilt-tree/configure
-===================================================================
---- quilt-tree.orig/configure
-+++ quilt-tree/configure
+--- a/configure
++++ b/configure
 @@ -4365,7 +4365,7 @@ ffmpeg_select="aformat_filter anull_filt
                 format_filter hflip_filter null_filter rotate_filter
                 transpose_filter trim_filter vflip_filter"

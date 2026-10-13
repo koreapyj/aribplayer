@@ -79,19 +79,6 @@ struct StreamInfo {
     bool isText = false;                  // subtitle rendered by libass (everything but bitmap PGS and ARIB)
 };
 
-/// Subtitle appearance applied by libffplay's libass renderer (mirrors FFPSubtitleStyle). Colours are 0xRRGGBBAA.
-/// The override flags choose which groups replace the track's own styling; applyToAss extends them to ASS/SSA tracks.
-struct SubtitleStyle {
-    std::string font = "Malgun Gothic";
-    double fontScale = 1.0;
-    std::uint32_t primaryRgba = 0xFFFFFFFFu;
-    std::uint32_t outlineRgba = 0x000000FFu;
-    double outlineWidth = 2.0;            // px at 1080 video lines
-    bool overrideFont = false, overrideSize = false, overrideColors = false, overrideBorder = false;
-    bool applyToAss = false;
-    bool operator==(const SubtitleStyle&) const = default;
-};
-
 // ARIB transport stream: the audio roles of the video's program (media info "arib_audio"). Audio 1 and audio 2 are decoded
 // together and chosen by a preference (IMediaPlayer::SetAudioPreference) instead of by cycling streams. Indexes are
 // StreamInfo::Index at the time of the call; -1 = no such stream now (audio 2 may appear later).

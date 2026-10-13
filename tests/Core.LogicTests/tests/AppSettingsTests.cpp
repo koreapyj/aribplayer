@@ -236,14 +236,19 @@ TEST_CASE(Settings_currentPlaylist_round_trips_and_defaults_empty_when_missing) 
 
 TEST_CASE(Settings_subtitle_style_defaults_round_trip_and_clamp) {
     AppSettings d;
+    CHECK(d.subtitle.useSystemCaptionStyle);
     CHECK(d.subtitle.font == "Malgun Gothic");
-    CHECK(d.subtitle.fontScale == 1.0);
+    CHECK(d.subtitle.fontWeight == 400 && !d.subtitle.italic);
+    CHECK(d.subtitle.fontSizePt == 45.0);
     CHECK(d.subtitle.primaryRgba == 0xFFFFFFFFu && d.subtitle.outlineRgba == 0x000000FFu);
     CHECK(!d.subtitle.overrideFont && !d.subtitle.overrideSize && !d.subtitle.overrideColors && !d.subtitle.overrideBorder && !d.subtitle.applyToAss);
 
     AppSettings s;
+    s.subtitle.useSystemCaptionStyle = false;
     s.subtitle.font = "Noto Sans KR";
-    s.subtitle.fontScale = 1.25;
+    s.subtitle.fontWeight = 700;
+    s.subtitle.italic = true;
+    s.subtitle.fontSizePt = 36.5;
     s.subtitle.primaryRgba = 0xFFFF00FFu;
     s.subtitle.outlineRgba = 0x112233FFu;
     s.subtitle.outlineWidth = 3.5;
@@ -254,10 +259,23 @@ TEST_CASE(Settings_subtitle_style_defaults_round_trip_and_clamp) {
     CHECK(back == s);
 
     AppSettings clamped;
-    CHECK(SettingsStore::FromJson("{\"subtitle\":{\"font\":\"\",\"fontScale\":99,\"outlineWidth\":-4}}", clamped));
+    CHECK(SettingsStore::FromJson("{\"subtitle\":{\"font\":\"\",\"fontSize\":999,\"fontWeight\":5000,\"outlineWidth\":-4}}", clamped));
     CHECK(clamped.subtitle.font == "Malgun Gothic");
-    CHECK(clamped.subtitle.fontScale == 4.0);
+    CHECK(clamped.subtitle.fontSizePt == 400.0);
+    CHECK(clamped.subtitle.fontWeight == 900);
     CHECK(clamped.subtitle.outlineWidth == 0.0);
+}
+
+TEST_CASE(Settings_unknown_arib_font_and_font_scale_are_ignored_and_dropped) {
+    AppSettings old;
+    CHECK(SettingsStore::FromJson("{\"aribFont\":\"D:\\\\Fonts\\\\x.ttf\",\"showSuperimpose\":false,"
+                                  "\"subtitle\":{\"fontScale\":1.5,\"font\":\"Gulim\"}}", old));
+    CHECK(!old.showSuperimpose);
+    CHECK(old.subtitle.font == "Gulim");
+    CHECK(old.subtitle.fontSizePt == SubtitleStyle{}.fontSizePt);
+    const std::string json = SettingsStore::ToJson(old);
+    CHECK(json.find("aribFont") == std::string::npos);
+    CHECK(json.find("fontScale") == std::string::npos);
 }
 
 TEST_CASE(Settings_old_presenter_and_decoder_keys_ignored) {

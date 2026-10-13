@@ -20,18 +20,30 @@
 
 namespace app::sl {
 
-const std::array<ColorPreset, 6>& SubtitleColorPresets() {
-    static const std::array<ColorPreset, 6> p = {{
-        {Tr(L"White", L"흰색"), 0xFFFFFFFFu}, {Tr(L"Yellow", L"노란색"), 0xFFFF00FFu}, {Tr(L"Cyan", L"하늘색"), 0x00FFFFFFu},
-        {Tr(L"Green", L"초록색"), 0x00FF00FFu}, {Tr(L"Gray", L"회색"), 0x808080FFu}, {Tr(L"Black", L"검은색"), 0x000000FFu}}};
-    return p;
+std::wstring SubtitleFontSummary(const std::string& family, int weight, bool italic, double points) {
+    std::wstring style;
+    switch ((std::clamp(weight, 100, 900) + 50) / 100) {
+    case 1: style = L"Thin"; break;
+    case 2: style = L"ExtraLight"; break;
+    case 3: style = L"Light"; break;
+    case 5: style = L"Medium"; break;
+    case 6: style = L"SemiBold"; break;
+    case 7: style = L"Bold"; break;
+    case 8: style = L"ExtraBold"; break;
+    case 9: style = L"Black"; break;
+    default: break;
+    }
+    if (italic) style += style.empty() ? L"Italic" : L" Italic";
+    if (style.empty()) style = L"Regular";
+    wchar_t size[32];
+    swprintf_s(size, points == std::floor(points) ? L"%.0f pt" : L"%.1f pt", points);
+    return wvp::ToWide(family) + L", " + style + L", " + size;
 }
-int ColorPresetIndex(std::uint32_t rgba) {
-    const auto& p = SubtitleColorPresets();
-    for (size_t i = 0; i < p.size(); i++) if (p[i].rgba == rgba) return (int)i;
-    return -1;
+std::wstring RgbaHex(std::uint32_t rgba) {
+    wchar_t buf[16];
+    swprintf_s(buf, L"#%06X", (unsigned)(rgba >> 8));
+    return buf;
 }
-std::wstring PercentLabel(double scale) { return std::to_wstring((int)std::lround(scale * 100)) + L"%"; }
 std::wstring PixelLabel(double px) {
     if (px <= 0) return Tr(L"None", L"없음");
     wchar_t buf[32];
@@ -587,6 +599,13 @@ LOGIC_TEST(settings_build_stamp_format) {
     LT_CHECK(s.rfind(L"built 20", 0) == 0 && s.size() == 25);
     std::wstring e = ExeBuildStamp();
     LT_CHECK(e.find(L".exe built 20") != std::wstring::npos);
+}
+
+LOGIC_TEST(settings_subtitle_value_labels) {
+    LT_CHECK(SubtitleFontSummary("Malgun Gothic", 400, false, 45) == L"Malgun Gothic, Regular, 45 pt");
+    LT_CHECK(SubtitleFontSummary("Gulim", 700, true, 36.5) == L"Gulim, Bold Italic, 36.5 pt");
+    LT_CHECK(SubtitleFontSummary("A", 300, true, 12) == L"A, Light Italic, 12 pt");
+    LT_CHECK(RgbaHex(0x11AAFFFFu) == L"#11AAFF");
 }
 
 LOGIC_TEST(settings_live_filters_in_planner_mode_reopen_when_the_decoder_must_change) {

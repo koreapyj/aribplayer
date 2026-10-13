@@ -143,3 +143,24 @@ TEST_CASE_INTEGRATION(Subtitle_delay_shifts_visibility) {
     CHECK_EQ(s.player->SetSubtitleDelay(0), 0);
     CHECK_MSG(wvptest::WaitFor([&] { return s.SubtitlePixels() == 0; }, 5), "subtitle stayed after the delay was cleared");
 }
+
+TEST_CASE_INTEGRATION(Subtitle_style_fallback_reaches_plain_text_tracks_only_through_its_flags) {
+    SubSession s(L"video-subs.mkv");
+    s.PlayTo(2.8);
+    REQUIRE_MSG(s.WaitPixels(5), "no subtitle pixels inside cue 2-4 s");
+    wvptest::Delay(300);
+    const int plain = s.SubtitlePixels();
+
+    SubtitleRenderStyle box;
+    box.fallbackFlags = kSubBackground;
+    box.backRgba = 0x2040C0FFu;
+    REQUIRE(s.player->SetSubtitleStyle(box) == 0);
+    CHECK_MSG(wvptest::WaitFor([&] { return s.SubtitlePixels() > plain * 3 / 2; }, 5),
+              "the background box did not enlarge the subtitle area: " + std::to_string(plain) + " -> " +
+              std::to_string(s.SubtitlePixels()));
+
+    box.fallbackFlags = 0;   // the values alone change nothing
+    REQUIRE(s.player->SetSubtitleStyle(box) == 0);
+    CHECK_MSG(wvptest::WaitFor([&] { return std::abs(s.SubtitlePixels() - plain) <= plain / 10; }, 5),
+              "the subtitle did not return to its own style: " + std::to_string(plain) + " -> " + std::to_string(s.SubtitlePixels()));
+}

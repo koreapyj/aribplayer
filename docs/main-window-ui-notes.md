@@ -234,12 +234,16 @@ The player keeps running and keeps its own keyboard / view state meanwhile.
   Draw / commit failures go through `Gfx::onFailure`, so a loss in either window runs the one rebind.
 - Input: its own `pui::UiHost` with normal focus (Tab traversal; the player-view "no focus" rule does not apply), mouse / wheel /
   capture / keys / WM_CHAR / tooltips and its own UIA bridge. Esc closes an open flyout or the licenses dialog first, otherwise the window. Deactivating
-  it closes its flyouts (not for its own dialogs, e.g. the caption font picker, which it owns).
-- Edit filters... closes the window and opens the filters panel in the main window (Settings could cover it). Toasts from
-  the page (ARIB caption font) still appear in the main window.
-- Sections: Appearance, Playback, Subtitles, About. Subtitles: Show subtitles, font family (installed fonts) + "Always use this font", size
-  preset + apply, text / outline colour presets + apply, outline width + apply, "Also apply to ASS/SSA subtitles" (the overrides normally
-  reach plain-text formats only); the ARIB captions sub-group keeps Show superimpose, the ARIB caption font and the Windows caption style link. About = player version, "Open source licenses" (View opens an in-app modal
+  it closes its flyouts (not for its own dialogs, e.g. the subtitle font and colour pickers, which it owns).
+- Edit filters... closes the window and opens the filters panel in the main window (Settings could cover it).
+- Sections: Appearance, Playback, Subtitles, About. Subtitles: Show subtitles, "Use Windows caption settings" (on: the Windows
+  caption settings are the text subtitle style source and the app's font, colour and outline rows are hidden), Subtitle font (text
+  colour swatch, row text "Family, Style, N pt, #RRGGBB"; the Windows font dialog `ChooseFontW`, opened on the current font: family,
+  style, size in points at 1080 video lines and the text colour from its colour list; underline / strikeout hidden) + "Override font"
+  + "Override size", outline colour (swatch + hex; the Windows colour dialog `ChooseColorW`, custom colours kept for the session) +
+  "Override colours", outline width preset + "Override outline", "Also apply to ASS/SSA subtitles". Precedence: `src/Core/include/wvp/SubtitleStyle.h`. Both dialogs are owned by the Settings window and
+  refuse under tests (`OsDialogsBlocked`). The ARIB captions sub-group keeps Show superimpose and the Windows caption style link
+  (ARIB always uses the bundled WLC Maru font). About = player version, "Open source licenses" (View opens an in-app modal
   `pages/LicensesDialog`: scrollable read-only text of `THIRD-PARTY-NOTICES.txt`, embedded in the exe as RCDATA `IDR_THIRD_PARTY_NOTICES`
   via `app.rc`; Close button / Esc), then the Debug logging toggle. The libffplay version row is gone.
 - Close: close button / Esc / Alt+F4 destroy it (placement saved); closing the main window closes it first.

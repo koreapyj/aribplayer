@@ -6,6 +6,7 @@
 
 #include "FilterManager.h"
 #include "PlayerTypes.h"
+#include "SubtitleStyle.h"
 #include "VideoGpu.h"
 
 namespace wvp {
@@ -41,7 +42,6 @@ struct AppSettings {
     bool showCaptions = true;                 // ARIB caption layer; missing key means on
     bool showSuperimpose = true;               // ARIB superimpose layer; missing key means on
     SubtitleStyle subtitle;                   // Settings > Subtitles; JSON key "subtitle"
-    std::string aribFont;                     // optional TTF override; empty = bundled WLC Maru ARIB font
     std::string currentPlaylist;              // active named playlist (PlaylistStore name); empty = the unnamed playlist; missing key = empty
 
     bool operator==(const AppSettings&) const = default;

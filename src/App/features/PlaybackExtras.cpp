@@ -196,7 +196,7 @@ void InitPlaybackExtras(AppContext& ctx) {
     });
     ctx.OnMediaPrepared.add([&ctx](const wvp::MediaPreparedInfo& p) {
         AttachSidecars(ctx);   // registered before any track restore, so a restore can resolve external tracks
-        if (auto* pl = ctx.Player()) pl->SetSubtitleStyle(ctx.Svc().settings.subtitle);
+        ApplySubtitleStyle(ctx);
         g_audioOnly = !p.HasVideo && p.HasAudio;
         RefreshZoomAspect(ctx);
         ctx.RequestRedraw();

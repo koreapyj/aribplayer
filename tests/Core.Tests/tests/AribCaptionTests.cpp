@@ -130,23 +130,19 @@ TEST_CASE(Arib_settings_default_on_migrate_and_round_trip) {
     AppSettings defaults;
     CHECK(defaults.showCaptions);
     CHECK(defaults.showSuperimpose);
-    CHECK(defaults.aribFont.empty());
 
     AppSettings old;
     REQUIRE(SettingsStore::FromJson("{\"volume\":42}", old));
     CHECK(old.showCaptions);
     CHECK(old.showSuperimpose);
-    CHECK(old.aribFont.empty());
 
     AppSettings saved;
     saved.showCaptions = false;
     saved.showSuperimpose = false;
-    saved.aribFont = "D:\\Fonts\\WLCMARU2004ARIBU.TTF";
     AppSettings restored;
     REQUIRE(SettingsStore::FromJson(SettingsStore::ToJson(saved), restored));
     CHECK_EQ(restored.showCaptions, false);
     CHECK_EQ(restored.showSuperimpose, false);
-    CHECK_EQ(restored.aribFont, saved.aribFont);
 }
 
 TEST_CASE_INTEGRATION(Arib_fixture_caption_classification_visibility_and_snapshot) {

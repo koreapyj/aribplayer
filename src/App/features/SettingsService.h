@@ -41,10 +41,13 @@ std::wstring LibffplayBuildStamp();
 /// Pure formatter used by both (FILETIME -> "built YYYY-MM-DD HH:MM:SS" local time), "" for a zero time.
 std::wstring FormatBuildTime(unsigned long long fileTime100ns);
 
-/// Sets the ARIB font, superimpose and Windows caption-style open options before every media open.
+/// Sets the ARIB font (always the bundled one), superimpose and Windows caption-style open options before every media open.
 void ApplyCaptionOpenOptions(wvp::PlaybackController& ctl, const wvp::AppSettings& settings);
-/// Refreshes the Windows Closed Caption Properties mapping and ARIB caption decoder when the ClosedCaptioning registry key
-/// changes (StartSystemCaptionSettingsWatch).
+/// Sends the text subtitle style (wvp::ResolveSubtitleStyle of the settings and the last read Windows caption settings) to
+/// the player.
+void ApplySubtitleStyle(AppContext& ctx);
+/// Re-reads the Windows caption settings when the ClosedCaptioning registry key changes (StartSystemCaptionSettingsWatch):
+/// the text subtitle style is sent again when it follows them, and the ARIB caption decoder is refreshed.
 void OnSystemCaptionSettingsChanged(AppContext& ctx);
 /// Windows Settings > Accessibility > Captions broadcasts no WM_SETTINGCHANGE for caption changes, so a background thread
 /// watches HKCU\Software\Microsoft\Windows\CurrentVersion\ClosedCaptioning (RegNotifyChangeKeyValue, subtree) and posts
@@ -52,7 +55,7 @@ void OnSystemCaptionSettingsChanged(AppContext& ctx);
 void StartSystemCaptionSettingsWatch(AppContext& ctx);
 /// Stops and joins the watcher (before the window / AppContext goes away). Safe when it never started.
 void StopSystemCaptionSettingsWatch();
-/// Bundled font location next to the executable (empty override means this path).
+/// The bundled ARIB caption font next to the executable.
 std::wstring BundledAribFontPath();
 
 /// What ApplySettingsLive did, for the toast and the tests.
@@ -60,8 +63,8 @@ struct LiveApplyResult {
     bool reopened = false;          // the current item was re-opened at its position (caption decoder change)
     std::wstring toast;             // "" = nothing to say
 };
-/// Applies the playback-affecting differences between `before` and `after` to the running playback: a superimpose or ARIB
-/// font change while media is playing/paused reopens the item through ReopenCurrentHere (position, pause kept; audio/subtitle
+/// Applies the playback-affecting differences between `before` and `after` to the running playback: a superimpose change
+/// while media is playing/paused reopens the item through ReopenCurrentHere (position, pause kept; audio/subtitle
 /// selection is restored by the app through SelectTrack after the new Prepared).
 LiveApplyResult ApplySettingsLive(wvp::PlaybackController& ctl, const wvp::AppSettings& before, const wvp::AppSettings& after);
 }

@@ -818,27 +818,28 @@ int App::RunHeadlessCheck() {
                 Step((pre + "_resume_in_sync_without_drops").c_str(),
                      (playing && drops == 0 && (!audioRunning || (avWhileAudio > -100 && avWhileAudio < 100))) ? S_OK : E_FAIL);
             };
-            // An ARIB font change reopens at the position; the bundled font named explicitly renders like the default.
-            const std::string configuredFont = svc_->settings.aribFont;
-            const std::string bundledFont = wvp::ToUtf8(BundledAribFontPath());
-            auto switchFont = [&] {
+            // The superimpose setting is the settings change that reopens at the position. It decides only whether the
+            // superimpose decoder runs; the caption layer, the picture and the Acrylic regions these steps measure stay
+            // the same.
+            const bool configuredSuperimpose = svc_->settings.showSuperimpose;
+            auto switchSuperimpose = [&] {
                 wvp::AppSettings before = svc_->settings, after = before;
-                after.aribFont = before.aribFont == configuredFont ? (configuredFont == bundledFont ? std::string() : bundledFont) : configuredFont;
+                after.showSuperimpose = !before.showSuperimpose;
                 svc_->settings = after;
                 ApplySettingsLive(*ctl_, before, after);
             };
-            auto restoreFont = [&] {   // playing, not measured
-                if (svc_->settings.aribFont == configuredFont) return;
+            auto restoreSuperimpose = [&] {   // playing, not measured
+                if (svc_->settings.showSuperimpose == configuredSuperimpose) return;
                 wvp::AppSettings before = svc_->settings, after = before;
-                after.aribFont = configuredFont;
+                after.showSuperimpose = configuredSuperimpose;
                 svc_->settings = after;
                 ApplySettingsLive(*ctl_, before, after);
                 PumpUntil([&] { return state_ == wvp::PlayerState::Playing; }, 3000);
             };
             pausedReopen("baseline_pause_play", [] {}, false);   // no reopen: the drop / caption numbers to compare with
             pausedReopen("ui_loss_paused", [&] { SimulateUiDeviceLoss(); });
-            pausedReopen("settings_reopen_paused", switchFont);
-            restoreFont();
+            pausedReopen("settings_reopen_paused", switchSuperimpose);
+            restoreSuperimpose();
 
             // repeated loss: 3 attempts per 30 s, then the WARP fallback; no further rebuilds
             for (int i = 0; i < 3; i++) {
@@ -864,9 +865,9 @@ int App::RunHeadlessCheck() {
                 const int extra = GetEnvironmentVariableW(L"WVP_HEADLESS_REOPEN_SAMPLES", n, 16) ? _wtoi(n) : 0;
                 for (int i = 0; i < extra; i++) {
                     const std::string prefix = "reopen_sample_" + std::to_string(i + 1);
-                    pausedReopen(prefix.c_str(), switchFont);
+                    pausedReopen(prefix.c_str(), switchSuperimpose);
                 }
-                restoreFont();
+                restoreSuperimpose();
             }
         }
         {   // seek logging (the log-file step below looks for it): the skip key hook ignores keys while the media is not seekable

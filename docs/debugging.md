@@ -210,7 +210,7 @@ host-copy mismatch.
 
 The ARIB section of the Tab overlay reports the caption and superimpose layers separately: selected stream and `arib_type`, decoder/options, resolved font, current cue rectangle count and start/end times, cues shown/cleared/uploaded, and the active canvas size and resize re-render count. An empty cue with zero rectangles is a clear event; an end time of `UINT32_MAX` means the caption remains active until replaced or cleared. The caption visibility toggle does not pause decoding, and it never hides superimpose. If stream metadata has `arib_type: superimpose`, it must not appear as a selectable caption track.
 
-For an ARIB stream, the open log should show bitmap subtitle output, the `caption` or `superimpose` decoder type, and the canvas dimensions matching the presenter's video rectangle. The caption style options (`arib_ignore_background` and `arib_force_outline`) apply only to captions. A resolved bundled font normally points to `<exe directory>\fonts\WLCMARU2004ARIBU.TTF`; a missing override falls back to libaribcaption's platform defaults.
+For an ARIB stream, the open log should show bitmap subtitle output, the `caption` or `superimpose` decoder type, and the canvas dimensions matching the presenter's video rectangle. The caption style options (`arib_ignore_background` and `arib_force_outline`) apply only to captions. The app always passes the bundled font `<exe directory>\fonts\WLCMARU2004ARIBU.TTF`; when that file is missing, libaribcaption falls back to its platform defaults.
 
 ### Headless fixture check
 
