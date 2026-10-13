@@ -1,32 +1,31 @@
---- a/fftools/Makefile
-+++ b/fftools/Makefile
-@@ -74,6 +74,9 @@ LIBFFPLAY_DLLDIR  = $(SHLIBDIR)
+Index: quilt-tree/fftools/Makefile
+===================================================================
+--- quilt-tree.orig/fftools/Makefile
++++ quilt-tree/fftools/Makefile
+@@ -72,8 +72,8 @@ LIBFFPLAY_LDFLAGS = -shared -Wl,-soname,
+ LIBFFPLAY_CFLAGS  = -fPIC
+ LIBFFPLAY_DLLDIR  = $(SHLIBDIR)
  endif
- # SDL2 (static) and its system libraries are linked into libffplay
- LIBFFPLAY_SDL_LIBS := $(filter-out -lSDL2main -mwindows,$(EXTRALIBS-ffplay))
-+# libass (static, with its font and shaping dependencies) for the subtitle renderer
-+LIBFFPLAY_ASS_LIBS   := $(shell $(PKG_CONFIG) --static --libs libass)
-+LIBFFPLAY_ASS_CFLAGS := $(shell $(PKG_CONFIG) --static --cflags libass)
+-# SDL2 (static) and its system libraries are linked into libffplay
+-LIBFFPLAY_SDL_LIBS := $(filter-out -lSDL2main -mwindows,$(EXTRALIBS-ffplay))
++# SDL2 and libass (static, with their system, font and shaping libraries) are linked into libffplay
++LIBFFPLAY_LIBS := $(filter-out -lSDL2main -mwindows,$(EXTRALIBS-ffplay))
  
  define DOFFTOOL
  OBJS-$(1) += fftools/cmdutils.o fftools/opt_common.o fftools/$(1).o $(OBJS-$(1)-yes)
-@@ -97,12 +100,12 @@ endif
- endif
- 
- ifeq ($(CONFIG_FFPLAY),yes)
--$(OBJS-libffplay): CFLAGS += $(CFLAGS-ffplay) $(LIBFFPLAY_CFLAGS) -DFFP_BUILDING_DLL
-+$(OBJS-libffplay): CFLAGS += $(CFLAGS-ffplay) $(LIBFFPLAY_ASS_CFLAGS) $(LIBFFPLAY_CFLAGS) -DFFP_BUILDING_DLL
- $(OBJS-libffplay): | fftools
+@@ -102,7 +102,7 @@ $(OBJS-libffplay): | fftools
  -include $(OBJS-libffplay:.o=.d)
  
  $(LIBFFPLAY_SO): $(OBJS-libffplay) $(FF_DEP_LIBS)
 -	$(LD) $(LDFLAGS) $(LIBFFPLAY_LDFLAGS) $(LD_O) $(OBJS-libffplay) $(LIBFFPLAY_SDL_LIBS) $(FF_EXTRALIBS)
-+	$(LD) $(LDFLAGS) $(LIBFFPLAY_LDFLAGS) $(LD_O) $(OBJS-libffplay) $(LIBFFPLAY_SDL_LIBS) $(LIBFFPLAY_ASS_LIBS) $(FF_EXTRALIBS)
++	$(LD) $(LDFLAGS) $(LIBFFPLAY_LDFLAGS) $(LD_O) $(OBJS-libffplay) $(LIBFFPLAY_LIBS) $(FF_EXTRALIBS)
  
  ifneq ($(LIBFFPLAY_IMPLIB),$(LIBFFPLAY_SO))
  $(LIBFFPLAY_IMPLIB): $(LIBFFPLAY_SO) ;
---- a/fftools/ffplay.c
-+++ b/fftools/ffplay.c
+Index: quilt-tree/fftools/ffplay.c
+===================================================================
+--- quilt-tree.orig/fftools/ffplay.c
++++ quilt-tree/fftools/ffplay.c
 @@ -69,6 +69,7 @@
  
  #include "ffplay.h"
@@ -1796,8 +1795,10 @@
 +{
 +    return ffp ? SDL_AtomicGet(&ffp->sub_delay_ms) : 0;
 +}
---- a/fftools/ffplay.h
-+++ b/fftools/ffplay.h
+Index: quilt-tree/fftools/ffplay.h
+===================================================================
+--- quilt-tree.orig/fftools/ffplay.h
++++ quilt-tree/fftools/ffplay.h
 @@ -75,17 +75,20 @@ enum {
                                          "removed_reason":"..."}; see FFPPresenterSink.failed */
      FFP_EVENT_STEP_DONE    = 10,     /* json: {"direction":1|-1,"moved":0|1}; see ffp_step_frame */
@@ -1890,3 +1891,16 @@
  enum { FFP_SNAPSHOT_SUBTITLES = 1 };
  FFP_API int         FFP_CALL ffp_snapshot_ex(FFPlayer *p, unsigned flags, uint8_t **out_bgra,
                                               int *width, int *height, int *stride);
+Index: quilt-tree/configure
+===================================================================
+--- quilt-tree.orig/configure
++++ quilt-tree/configure
+@@ -4365,7 +4365,7 @@ ffmpeg_select="aformat_filter anull_filt
+                format_filter hflip_filter null_filter rotate_filter
+                transpose_filter trim_filter vflip_filter"
+ ffmpeg_suggest="ole32 psapi shell32"
+-ffplay_deps="avcodec avformat avfilter swscale swresample sdl2"
++ffplay_deps="avcodec avformat avfilter swscale swresample sdl2 libass"
+ ffplay_select="crop_filter transpose_filter hflip_filter vflip_filter rotate_filter"
+ ffplay_suggest="shell32 libplacebo vulkan"
+ ffprobe_deps="avcodec avformat"

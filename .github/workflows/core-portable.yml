@@ -40,12 +40,12 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-      - name: Install quilt and SDL2
+      - name: Install quilt, SDL2 and libass
         shell: bash
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends quilt libsdl2-dev pkg-config
+          sudo apt-get install -y --no-install-recommends quilt libsdl2-dev libass-dev pkg-config
       - name: Stage the patched FFmpeg tree
         shell: bash
         run: |
@@ -60,13 +60,13 @@ jobs:
           stage_tree "$WORK/tree" 0
           cd "$WORK/tree"
           QUILTRC="$WORK/builder-ffmpeg/.quiltrc" QUILT_PATCHES=debian/patches quilt push -a > /dev/null
-      - name: Configure (minimal, SDL2)
+      - name: Configure (minimal, SDL2, libass)
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/ffmpeg-build"
           cd "$RUNNER_TEMP/ffmpeg-build"
-          "$RUNNER_TEMP/ffmpeg-work/tree/configure" --disable-autodetect --enable-sdl2 --enable-ffplay \
+          "$RUNNER_TEMP/ffmpeg-work/tree/configure" --disable-autodetect --enable-sdl2 --enable-libass --enable-ffplay \
             --disable-ffmpeg --disable-ffprobe --disable-doc --disable-x86asm --enable-shared --disable-static
       - name: Compile libffplay and ffcapsdump
         shell: bash
