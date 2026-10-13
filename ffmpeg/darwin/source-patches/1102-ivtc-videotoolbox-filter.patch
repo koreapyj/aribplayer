@@ -1,0 +1,986 @@
+--- a/configure
++++ b/configure
+@@ -4186,6 +4186,7 @@ ivtc_cuda_filter_deps="ffnvcodec"
+ ivtc_cuda_filter_deps_any="cuda_nvcc cuda_llvm"
+ ivtc_d3d11_filter_deps="d3d11va d3dcompiler_h"
+ ivtc_opencl_filter_deps="opencl"
++ivtc_videotoolbox_filter_deps="metal corevideo videotoolbox"
+ kerndeint_filter_deps="gpl"
+ ladspa_filter_deps="ladspa libdl"
+ lcevc_filter_deps="liblcevc_dec"
+--- a/libavfilter/Makefile
++++ b/libavfilter/Makefile
+@@ -381,6 +381,9 @@ OBJS-$(CONFIG_IVTC_D3D11_FILTER)
+                                                 ivtc_common.o
+ OBJS-$(CONFIG_IVTC_OPENCL_FILTER)            += vf_ivtc_opencl.o opencl.o opencl/ivtc.o \
+                                                 ivtc_common.o
++OBJS-$(CONFIG_IVTC_VIDEOTOOLBOX_FILTER)      += vf_ivtc_videotoolbox.o \
++                                                metal/vf_ivtc_videotoolbox.metallib.o \
++                                                metal/utils.o ivtc_common.o
+ OBJS-$(CONFIG_KERNDEINT_FILTER)              += vf_kerndeint.o
+ OBJS-$(CONFIG_KIRSCH_FILTER)                 += vf_convolution.o
+ OBJS-$(CONFIG_LAGFUN_FILTER)                 += vf_lagfun.o
+--- a/libavfilter/allfilters.c
++++ b/libavfilter/allfilters.c
+@@ -347,6 +347,7 @@ extern const FFFilter ff_vf_interleave;
+ extern const FFFilter ff_vf_ivtc_cuda;
+ extern const FFFilter ff_vf_ivtc_d3d11;
+ extern const FFFilter ff_vf_ivtc_opencl;
++extern const FFFilter ff_vf_ivtc_videotoolbox;
+ extern const FFFilter ff_vf_kerndeint;
+ extern const FFFilter ff_vf_kirsch;
+ extern const FFFilter ff_vf_lagfun;
+--- /dev/null
++++ b/libavfilter/metal/vf_ivtc_videotoolbox.metal
+@@ -0,0 +1,267 @@
++/*
++ * Copyright (c) 2026
++ *
++ * These inverse-telecine kernels are ported from QSVEnc
++ * (QSVPipeline/rgy_filter_ivtc.cl) by rigaya, used under the MIT License:
++ *     QSVEnc/NVEnc/VCEEnc, Copyright (c) 2014-2016 rigaya.
++ *     https://github.com/rigaya/QSVEnc
++ *
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * FFmpeg is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with FFmpeg; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++/*
++ * Metal port of the field-matching / decimation kernels in d3d11/ivtc.hlsl
++ * (themselves a port of vf_ivtc_cuda.cu). Planes are UNORM textures (R8/RG8
++ * for NV12, R16/RG16 for P010); every analysis read is rounded back to the raw
++ * container integer and multiplied by `scale`, so the values match the CUDA
++ * and D3D11 paths (raw * scale): 0..255 luma units for the fieldmatch kernels,
++ * 0..1 for the decimation diff. Reads clamp to the plane edge. The weave
++ * kernels copy whole fields and need no rounding.
++ *
++ * Every kernel is dispatched in IVTC_WG x IVTC_WG threadgroups
++ * (dispatchThreadgroups, not dispatchThreads): the reductions assume exactly
++ * IVTC_NT threads per group and one output slot per group.
++ */
++
++#include <metal_stdlib>
++
++using namespace metal;
++
++#define IVTC_WG 16
++#define IVTC_NT (IVTC_WG * IVTC_WG)
++
++// must match IvtcVTParams in vf_ivtc_videotoolbox.m
++struct IvtcParams {
++    int   width;
++    int   height;
++    int   hf;
++    int   tff;
++    int   nbx;
++    int   out_offset;   // ivtc_diff: slice offset into diff_buf
++    int   first;        // weave: parity of the rows taken from tex_a
++    int   pad0;
++    float scale;
++    float maxval;       // UNORM -> raw container integer
++    float pad1;
++    float pad2;
++};
++
++// texture slots: 0 a_y, 1 b_y, 2 a_uv, 3 b_uv, 4 dst_y, 5 dst_uv
++// buffer slots:  0 D, 1 F, 2 cmp, 3 diff, 4 params
++
++static inline float px(texture2d<float, access::read> tex, int x, int y, constant IvtcParams &p)
++{
++    x = clamp(x, 0, p.width - 1);
++    y = clamp(y, 0, p.height - 1);
++    return round(tex.read(uint2(x, y)).x * p.maxval) * p.scale;
++}
++
++/* =====================================================================
++ * vf_fieldmatch compare_fields port (Stage 1: C-vs-P primary match).
++ * Works in 0..255 luma units so fieldmatch's integer thresholds (3,19,23,42)
++ * apply unchanged; "field rows" index the borrowed parity: borrowed image
++ * row yb = 2*fy + (tff?1:0).
++ * ===================================================================== */
++
++// |cur.borrowed - cand.borrowed| per borrowed field row -> D[fy*width + x] (0..255)
++kernel void fm_absdiff(texture2d<float, access::read> tex_a_y [[texture(0)]],
++                       texture2d<float, access::read> tex_b_y [[texture(1)]],
++                       device uint *D_buf                     [[buffer(0)]],
++                       constant IvtcParams &p                 [[buffer(4)]],
++                       uint2 id                               [[thread_position_in_grid]])
++{
++    int x  = id.x;
++    int fy = id.y;
++    if (x >= p.width || fy >= p.hf)
++        return;
++    int yb = 2 * fy + (p.tff ? 1 : 0);
++    float d = abs(px(tex_a_y, x, yb, p) - px(tex_b_y, x, yb, p));
++    D_buf[fy * p.width + x] = d > 255.0f ? 255u : (uint)(int)(d + 0.5f);
++}
++
++// build_diff_map: flag bits 1/2/4 per field-row diff magnitude + clustering.
++kernel void fm_diffmap(device const uint *D_buf [[buffer(0)]],
++                       device uint *F_buf       [[buffer(1)]],
++                       constant IvtcParams &p   [[buffer(4)]],
++                       uint2 id                 [[thread_position_in_grid]])
++{
++    int x  = id.x;
++    int fy = id.y;
++    int width = p.width, hf = p.hf;
++    int u, count;
++    if (x >= width || fy >= hf)
++        return;
++    F_buf[fy * width + x] = 0;
++    if (fy < 1 || fy >= hf - 1 || x < 1 || x >= width - 1)
++        return;
++    int diff = D_buf[fy * width + x];
++    if (diff <= 3)
++        return;
++    count = 0;
++    for (u = x - 1; u < x + 2 && count < 2; u++) {
++        count += D_buf[(fy - 1) * width + u] > 3;
++        count += D_buf[ fy      * width + u] > 3;
++        count += D_buf[(fy + 1) * width + u] > 3;
++    }
++    if (count <= 1)
++        return;
++    uint f = 1;
++    if (diff > 19) {
++        int upper = 0, lower = 0;
++        count = 0;
++        for (u = x - 1; u < x + 2 && count < 6; u++) {
++            if (D_buf[(fy - 1) * width + u] > 19) { count++; upper = 1; }
++            if (D_buf[ fy      * width + u] > 19)   count++;
++            if (D_buf[(fy + 1) * width + u] > 19) { count++; lower = 1; }
++        }
++        if (count > 3) {
++            if (upper && lower) {
++                f |= 1 << 1;
++            } else {
++                int upper2 = 0, lower2 = 0;
++                int ulo = max(x - 4, 0), uhi = min(x + 5, width);
++                for (u = ulo; u < uhi; u++) {
++                    if (fy >= 2      && D_buf[(fy - 2) * width + u] > 19) upper2 = 1;
++                    if (                D_buf[(fy - 1) * width + u] > 19) upper  = 1;
++                    if (                D_buf[(fy + 1) * width + u] > 19) lower  = 1;
++                    if (fy < hf - 2  && D_buf[(fy + 2) * width + u] > 19) lower2 = 1;
++                }
++                if ((upper && (lower || upper2)) || (lower && (upper || lower2)))
++                    f |= 1 << 1;
++                else if (count > 5)
++                    f |= 1 << 2;
++            }
++        }
++    }
++    F_buf[fy * width + x] = f;
++}
++
++// compare_fields accumulation for match1=C (cur, tex_a) vs match2=cand (tex_b).
++// Each group writes 6 partials: {Ac,Am,Aml, Bc,Bm,Bml} -> cmp_buf[blk*6 + 0..5].
++kernel void fm_compare_accum(texture2d<float, access::read> tex_a_y [[texture(0)]],
++                             texture2d<float, access::read> tex_b_y [[texture(1)]],
++                             device const uint *F_buf               [[buffer(1)]],
++                             device float *cmp_buf                  [[buffer(2)]],
++                             constant IvtcParams &p                 [[buffer(4)]],
++                             uint2 id                               [[thread_position_in_grid]],
++                             uint2 gid                              [[threadgroup_position_in_grid]],
++                             uint tid                               [[thread_index_in_threadgroup]])
++{
++    threadgroup float l[IVTC_NT * 6];
++    int x  = id.x;
++    int y  = id.y;
++    int width = p.width, height = p.height, hf = p.hf;
++    int kp = p.tff ? 0 : 1;              // kept parity
++    int bf = p.tff ? 1 : 0;              // borrowed parity
++    uint k, s;
++
++    float Ac = 0, Am = 0, Aml = 0, Bc = 0, Bm = 0, Bml = 0;
++    if (x >= 8 && x < width - 8 && (y & 1) == kp && y >= 2 && y < height - 2) {
++        float t1 = px(tex_a_y, x, y - 2, p) + 4.0f * px(tex_a_y, x, y, p) + px(tex_a_y, x, y + 2, p);
++        float a  = abs(3.0f * (px(tex_a_y, x, y - 1, p) + px(tex_a_y, x, y + 1, p)) - t1);
++        float b  = abs(3.0f * (px(tex_b_y, x, y - 1, p) + px(tex_b_y, x, y + 1, p)) - t1);
++        // mask flags at the two borrowed field rows adjacent to kept row y
++        int fa = (y - 1 - bf) >> 1, fb = (y + 1 - bf) >> 1;
++        uint m = 0;
++        if (fa >= 0 && fa < hf) m |= F_buf[fa * width + x];
++        if (fb >= 0 && fb < hf) m |= F_buf[fb * width + x];
++        if (a > 23.0f && (m & 1)) Ac += a;
++        if (a > 42.0f) { if (m & 2) Am += a; if (m & 4) Aml += a; }
++        if (b > 23.0f && (m & 1)) Bc += b;
++        if (b > 42.0f) { if (m & 2) Bm += b; if (m & 4) Bml += b; }
++    }
++
++    // planar layout l[k*NT + tid], same tree as the CUDA kernel
++    l[0*IVTC_NT+tid] = Ac; l[1*IVTC_NT+tid] = Am; l[2*IVTC_NT+tid] = Aml;
++    l[3*IVTC_NT+tid] = Bc; l[4*IVTC_NT+tid] = Bm; l[5*IVTC_NT+tid] = Bml;
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++    for (s = IVTC_NT / 2; s > 0; s >>= 1) {
++        if (tid < s)
++            for (k = 0; k < 6; k++)
++                l[k*IVTC_NT+tid] += l[k*IVTC_NT+tid+s];
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++    }
++    if (tid == 0) {
++        uint blk = gid.y * p.nbx + gid.x;
++        for (k = 0; k < 6; k++)
++            cmp_buf[blk*6+k] = l[k*IVTC_NT];
++    }
++}
++
++/*
++ * Luma SAD between two frames for decimation duplicate detection. Each group
++ * writes its partial sum to diff_buf[out_offset + blk]; the host reduces.
++ */
++kernel void ivtc_diff(texture2d<float, access::read> tex_a_y [[texture(0)]],
++                      texture2d<float, access::read> tex_b_y [[texture(1)]],
++                      device float *diff_buf                 [[buffer(3)]],
++                      constant IvtcParams &p                 [[buffer(4)]],
++                      uint2 id                               [[thread_position_in_grid]],
++                      uint2 gid                              [[threadgroup_position_in_grid]],
++                      uint tid                               [[thread_index_in_threadgroup]])
++{
++    threadgroup float l[IVTC_NT];
++    int x = id.x;
++    int y = id.y;
++    uint s;
++
++    float d = 0.0f;
++    if (x < p.width && y < p.height)
++        d = abs(px(tex_a_y, x, y, p) - px(tex_b_y, x, y, p));
++
++    l[tid] = d;
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++    for (s = IVTC_NT / 2; s > 0; s >>= 1) {
++        if (tid < s)
++            l[tid] += l[tid + s];
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++    }
++    if (tid == 0)
++        diff_buf[p.out_offset + gid.y * p.nbx + gid.x] = l[0];
++}
++
++/*
++ * Field weave: rows of parity `first` come from tex_a, the others from tex_b
++ * (the CUDA backend does this with pitched 2D copies).
++ */
++kernel void weave_y(texture2d<float, access::read>  tex_a_y [[texture(0)]],
++                    texture2d<float, access::read>  tex_b_y [[texture(1)]],
++                    texture2d<float, access::write> dst_y   [[texture(4)]],
++                    constant IvtcParams &p                  [[buffer(4)]],
++                    uint2 id                                [[thread_position_in_grid]])
++{
++    int x = id.x;
++    int y = id.y;
++    if (x >= p.width || y >= p.height)
++        return;
++    float v = (y & 1) == p.first ? tex_a_y.read(id).x : tex_b_y.read(id).x;
++    dst_y.write(float4(v, 0, 0, 0), id);
++}
++
++kernel void weave_uv(texture2d<float, access::read>  tex_a_uv [[texture(2)]],
++                     texture2d<float, access::read>  tex_b_uv [[texture(3)]],
++                     texture2d<float, access::write> dst_uv   [[texture(5)]],
++                     constant IvtcParams &p                   [[buffer(4)]],
++                     uint2 id                                 [[thread_position_in_grid]])
++{
++    int x = id.x;
++    int y = id.y;
++    if (x >= (p.width + 1) >> 1 || y >= (p.height + 1) >> 1)
++        return;
++    float2 v = (y & 1) == p.first ? tex_a_uv.read(id).xy : tex_b_uv.read(id).xy;
++    dst_uv.write(float4(v.x, v.y, 0, 0), id);
++}
+--- /dev/null
++++ b/libavfilter/vf_ivtc_videotoolbox.m
+@@ -0,0 +1,681 @@
++/*
++ * Copyright (c) 2026
++ *
++ * The inverse-telecine field-matching algorithm and the kernels in
++ * metal/vf_ivtc_videotoolbox.metal are ported from QSVEnc
++ * (QSVPipeline/rgy_filter_ivtc) by rigaya, used under the MIT License:
++ *     QSVEnc/NVEnc/VCEEnc, Copyright (c) 2014-2016 rigaya.
++ *     https://github.com/rigaya/QSVEnc
++ * The VideoToolbox/Metal filter scaffolding follows vf_yadif_videotoolbox.m.
++ *
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * FFmpeg is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with FFmpeg; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++/*
++ * vf_ivtc_videotoolbox -- hardware inverse telecine (field-matching) through
++ * Metal compute, on VideoToolbox (CVPixelBuffer / IOSurface) frames.
++ *
++ * The Metal backend of the shared ivtc core (ivtc_common.c), for the zero-copy
++ * VideoToolbox decode -> Metal -> present/encode chain on macOS:
++ *   -hwaccel videotoolbox -hwaccel_output_format videotoolbox ... -vf ivtc_videotoolbox
++ *
++ * Every plane is bound through CVMetalTextureCache without a copy. All work
++ * goes through one in-order command queue; the only waits are the reads of the
++ * match accumulators (one per frame) and of the decimation diffs (one per
++ * 5-frame cycle), both from shared-storage buffers. Kernel parameters travel
++ * inline with each dispatch (setBytes), so a synth still in flight never
++ * races a later analysis.
++ */
++
++#include "libavutil/avassert.h"
++#include "libavutil/common.h"
++#include "libavutil/hwcontext.h"
++#include "libavutil/hwcontext_videotoolbox.h"
++#include "libavutil/mem.h"
++#include "libavutil/objc.h"
++#include "libavutil/opt.h"
++#include "libavutil/pixdesc.h"
++
++#include "avfilter.h"
++#include "filters.h"
++#include "ivtc.h"
++#include "metal/utils.h"
++#include "video.h"
++
++extern char ff_vf_ivtc_videotoolbox_metallib_data[];
++extern unsigned int ff_vf_ivtc_videotoolbox_metallib_len;
++
++#define DIV_UP(a, b) (((a) + (b) - 1) / (b))
++
++#define IVTC_VT_POOL_SIZE 16   // cycle + dec_prev + downstream refs, like ivtc_d3d11
++
++enum { PIPE_ABSDIFF, PIPE_DIFFMAP, PIPE_COMPARE, PIPE_DIFF, PIPE_WEAVE_Y, PIPE_WEAVE_UV, PIPE_NB };
++enum { BUF_D, BUF_F, BUF_CMP, BUF_DIFF, BUF_NB };
++enum { TEX_A_Y, TEX_B_Y, TEX_A_UV, TEX_B_UV, TEX_DST_Y, TEX_DST_UV, TEX_NB };
++
++// must match struct IvtcParams in metal/vf_ivtc_videotoolbox.metal
++typedef struct IvtcVTParams {
++    int   width;
++    int   height;
++    int   hf;
++    int   tff;
++    int   nbx;
++    int   out_offset;
++    int   first;
++    int   pad0;
++    float scale;
++    float maxval;
++    float pad1;
++    float pad2;
++} IvtcVTParams;
++
++typedef struct API_AVAILABLE(macos(10.11), ios(8.0)) IvtcVTContext {
++    IVTCContext ivtc;
++
++    AVBufferRef       *device_ref;
++    AVBufferRef       *input_frames_ref;
++    AVHWFramesContext *input_frames;
++
++    id<MTLDevice>               mtlDevice;
++    id<MTLLibrary>              mtlLibrary;
++    id<MTLCommandQueue>         mtlQueue;
++    id<MTLComputePipelineState> mtlPipeline[PIPE_NB];
++    id<MTLBuffer>               mtlBuffer[BUF_NB];   // D, F (private); cmp, diff (shared, read by the host)
++    id<MTLCommandBuffer>        mtlLast;             // most recently committed, not yet waited for
++    CVMetalTextureCacheRef      textureCache;
++
++    MTLPixelFormat fmt_y;        // per-plane texture formats of sw_format
++    MTLPixelFormat fmt_uv;
++
++    int   sw_format;             // enum AVPixelFormat
++    int   pad0;
++    float scale_fm;              // raw luma -> 0..255 (fieldmatch units)
++    float scale_diff;            // raw luma -> 0..1   (decimation units)
++    float maxval;                // UNORM -> raw container integer
++    float pad1;
++} IvtcVTContext API_AVAILABLE(macos(10.11), ios(8.0));
++
++// Using sizeof(IvtcVTContext) outside of an availability check will error
++// if we're targeting an older OS version, so we need to calculate the size ourselves
++// (we'll statically verify it's correct in ivtc_videotoolbox_init behind a check)
++#define IVTC_VT_CTX_SIZE (sizeof(IVTCContext) + sizeof(void*) * (3 + 3 + PIPE_NB + BUF_NB + 1 + 1) + \
++                          sizeof(MTLPixelFormat) * 2 + sizeof(int) * 2 + sizeof(float) * 4)
++
++// ---- helpers --------------------------------------------------------------
++
++static CVPixelBufferRef ivtc_vt_pixbuf(const AVFrame *frame)
++{
++    return (CVPixelBufferRef)frame->data[3];
++}
++
++// Y (plane 0) or UV (plane 1) texture of a frame; the CVMetalTextureRef keeps
++// the MTLTexture alive and must outlive the command buffer that reads it.
++static CVMetalTextureRef ivtc_vt_plane(AVFilterContext *avctx, const AVFrame *frame, int plane)
++    API_AVAILABLE(macos(10.11), ios(8.0))
++{
++    IvtcVTContext *ctx = avctx->priv;
++    return ff_metal_texture_from_pixbuf(avctx, ctx->textureCache, ivtc_vt_pixbuf(frame), plane,
++                                        plane ? ctx->fmt_uv : ctx->fmt_y);
++}
++
++static void ivtc_vt_release(CVMetalTextureRef *refs, int n)
++{
++    for (int i = 0; i < n; i++) {
++        if (refs[i])
++            CFRelease(refs[i]);
++        refs[i] = NULL;
++    }
++}
++
++// One IVTC_WG x IVTC_WG threadgroup grid of `pipe` over the bound textures,
++// all four buffers and the inline parameters.
++static void ivtc_vt_dispatch(IvtcVTContext *ctx, id<MTLCommandBuffer> cb, int pipe,
++                             CVMetalTextureRef const tex[TEX_NB], const IvtcVTParams *params,
++                             int grid_x, int grid_y) API_AVAILABLE(macos(10.11), ios(8.0))
++{
++    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
++    [enc setComputePipelineState:ctx->mtlPipeline[pipe]];
++    for (int i = 0; i < TEX_NB; i++)
++        if (tex[i])
++            [enc setTexture:CVMetalTextureGetTexture(tex[i]) atIndex:i];
++    for (int i = 0; i < BUF_NB; i++)
++        [enc setBuffer:ctx->mtlBuffer[i] offset:0 atIndex:i];
++    [enc setBytes:params length:sizeof(*params) atIndex:BUF_NB];
++    [enc dispatchThreadgroups:MTLSizeMake(grid_x, grid_y, 1)
++        threadsPerThreadgroup:MTLSizeMake(IVTC_WG, IVTC_WG, 1)];
++    [enc endEncoding];
++}
++
++// Commit, remember as the newest in-flight buffer; the texture refs are
++// released once the GPU is done with them.
++static void ivtc_vt_commit(IvtcVTContext *ctx, id<MTLCommandBuffer> cb,
++                           CVMetalTextureRef const tex[TEX_NB]) API_AVAILABLE(macos(10.11), ios(8.0))
++{
++    CVMetalTextureRef t0 = tex[0], t1 = tex[1], t2 = tex[2], t3 = tex[3], t4 = tex[4], t5 = tex[5];
++    [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
++        (void)done;
++        if (t0) CFRelease(t0);
++        if (t1) CFRelease(t1);
++        if (t2) CFRelease(t2);
++        if (t3) CFRelease(t3);
++        if (t4) CFRelease(t4);
++        if (t5) CFRelease(t5);
++    }];
++    [cb commit];
++    ff_objc_release(&ctx->mtlLast);
++    ctx->mtlLast = [cb retain];
++}
++
++// Block until the newest command buffer has executed; command buffers on one
++// queue complete in commit order, so everything older is done too.
++static int ivtc_vt_wait(AVFilterContext *avctx) API_AVAILABLE(macos(10.11), ios(8.0))
++{
++    IvtcVTContext *ctx = avctx->priv;
++    id<MTLCommandBuffer> cb = ctx->mtlLast;
++    if (!cb)
++        return 0;
++    [cb waitUntilCompleted];
++    if (cb.status == MTLCommandBufferStatusError) {
++        av_log(avctx, AV_LOG_ERROR, "Metal command buffer failed: %s\n",
++               cb.error ? cb.error.localizedDescription.UTF8String : "unknown error");
++        ff_objc_release(&ctx->mtlLast);
++        return AVERROR_EXTERNAL;
++    }
++    ff_objc_release(&ctx->mtlLast);
++    return 0;
++}
++
++static void ivtc_vt_sync(AVFilterContext *avctx)
++{
++    if (@available(macOS 10.11, iOS 8.0, *)) {
++        @autoreleasepool {
++            ivtc_vt_wait(avctx);
++        }
++    }
++}
++
++// ---- one-time GPU init (pipelines, score/diff buffers) --------------------
++
++static int ivtc_init_metal(AVFilterContext *avctx) API_AVAILABLE(macos(10.11), ios(8.0))
++{
++    IvtcVTContext *ctx = avctx->priv;
++    IVTCContext *s = &ctx->ivtc;
++    static const char *const names[PIPE_NB] = {
++        [PIPE_ABSDIFF]  = "fm_absdiff",
++        [PIPE_DIFFMAP]  = "fm_diffmap",
++        [PIPE_COMPARE]  = "fm_compare_accum",
++        [PIPE_DIFF]     = "ivtc_diff",
++        [PIPE_WEAVE_Y]  = "weave_y",
++        [PIPE_WEAVE_UV] = "weave_uv",
++    };
++    NSUInteger field_px = (NSUInteger)s->luma_w * s->luma_hf;
++    NSError *err = nil;
++    CVReturn cvret;
++    int i;
++
++    ctx->mtlDevice = MTLCreateSystemDefaultDevice();
++    if (!ctx->mtlDevice) {
++        av_log(avctx, AV_LOG_ERROR, "Unable to find Metal device\n");
++        return AVERROR_EXTERNAL;
++    }
++    av_log(avctx, AV_LOG_VERBOSE, "Using Metal device: %s\n", ctx->mtlDevice.name.UTF8String);
++
++    {
++        dispatch_data_t libData = dispatch_data_create(ff_vf_ivtc_videotoolbox_metallib_data,
++                                                       ff_vf_ivtc_videotoolbox_metallib_len, nil, nil);
++        ctx->mtlLibrary = [ctx->mtlDevice newLibraryWithData:libData error:&err];
++        dispatch_release(libData);
++    }
++    if (err || !ctx->mtlLibrary) {
++        av_log(avctx, AV_LOG_ERROR, "Failed to load Metal library: %s\n",
++               err ? err.description.UTF8String : "unknown error");
++        return AVERROR_EXTERNAL;
++    }
++
++    for (i = 0; i < PIPE_NB; i++) {
++        id<MTLFunction> fn = [ctx->mtlLibrary newFunctionWithName:[NSString stringWithUTF8String:names[i]]];
++        if (!fn) {
++            av_log(avctx, AV_LOG_ERROR, "Metal function %s not found\n", names[i]);
++            return AVERROR_EXTERNAL;
++        }
++        ctx->mtlPipeline[i] = [ctx->mtlDevice newComputePipelineStateWithFunction:fn error:&err];
++        [fn release];
++        if (err || !ctx->mtlPipeline[i]) {
++            av_log(avctx, AV_LOG_ERROR, "Failed to create Metal pipeline %s: %s\n", names[i],
++                   err ? err.description.UTF8String : "unknown error");
++            return AVERROR_EXTERNAL;
++        }
++        if (ctx->mtlPipeline[i].maxTotalThreadsPerThreadgroup < IVTC_WG * IVTC_WG) {
++            av_log(avctx, AV_LOG_ERROR, "Metal pipeline %s allows only %lu threads per group, need %d\n",
++                   names[i], (unsigned long)ctx->mtlPipeline[i].maxTotalThreadsPerThreadgroup,
++                   IVTC_WG * IVTC_WG);
++            return AVERROR_EXTERNAL;
++        }
++    }
++
++    ctx->mtlQueue = [ctx->mtlDevice newCommandQueue];
++    if (!ctx->mtlQueue) {
++        av_log(avctx, AV_LOG_ERROR, "Failed to create Metal command queue\n");
++        return AVERROR_EXTERNAL;
++    }
++
++    ctx->mtlBuffer[BUF_D]    = [ctx->mtlDevice newBufferWithLength:FFMAX(field_px, 1) * sizeof(uint32_t)
++                                                           options:MTLResourceStorageModePrivate];
++    ctx->mtlBuffer[BUF_F]    = [ctx->mtlDevice newBufferWithLength:FFMAX(field_px, 1) * sizeof(uint32_t)
++                                                           options:MTLResourceStorageModePrivate];
++    ctx->mtlBuffer[BUF_CMP]  = [ctx->mtlDevice newBufferWithLength:(NSUInteger)s->nwg * 6 * sizeof(float)
++                                                           options:MTLResourceStorageModeShared];
++    ctx->mtlBuffer[BUF_DIFF] = [ctx->mtlDevice newBufferWithLength:(NSUInteger)s->nwg * IVTC_CYCLE * sizeof(float)
++                                                           options:MTLResourceStorageModeShared];
++    for (i = 0; i < BUF_NB; i++) {
++        if (!ctx->mtlBuffer[i]) {
++            av_log(avctx, AV_LOG_ERROR, "Failed to create Metal buffer %d\n", i);
++            return AVERROR_EXTERNAL;
++        }
++    }
++    memset(ctx->mtlBuffer[BUF_DIFF].contents, 0, ctx->mtlBuffer[BUF_DIFF].length);
++
++    cvret = CVMetalTextureCacheCreate(NULL, NULL, ctx->mtlDevice, NULL, &ctx->textureCache);
++    if (cvret != kCVReturnSuccess) {
++        av_log(avctx, AV_LOG_ERROR, "Failed to create CVMetalTextureCache: %d\n", cvret);
++        return AVERROR_EXTERNAL;
++    }
++    return 0;
++}
++
++static int ivtc_vt_init_gpu(AVFilterContext *avctx)
++{
++    if (@available(macOS 10.11, iOS 8.0, *)) {
++        @autoreleasepool {
++            return ivtc_init_metal(avctx);
++        }
++    }
++    return AVERROR(ENOSYS);
++}
++
++// ---- GPU hooks ------------------------------------------------------------
++
++// compare_fields accumulators (C vs P) in three chained kernels, then one
++// blocking read of the per-group partials, summed here.
++static int ivtc_vt_match_accum(AVFilterContext *avctx, AVFrame *prevf, AVFrame *curf,
++                               AVFrame *nextf, int tff, double A[3], double B[3])
++{
++    IvtcVTContext *ctx = avctx->priv;
++    IVTCContext *s = &ctx->ivtc;
++    IvtcVTParams params = {
++        .width  = s->luma_w,
++        .height = s->luma_h,
++        .hf     = s->luma_hf,
++        .tff    = tff,
++        .nbx    = s->nwgx,
++        .scale  = ctx->scale_fm,
++        .maxval = ctx->maxval,
++    };
++    int w = s->luma_w, hf = s->luma_hf;
++    int ret, i;
++
++    (void)nextf;
++
++    if (@available(macOS 10.11, iOS 8.0, *)) {
++        @autoreleasepool {
++            CVMetalTextureRef tex[TEX_NB] = { NULL };
++            id<MTLCommandBuffer> cb;
++
++            tex[TEX_A_Y] = ivtc_vt_plane(avctx, curf, 0);
++            tex[TEX_B_Y] = ivtc_vt_plane(avctx, prevf, 0);
++            if (!tex[TEX_A_Y] || !tex[TEX_B_Y]) {
++                ivtc_vt_release(tex, TEX_NB);
++                return AVERROR_EXTERNAL;
++            }
++
++            cb = [ctx->mtlQueue commandBuffer];
++            if (hf > 0) {
++                ivtc_vt_dispatch(ctx, cb, PIPE_ABSDIFF, tex, &params, DIV_UP(w, IVTC_WG), DIV_UP(hf, IVTC_WG));
++                ivtc_vt_dispatch(ctx, cb, PIPE_DIFFMAP, tex, &params, DIV_UP(w, IVTC_WG), DIV_UP(hf, IVTC_WG));
++            }
++            ivtc_vt_dispatch(ctx, cb, PIPE_COMPARE, tex, &params, s->nwgx, s->nwgy);
++            ivtc_vt_commit(ctx, cb, tex);   // owns the texture refs from here
++            if ((ret = ivtc_vt_wait(avctx)) < 0)
++                return ret;
++
++            const float *cmp = ctx->mtlBuffer[BUF_CMP].contents;
++            for (i = 0; i < s->nwg; i++) {
++                A[0] += cmp[i*6+0]; A[1] += cmp[i*6+1]; A[2] += cmp[i*6+2];
++                B[0] += cmp[i*6+3]; B[1] += cmp[i*6+4]; B[2] += cmp[i*6+5];
++            }
++        }
++        return 0;
++    }
++    return AVERROR(ENOSYS);
++}
++
++// Weave the chosen match into dst (all planes), candidate geometry as in
++// opencl/ivtc.cl: C keeps cur; P/N keep cur's first field and borrow the
++// second from prev/next; B/U keep cur's second field and borrow the first.
++static int ivtc_vt_synth(AVFilterContext *avctx, AVFrame *dst, AVFrame *prev,
++                         AVFrame *cur, AVFrame *next, int tff, int match)
++{
++    IvtcVTContext *ctx = avctx->priv;
++    IVTCContext *s = &ctx->ivtc;
++    IvtcVTParams params = {
++        .width  = s->luma_w,
++        .height = s->luma_h,
++        .first  = tff ? 0 : 1,   // parity of the first (top) field rows
++    };
++    AVFrame *src_first, *src_second;
++
++    switch (match) {
++    case 1:  src_first = cur;  src_second = prev; break; // P
++    case 2:  src_first = cur;  src_second = next; break; // N
++    case 3:  src_first = prev; src_second = cur;  break; // B
++    case 4:  src_first = next; src_second = cur;  break; // U
++    default: src_first = cur;  src_second = cur;  break; // C
++    }
++
++    if (@available(macOS 10.11, iOS 8.0, *)) {
++        @autoreleasepool {
++            CVMetalTextureRef tex[TEX_NB] = { NULL };
++            id<MTLCommandBuffer> cb;
++            int i;
++
++            tex[TEX_A_Y]    = ivtc_vt_plane(avctx, src_first,  0);
++            tex[TEX_B_Y]    = ivtc_vt_plane(avctx, src_second, 0);
++            tex[TEX_A_UV]   = ivtc_vt_plane(avctx, src_first,  1);
++            tex[TEX_B_UV]   = ivtc_vt_plane(avctx, src_second, 1);
++            tex[TEX_DST_Y]  = ivtc_vt_plane(avctx, dst, 0);
++            tex[TEX_DST_UV] = ivtc_vt_plane(avctx, dst, 1);
++            for (i = 0; i < TEX_NB; i++) {
++                if (!tex[i]) {
++                    ivtc_vt_release(tex, TEX_NB);
++                    return AVERROR_EXTERNAL;
++                }
++            }
++
++            cb = [ctx->mtlQueue commandBuffer];
++            if (src_first == src_second) {
++                // C: a plain copy, on the GPU so it is ordered with the rest
++                id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
++                for (i = 0; i < 2; i++) {
++                    id<MTLTexture> from = CVMetalTextureGetTexture(tex[i ? TEX_A_UV : TEX_A_Y]);
++                    id<MTLTexture> to   = CVMetalTextureGetTexture(tex[i ? TEX_DST_UV : TEX_DST_Y]);
++                    [blit copyFromTexture:from sourceSlice:0 sourceLevel:0
++                             sourceOrigin:MTLOriginMake(0, 0, 0)
++                               sourceSize:MTLSizeMake(from.width, from.height, 1)
++                                toTexture:to destinationSlice:0 destinationLevel:0
++                        destinationOrigin:MTLOriginMake(0, 0, 0)];
++                }
++                [blit endEncoding];
++            } else {
++                ivtc_vt_dispatch(ctx, cb, PIPE_WEAVE_Y, tex, &params,
++                                 DIV_UP(s->luma_w, IVTC_WG), DIV_UP(s->luma_h, IVTC_WG));
++                ivtc_vt_dispatch(ctx, cb, PIPE_WEAVE_UV, tex, &params,
++                                 DIV_UP((s->luma_w + 1) >> 1, IVTC_WG), DIV_UP((s->luma_h + 1) >> 1, IVTC_WG));
++            }
++            ivtc_vt_commit(ctx, cb, tex);   // no wait: the core holds the input refs until the next read
++        }
++        CVBufferPropagateAttachments(ivtc_vt_pixbuf(cur), ivtc_vt_pixbuf(dst));
++        return 0;
++    }
++    return AVERROR(ENOSYS);
++}
++
++// ivtc_diff emits one abs-diff sum per 16x16 group into its slice; all
++// dispatches are enqueued first, then ONE blocking read of the whole buffer.
++static int ivtc_vt_diff_cycle(AVFilterContext *avctx, AVFrame *const a[IVTC_CYCLE],
++                              AVFrame *const b[IVTC_CYCLE], const float **sums, int *stride)
++{
++    IvtcVTContext *ctx = avctx->priv;
++    IVTCContext *s = &ctx->ivtc;
++    IvtcVTParams params = {
++        .width  = s->luma_w,
++        .height = s->luma_h,
++        .nbx    = s->nwgx,
++        .scale  = ctx->scale_diff,
++        .maxval = ctx->maxval,
++    };
++    int ret, i;
++
++    if (@available(macOS 10.11, iOS 8.0, *)) {
++        @autoreleasepool {
++            CVMetalTextureRef refs[IVTC_CYCLE][2] = { { NULL } };
++            id<MTLCommandBuffer> cb = [ctx->mtlQueue commandBuffer];
++
++            for (i = 0; i < IVTC_CYCLE; i++) {
++                CVMetalTextureRef tex[TEX_NB] = { NULL };
++                if (!b[i])
++                    continue;
++                refs[i][0] = ivtc_vt_plane(avctx, a[i], 0);
++                refs[i][1] = ivtc_vt_plane(avctx, b[i], 0);
++                if (!refs[i][0] || !refs[i][1]) {
++                    ret = AVERROR_EXTERNAL;
++                    goto fail;
++                }
++                tex[TEX_A_Y] = refs[i][0];
++                tex[TEX_B_Y] = refs[i][1];
++                params.out_offset = i * s->nwg;
++                ivtc_vt_dispatch(ctx, cb, PIPE_DIFF, tex, &params, s->nwgx, s->nwgy);
++            }
++            {
++                CVMetalTextureRef none[TEX_NB] = { NULL };
++                ivtc_vt_commit(ctx, cb, none);
++            }
++            ret = ivtc_vt_wait(avctx);
++        fail:
++            for (i = 0; i < IVTC_CYCLE; i++)
++                ivtc_vt_release(refs[i], 2);
++            if (ret < 0)
++                return ret;
++        }
++        *sums   = ctx->mtlBuffer[BUF_DIFF].contents;
++        *stride = s->nwg;
++        return 0;
++    }
++    return AVERROR(ENOSYS);
++}
++
++// ---- filter plumbing ------------------------------------------------------
++
++static int ivtc_config_input(AVFilterLink *inlink)
++{
++    FilterLink          *l = ff_filter_link(inlink);
++    AVFilterContext *avctx = inlink->dst;
++    IvtcVTContext     *ctx = avctx->priv;
++
++    if (!l->hw_frames_ctx) {
++        av_log(avctx, AV_LOG_ERROR, "ivtc_videotoolbox requires a VideoToolbox hardware frames "
++               "context on the input (decode with -hwaccel_output_format videotoolbox, "
++               "or insert hwupload).\n");
++        return AVERROR(EINVAL);
++    }
++
++    av_buffer_unref(&ctx->input_frames_ref);
++    ctx->input_frames_ref = av_buffer_ref(l->hw_frames_ctx);
++    if (!ctx->input_frames_ref)
++        return AVERROR(ENOMEM);
++    ctx->input_frames = (AVHWFramesContext*)ctx->input_frames_ref->data;
++    if (ctx->input_frames->format != AV_PIX_FMT_VIDEOTOOLBOX)
++        return AVERROR(EINVAL);
++    if (ctx->input_frames->sw_format != AV_PIX_FMT_NV12 &&
++        ctx->input_frames->sw_format != AV_PIX_FMT_P010) {
++        av_log(avctx, AV_LOG_ERROR, "ivtc_videotoolbox supports NV12 and P010 only, got %s\n",
++               av_get_pix_fmt_name(ctx->input_frames->sw_format));
++        return AVERROR(ENOSYS);
++    }
++
++    av_log(avctx, AV_LOG_INFO, "ivtc_videotoolbox: %dx%d sw_format %s.\n",
++           inlink->w, inlink->h, av_get_pix_fmt_name(ctx->input_frames->sw_format));
++    return 0;
++}
++
++static int ivtc_config_output(AVFilterLink *outlink)
++{
++    FilterLink           *l = ff_filter_link(outlink);
++    AVFilterContext  *avctx = outlink->src;
++    AVFilterLink    *inlink = avctx->inputs[0];
++    IvtcVTContext      *ctx = avctx->priv;
++    const AVPixFmtDescriptor *desc;
++    AVHWFramesContext *output_frames;
++    int ret;
++
++    av_assert0(ctx->input_frames);
++    ctx->sw_format = ctx->input_frames->sw_format;
++    if (ctx->sw_format == AV_PIX_FMT_P010) {
++        ctx->fmt_y  = MTLPixelFormatR16Unorm;
++        ctx->fmt_uv = MTLPixelFormatRG16Unorm;
++    } else {
++        ctx->fmt_y  = MTLPixelFormatR8Unorm;
++        ctx->fmt_uv = MTLPixelFormatRG8Unorm;
++    }
++
++    // luma scale for the kernels: same values as ivtc_cuda / ivtc_d3d11,
++    // applied to the whole container integer recovered from the UNORM read
++    desc = av_pix_fmt_desc_get(ctx->sw_format);
++    {
++        double maxval = (double)((1 << (desc->comp[0].depth + desc->comp[0].shift)) - 1);
++        ctx->maxval     = (float)maxval;
++        ctx->scale_fm   = (float)(255.0 / maxval);
++        ctx->scale_diff = (float)(1.0 / maxval);
++    }
++
++    av_buffer_unref(&ctx->device_ref);
++    ctx->device_ref = av_buffer_ref(ctx->input_frames->device_ref);
++    if (!ctx->device_ref)
++        return AVERROR(ENOMEM);
++
++    // own fixed-size output pool (same sw_format), so the woven frames can go
++    // straight to the presenter or encoder
++    av_buffer_unref(&l->hw_frames_ctx);
++    l->hw_frames_ctx = av_hwframe_ctx_alloc(ctx->device_ref);
++    if (!l->hw_frames_ctx)
++        return AVERROR(ENOMEM);
++    output_frames = (AVHWFramesContext*)l->hw_frames_ctx->data;
++    output_frames->format    = AV_PIX_FMT_VIDEOTOOLBOX;
++    output_frames->sw_format = ctx->sw_format;
++    output_frames->width     = inlink->w;
++    output_frames->height    = inlink->h;
++    ((AVVTFramesContext *)output_frames->hwctx)->color_range =
++        ((AVVTFramesContext *)ctx->input_frames->hwctx)->color_range;
++
++    if ((ret = ff_filter_init_hw_frames(avctx, outlink, IVTC_VT_POOL_SIZE)) < 0)
++        return ret;
++    ret = av_hwframe_ctx_init(l->hw_frames_ctx);
++    if (ret < 0) {
++        av_buffer_unref(&l->hw_frames_ctx);
++        av_log(avctx, AV_LOG_ERROR, "Failed to initialise VideoToolbox frame "
++               "context for output: %d\n", ret);
++        return ret;
++    }
++
++    outlink->w = inlink->w;
++    outlink->h = inlink->h;
++    return ff_ivtc_config_output_common(outlink);
++}
++
++static int ivtc_init(AVFilterContext *avctx)
++{
++    IvtcVTContext *ctx = avctx->priv;
++    IVTCContext *s = &ctx->ivtc;
++
++    if (@available(macOS 10.11, iOS 8.0, *)) {
++        // Ensure we calculated IVTC_VT_CTX_SIZE correctly
++        static_assert(IVTC_VT_CTX_SIZE == sizeof(IvtcVTContext), "Incorrect IVTC_VT_CTX_SIZE value!");
++    } else {
++        av_log(avctx, AV_LOG_ERROR, "Metal is not available on this OS version\n");
++        return AVERROR(ENOSYS);
++    }
++
++    ff_ivtc_init_common(avctx);
++    s->init        = ivtc_vt_init_gpu;
++    s->match_accum = ivtc_vt_match_accum;
++    s->synth       = ivtc_vt_synth;
++    s->diff_cycle  = ivtc_vt_diff_cycle;
++    s->sync        = ivtc_vt_sync;
++    return 0;
++}
++
++static av_cold void ivtc_uninit_metal(AVFilterContext *avctx) API_AVAILABLE(macos(10.11), ios(8.0))
++{
++    IvtcVTContext *ctx = avctx->priv;
++    int i;
++
++    ff_objc_release(&ctx->mtlLast);
++    for (i = 0; i < BUF_NB; i++)
++        ff_objc_release(&ctx->mtlBuffer[i]);
++    for (i = 0; i < PIPE_NB; i++)
++        ff_objc_release(&ctx->mtlPipeline[i]);
++    ff_objc_release(&ctx->mtlQueue);
++    ff_objc_release(&ctx->mtlLibrary);
++    ff_objc_release(&ctx->mtlDevice);
++    if (ctx->textureCache) {
++        CFRelease(ctx->textureCache);
++        ctx->textureCache = NULL;
++    }
++}
++
++static av_cold void ivtc_uninit(AVFilterContext *avctx)
++{
++    IvtcVTContext *ctx = avctx->priv;
++
++    ff_ivtc_uninit_common(avctx);   // syncs the GPU first
++    if (@available(macOS 10.11, iOS 8.0, *)) {
++        @autoreleasepool {
++            ivtc_uninit_metal(avctx);
++        }
++    }
++
++    av_buffer_unref(&ctx->device_ref);
++    av_buffer_unref(&ctx->input_frames_ref);
++    ctx->input_frames = NULL;
++}
++
++static const AVOption ivtc_videotoolbox_options[] = {
++    IVTC_COMMON_OPTIONS
++    { NULL }
++};
++
++AVFILTER_DEFINE_CLASS(ivtc_videotoolbox);
++
++static const AVFilterPad ivtc_videotoolbox_inputs[] = {
++    {
++        .name         = "default",
++        .type         = AVMEDIA_TYPE_VIDEO,
++        .config_props = &ivtc_config_input,
++    },
++};
++
++static const AVFilterPad ivtc_videotoolbox_outputs[] = {
++    {
++        .name         = "default",
++        .type         = AVMEDIA_TYPE_VIDEO,
++        .config_props = &ivtc_config_output,
++    },
++};
++
++const FFFilter ff_vf_ivtc_videotoolbox = {
++    .p.name         = "ivtc_videotoolbox",
++    .p.description  = NULL_IF_CONFIG_SMALL("Inverse telecine (field matching) for VideoToolbox frames using Metal compute."),
++    .p.priv_class   = &ivtc_videotoolbox_class,
++    .p.flags        = AVFILTER_FLAG_HWDEVICE,
++    .priv_size      = IVTC_VT_CTX_SIZE,
++    .init           = &ivtc_init,
++    .uninit         = &ivtc_uninit,
++    .activate       = &ff_ivtc_activate,
++    FILTER_INPUTS(ivtc_videotoolbox_inputs),
++    FILTER_OUTPUTS(ivtc_videotoolbox_outputs),
++    FILTER_SINGLE_PIXFMT(AV_PIX_FMT_VIDEOTOOLBOX),
++    .flags_internal = FF_FILTER_FLAG_HWFRAME_AWARE,
++};

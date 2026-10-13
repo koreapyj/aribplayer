@@ -237,7 +237,7 @@ TEST_CASE(Settings_currentPlaylist_round_trips_and_defaults_empty_when_missing) 
 TEST_CASE(Settings_subtitle_style_defaults_round_trip_and_clamp) {
     AppSettings d;
     CHECK(d.subtitle.useSystemCaptionStyle);
-    CHECK(d.subtitle.font == "Malgun Gothic");
+    CHECK(d.subtitle.font == WVP_DEFAULT_SUBTITLE_FONT);
     CHECK(d.subtitle.fontWeight == 400 && !d.subtitle.italic);
     CHECK(d.subtitle.fontSizePt == 45.0);
     CHECK(d.subtitle.primaryRgba == 0xFFFFFFFFu && d.subtitle.outlineRgba == 0x000000FFu);
@@ -260,7 +260,7 @@ TEST_CASE(Settings_subtitle_style_defaults_round_trip_and_clamp) {
 
     AppSettings clamped;
     CHECK(SettingsStore::FromJson("{\"subtitle\":{\"font\":\"\",\"fontSize\":999,\"fontWeight\":5000,\"outlineWidth\":-4}}", clamped));
-    CHECK(clamped.subtitle.font == "Malgun Gothic");
+    CHECK(clamped.subtitle.font == WVP_DEFAULT_SUBTITLE_FONT);
     CHECK(clamped.subtitle.fontSizePt == 400.0);
     CHECK(clamped.subtitle.fontWeight == 900);
     CHECK(clamped.subtitle.outlineWidth == 0.0);

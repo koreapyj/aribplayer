@@ -10,12 +10,18 @@
 #include <optional>
 #include <string>
 
+#if defined(__APPLE__)
+#define WVP_DEFAULT_SUBTITLE_FONT "Apple SD Gothic Neo"
+#else
+#define WVP_DEFAULT_SUBTITLE_FONT "Malgun Gothic"
+#endif
+
 namespace wvp {
 
 /// Settings > Subtitles.
 struct SubtitleStyle {
     bool useSystemCaptionStyle = true;    // the Windows caption settings are the source; the values below are unused
-    std::string font = "Malgun Gothic";
+    std::string font = WVP_DEFAULT_SUBTITLE_FONT;
     int fontWeight = 400;                 // 100 .. 900
     bool italic = false;
     double fontSizePt = 45;               // points at 1080 video lines, scaled with the video (45 = the decoders' default)
@@ -43,7 +49,7 @@ struct SubtitleRenderStyle {
     unsigned overrideFlags = 0;   // replace the track's value on plain-text tracks, and on ASS/SSA tracks with applyToAss
     unsigned fallbackFlags = 0;   // replace it on plain-text tracks only
     bool applyToAss = false;
-    std::string font = "Malgun Gothic";   // also the renderer's default family
+    std::string font = WVP_DEFAULT_SUBTITLE_FONT;   // also the renderer's default family
     int fontWeight = 400;
     bool italic = false;
     double fontSizePt = 0;        // 0 = the track's size
