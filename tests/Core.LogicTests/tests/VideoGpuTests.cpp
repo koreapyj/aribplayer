@@ -63,16 +63,10 @@ TEST_CASE(VideoGpu_igpu_without_av1_moves_av1_to_dgpu_only) {
     CHECK_EQ(SelectVideoGpu({ Igpu(false), Dgpu() }, kIgpu, {}, Req("h264")).index, 0);
 }
 
-TEST_CASE(VideoGpu_desktop_dgpu_display_picks_dgpu_with_a_forced_decoder) {
+TEST_CASE(VideoGpu_desktop_dgpu_display_picks_dgpu) {
     VideoGpuChoice ch = SelectVideoGpu({ Igpu(), Dgpu() }, kDgpu, {}, Req("h264"));
     CHECK_EQ(ch.index, 1);
     CHECK(!ch.crossAdapter);
-    PlanRequest forced = Req("h264");
-    forced.decoder = DecoderPref::Forced;
-    forced.forcedDecoder = "d3d12va";
-    VideoGpuChoice c = SelectVideoGpu({ Igpu(), Dgpu() }, kDgpu, {}, forced);
-    CHECK_EQ(c.index, 1);
-    CHECK_EQ(c.plan.hwaccel, std::string("d3d12va"));
 }
 
 TEST_CASE(VideoGpu_tie_prefers_display_then_order) {

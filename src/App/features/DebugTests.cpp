@@ -425,8 +425,6 @@ LOGIC_TEST(log_open_hook_hardware_decoding_and_vf) {
     OpenRecorder rec;
     wvp::PlaybackController ctl(rec);
     wvp::FilterManager fm;
-    wvp::PlanPrefs pp = wvp::PlanPrefsFor("d3d11va");
-    (void)fm.SetPlanPreferences(pp.decoder, pp.forcedDecoder);
     (void)fm.SetCapabilities(wvp::fakecaps::Intel());
     wvp::FilterSettings fs;
     fs.deinterlace = wvp::DeinterlaceMode::On;
@@ -450,8 +448,7 @@ LOGIC_TEST(log_open_hook_hardware_decoding_and_vf) {
     bool foundVf = false;
     for (auto& kv : seen) if (kv.first == "vf" && kv.second == vf) foundVf = true;
     LT_CHECK(foundVf);
-    pp = wvp::PlanPrefsFor("off");
-    (void)fm.SetPlanPreferences(pp.decoder, pp.forcedDecoder);
+    (void)fm.SetCapabilities(wvp::WithoutHardwareDevices(wvp::fakecaps::Intel(), "device lost"));
     ctl.PlayAt(0);
     LT_CHECK(rec.opened.back().second.size() >= 1);
     for (auto& kv : rec.opened.back().second) LT_CHECK(kv.first != "hwaccel");

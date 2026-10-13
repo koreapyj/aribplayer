@@ -347,21 +347,6 @@ private:
             Commit();
         };
 
-        auto* hw = Row(pui::glyph::VideoSettings, Tr(L"Hardware decoding", L"하드웨어 디코딩"),
-                       Tr(L"Auto lets the pipeline planner pick the decoder with the fewest copies, software included; Prefer GPU always uses a GPU decoder when one fits. Changing it re-opens the current item at the same position", L"자동은 파이프라인 계획기가 소프트웨어를 포함해 복사가 가장 적은 디코더를 고르게 하며, GPU 우선은 맞는 GPU 디코더가 있으면 항상 사용합니다. 변경하면 현재 항목이 같은 위치에서 다시 열립니다"), true);
-        auto hwGroup = std::make_unique<pui::RadioGroup>();
-        hwGroup->SetHorizontal(true);
-        hwGroup->SetName(Tr(L"Hardware decoding", L"하드웨어 디코딩"));
-        hwGroup->SetAutomationId(L"HardwareDecodingGroup");
-        for (const auto& ch : sl::HwDecoderChoices()) hwGroup->AddOption(ch.label)->SetName(ch.label);
-        hwGroup->SetSelectedIndex(state_.hwDecoderIndex);
-        auto* hwCtl = hw->SetControl(std::move(hwGroup));
-        hwCtl->onSelectionChanged = [this](int i) {
-            if (i < 0) return;
-            state_.hwDecoderIndex = i;
-            Commit();
-        };
-
         auto* gpu = Row(pui::glyph::VideoSettings, Tr(L"Video GPU", L"영상 GPU"),
                         Tr(L"Automatic picks the GPU with the fewest copies, preferring the one driving this window's monitor. A specific GPU always wins (e.g. for speed); if it is missing, Automatic is used until it returns", L"자동은 복사가 가장 적은 GPU를 고르며, 이 창의 모니터를 구동하는 GPU를 우선합니다. 특정 GPU를 선택하면 항상 그 GPU가 우선하며(예: 속도), 없으면 다시 나타날 때까지 자동이 사용됩니다"), true);
         gpus_ = ctx_.VideoGpus();

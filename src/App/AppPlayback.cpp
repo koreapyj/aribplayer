@@ -776,14 +776,6 @@ void App::Execute(CommandId c) {
     case C::FocusPlaylistSearch: FocusPlaylistSearch(); break;
     case C::CycleAlwaysOnTop: CycleAlwaysOnTop(); break;
     case C::ToggleTimeMode: ToggleTimeMode(); break;
-    case C::ToggleHwDecoding: {   // bar H/W | S/W chip: the configured decoder <-> off, same path as Settings > Playback > Hardware decoding
-        wvp::AppSettings& s = svc_->settings;
-        if (s.hwDecoder != "off") { s.hwDecoderLastOn = s.hwDecoder; s.hwDecoder = "off"; }
-        else s.hwDecoder = wvp::IsValidHwDecoder(s.hwDecoderLastOn) && s.hwDecoderLastOn != "off" ? s.hwDecoderLastOn : "auto";
-        OnSettingsChanged(*this);
-        SyncModel();
-        break;
-    }
     case C::ToggleMute: if (ctl_) { ctl_->SetMuted(!ctl_->IsMuted()); SyncModel(); } break;
     case C::VolumeUp: AdjustVolume(5); break;
     case C::VolumeDown: AdjustVolume(-5); break;

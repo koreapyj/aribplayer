@@ -57,6 +57,10 @@ FilterCap* FindFilter(CapabilitySet& c, const std::string& n) {
 void RemoveFilter(CapabilitySet& c, const std::string& n) {
     c.filters.erase(std::remove_if(c.filters.begin(), c.filters.end(), [&](const FilterCap& f) { return f.name == n; }), c.filters.end());
 }
+CapabilitySet WithoutDecoders(CapabilitySet c) {
+    c.decoders.clear();
+    return c;
+}
 
 }
 
@@ -81,9 +85,6 @@ TEST_CASE(Plan_nvidia_cases) {
     Plan c = Run(nv, Req(Case::C));
     Expect(c, 0, 0, "d3d11va", true, "d3d11", kSetpts);
     CHECK(c.filterHwDevice.empty());
-    PlanRequest r = Req(Case::A);
-    r.decoder = DecoderPref::PreferGpu;
-    Expect(Run(nv, r), 0, 0, "d3d11va", true, "d3d11", "ivtc_d3d11");
 }
 
 TEST_CASE(Plan_nvidia_presenter_variants) {
@@ -123,9 +124,7 @@ TEST_CASE(Plan_ivtc_d3d11_is_zero_copy) {
         for (auto& s : a.steps) download = download || s.name == "hwdownload";
         CHECK(!download);
 
-        PlanRequest sw = Req(Case::A);
-        sw.decoder = DecoderPref::Software;
-        Plan b = Run(caps, sw);
+        Plan b = Run(WithoutDecoders(caps), Req(Case::A));
         CHECK(b.ok);
         CHECK(b.hwaccel.empty());
         CHECK_EQ(b.cost.hostCopies, 1);
@@ -192,50 +191,22 @@ TEST_CASE(Plan_blacklist) {
     }
 }
 
-TEST_CASE(Plan_decoder_preferences) {
-    CapabilitySet intel = fakecaps::Intel();
-    {
-        PlanRequest r = Req(Case::A);
-        r.decoder = DecoderPref::PreferGpu;
-        Expect(Run(intel, r), 0, 0, "d3d11va", true, "d3d11", "ivtc_d3d11");
-        r.blacklist.insert("filter:ivtc_d3d11");
-        Plan p = Run(intel, r);
-        // ivtc_d3d11 blacklisted: d3d11va keep -> hwdownload -> CPU recipe -> upload: 2 host copies
-        CHECK_EQ(p.hwaccel, std::string("d3d11va"));
-        CHECK_EQ(p.cost.Weighted(), 2);
-    }
-    {
-        PlanRequest r = Req(Case::B);
-        r.decoder = DecoderPref::Software;
-        Plan p = Run(fakecaps::Nvidia(), r);
-        CHECK(p.hwaccel.empty());
-        CHECK(!p.hwframesKeep);
-    }
-    {
-        PlanRequest r = Req(Case::B);
-        r.decoder = DecoderPref::Forced;
-        r.forcedDecoder = "d3d11va";
-        Plan p = Run(fakecaps::Nvidia(), r);
-        CHECK(p.ok);
-        CHECK_EQ(p.hwaccel, std::string("d3d11va"));
-    }
-    {
-        PlanRequest r = Req(Case::B);
-        r.decoder = DecoderPref::Forced;
-        r.forcedDecoder = "d3d11va";
-        r.blacklist.insert("hwaccel:d3d11va");
-        Plan p = Run(fakecaps::Nvidia(), r);
-        CHECK(p.hwaccel.empty());
-        CHECK(!p.notes.empty());
-    }
-    {
-        PlanRequest r = Req(Case::B);
-        r.decoder = DecoderPref::PreferGpu;
-        Plan p = Run(fakecaps::None(), r);
-        CHECK(p.ok);
-        CHECK(p.hwaccel.empty());
-        CHECK(!p.notes.empty());
-    }
+TEST_CASE(Plan_software_decoding_only_without_a_usable_gpu_decoder) {
+    CapabilitySet nv = fakecaps::Nvidia();
+    PlanRequest r = Req(Case::C);
+    Plan hw = Run(nv, r);
+    CHECK(hw.ok);
+    CHECK_EQ(hw.hwaccel, std::string("d3d11va"));
+    r.content.bitDepth = 12;   // no decoder of the capabilities takes HEVC 12-bit
+    Plan sw = Run(nv, r);
+    CHECK(sw.ok);
+    CHECK(sw.hwaccel.empty());
+    CHECK(!sw.hwframesKeep);
+    CHECK(sw.openOptions.end() == std::find_if(sw.openOptions.begin(), sw.openOptions.end(), [](const auto& o) { return o.first == "hwaccel"; }));
+    Plan none = Run(WithoutHardwareDevices(nv, "device lost"), Req(Case::C));
+    CHECK(none.ok);
+    CHECK(none.hwaccel.empty());
+    CHECK(!none.steps.empty() && none.steps.back().name == "present:d3d11");
 }
 
 TEST_CASE(Plan_uses_the_platform_presenter) {
@@ -333,17 +304,15 @@ TEST_CASE(Plan_raw_chain_transition_into_d3d11) {
     PlanRequest r = Req(Case::B);
     r.settings.deinterlace = DeinterlaceMode::Off;
     r.settings.customVideoFilter = "bwdif_d3d11";
-    r.decoder = DecoderPref::Software;
-    Plan p = Run(fakecaps::Nvidia(false), r);   // the presenter takes system frames only: the frames leave the GPU again
+    Plan p = Run(WithoutDecoders(fakecaps::Nvidia(false)), r);   // the presenter takes system frames only: the frames leave the GPU again
     CHECK(p.ok);
     CHECK_EQ(p.videoFilter, "format=nv12,hwupload,bwdif_d3d11,hwdownload,format=nv12");
     CHECK_EQ(p.filterHwDevice, std::string("d3d11va"));
-    Plan q = Run(fakecaps::Nvidia(), r);
+    Plan q = Run(WithoutDecoders(fakecaps::Nvidia()), r);
     CHECK_EQ(q.steps.back().name, std::string("present:d3d11"));
     CHECK_EQ(q.videoFilter, "format=nv12,hwupload,bwdif_d3d11");
     CHECK_EQ(q.cost.deviceCopies, 0);
     CHECK_EQ(q.cost.hostCopies, 1);
-    r.decoder = DecoderPref::Auto;
     r.settings.customVideoFilter.clear();
     r.settings.deinterlace = DeinterlaceMode::Ivtc;
     Plan keep = Run(fakecaps::Nvidia(), r);
@@ -384,9 +353,7 @@ TEST_CASE(Plan_diff) {
     CHECK(PipelinePlanner::Diff(a, Run(none, r2)).kind == PlanDeltaKind::GraphRebuild);
     CapabilitySet nv = fakecaps::Nvidia();
     Plan x = Run(nv, r);
-    PlanRequest r5 = r;
-    r5.decoder = DecoderPref::Software;
-    CHECK(PipelinePlanner::Diff(x, Run(nv, r5)).kind == PlanDeltaKind::Reopen);
+    CHECK(PipelinePlanner::Diff(x, Run(WithoutDecoders(nv), r)).kind == PlanDeltaKind::Reopen);
     Plan y = x;
     y.hwframesKeep = !x.hwframesKeep;
     CHECK(PipelinePlanner::Diff(x, y).kind == PlanDeltaKind::Reopen);
@@ -485,9 +452,7 @@ TEST_CASE(Plan_ivtc_flags_combed_appends_same_domain_bwdif) {
     CapabilitySet in = fakecaps::Intel();
     for (FilterCap& f : in.filters) if (f.name == "ivtc_d3d11") f.flagsCombed = true;
     RemoveFilter(in, "bwdif_d3d11");
-    PlanRequest r = Req(Case::A);
-    r.decoder = DecoderPref::PreferGpu;
-    Plan q = Run(in, r);
+    Plan q = Run(in, Req(Case::A));
     CHECK(q.ok);
     if (q.videoFilter.find("ivtc_d3d11") != std::string::npos) {
         CHECK(q.videoFilter.find(kResidual) == std::string::npos);
@@ -518,17 +483,11 @@ TEST_CASE(Plan_cuda_filters_of_the_build_are_never_planned) {
             r.blacklist.insert("filter:ivtc_d3d11");
             r.blacklist.insert("filter:bwdif_d3d11");
             r.blacklist.insert("filter:yadif_d3d11");
-            for (const Plan& p : { Run(caps, r), [&] { PlanRequest f = r; f.decoder = DecoderPref::Forced; f.forcedDecoder = "cuda";
-                                                         return Run(caps, f); }() }) {
-                CHECK_MSG(p.ok, p.error);
-                CHECK_MSG(p.hwaccel != "cuda" && p.filterHwDevice != "cuda", p.Summary());
-                CHECK_MSG(p.videoFilter.find("_cuda") == std::string::npos, p.videoFilter);
-                for (const PlanStep& st : p.steps) CHECK_MSG(st.in != FrameDomain::Cuda && st.out != FrameDomain::Cuda, st.name);
-            }
-            PlanRequest f = r;
-            f.decoder = DecoderPref::Forced;
-            f.forcedDecoder = "cuda";
-            CHECK(HasNote(Run(caps, f), "forced decoder unknown: using automatic choice"));
+            const Plan p = Run(caps, r);
+            CHECK_MSG(p.ok, p.error);
+            CHECK_MSG(p.hwaccel != "cuda" && p.filterHwDevice != "cuda", p.Summary());
+            CHECK_MSG(p.videoFilter.find("_cuda") == std::string::npos, p.videoFilter);
+            for (const PlanStep& st : p.steps) CHECK_MSG(st.in != FrameDomain::Cuda && st.out != FrameDomain::Cuda, st.name);
         }
     PlanRequest raw = Req(Case::B);
     raw.settings.deinterlace = DeinterlaceMode::Off;

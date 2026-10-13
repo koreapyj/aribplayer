@@ -21,24 +21,10 @@ struct WindowPlacement {
     bool operator==(const WindowPlacement&) const = default;
 };
 
-/// Valid hwDecoder values ("auto", "gpu" = prefer GPU, "off", or a device type: "d3d11va", "d3d12va", "dxva2",
-/// "videotoolbox"); anything else normalises to "auto".
-bool IsValidHwDecoder(const std::string& v);
-
-/// The planner preferences of the decoder setting: auto->Auto, gpu->PreferGpu, a device type->Forced(name), off->Software.
-struct PlanPrefs {
-    DecoderPref decoder = DecoderPref::Auto;
-    std::string forcedDecoder;
-    bool operator==(const PlanPrefs&) const = default;
-};
-PlanPrefs PlanPrefsFor(const std::string& hwDecoder);
-
 struct AppSettings {
     ThemeSetting theme = ThemeSetting::System;
     std::uint32_t accentColor = 0;           // 0 = system accent, else ARGB
     AlwaysOnTop alwaysOnTop = AlwaysOnTop::Disable;   // JSON key "alwaysOnTop": "Disable"|"Enable"|"WhenPlaying"|"WhenFullscreen"; else Disable
-    std::string hwDecoder = "auto";        // see IsValidHwDecoder; JSON key "hwDecoder" (absent/invalid -> auto)
-    std::string hwDecoderLastOn = "auto";  // last non-"off" hwDecoder: what the bar H/W chip switches back to; JSON key "hwDecoderLastOn" (absent/invalid/"off" -> auto)
     // Settings > Playback > Video GPU. JSON key "videoGpu": "auto" (also absent/invalid) or
     // {"luid": "HHHHHHHH:LLLLLLLL", "vendorId": N, "deviceId": N, "name": "..."}.
     VideoGpuPref videoGpu;

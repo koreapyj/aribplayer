@@ -29,7 +29,7 @@ enum class CommandId : int {
     WindowSize50, WindowSize100, WindowSize150, WindowSize200, WindowSizeMax,
     KeyframePrevious, KeyframeNext,
     SeekForward5,
-    Stop, ToggleControlPanel, TogglePlaylistPanel, CycleAlwaysOnTop, ToggleTimeMode, ToggleHwDecoding,
+    Stop, ToggleControlPanel, TogglePlaylistPanel, CycleAlwaysOnTop, ToggleTimeMode,
     FocusPlaylistSearch
 };
 

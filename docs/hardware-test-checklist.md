@@ -50,7 +50,6 @@ with no `MISMATCH` line.
 |---|---|
 | Deinterlace On, priority Efficiency, 1080i | `deinterlace bwdif_d3d11 (d3d11va); priority efficiency: GPU deinterlacer -> bwdif_d3d11`; no combing |
 | Deinterlace On, priority Quality | same filter (GPU is always bwdif) |
-| Deinterlace On with Settings > Hardware decoding = Off | `deinterlace yadif (CPU); priority efficiency: no GPU deinterlacer -> yadif` (Quality: `bwdif`) |
 | Output rate = One frame per field | ~59.94 fps in the fps line |
 | IVTC on telecined MPEG-2 | `IVTC: ivtc_d3d11 (d3d11va), residual-combing fallback unavailable`, ~23.976 fps, no duplicate frames on pans |
 | No driver deinterlacer | the filter graph never contains `deinterlace_d3d11`, `deinterlace_qsv`, `vpp_qsv`, `vpp_amf` |

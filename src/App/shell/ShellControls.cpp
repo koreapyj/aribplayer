@@ -219,32 +219,15 @@ void TextButton::Invoke() {
     if (onInvoke) onInvoke();
 }
 
-Chip::Chip(std::wstring text, bool clickable)
-    : pui::Widget(clickable ? pui::Role::Button : pui::Role::Text), text_(std::move(text)), clickable_(clickable) {
+Chip::Chip(std::wstring text) : pui::Widget(pui::Role::Text), text_(std::move(text)) {
     SetName(text_);
-    SetFocusable(clickable);
-    SetHitTestVisible(clickable);   // display-only chips let the pointer fall through to the bar
+    SetHitTestVisible(false);
 }
 
 void Chip::SetText(const std::wstring& text) {
     if (text == text_) return;
     text_ = text;
     SetName(text_);
-    Invalidate();
-}
-
-void Chip::SetClickable(bool on) {
-    if (on == clickable_) return;
-    clickable_ = on;
-    SetRole(on ? pui::Role::Button : pui::Role::Text);
-    SetFocusable(on);
-    SetHitTestVisible(on);
-    Invalidate();
-}
-
-void Chip::SetMenuOpen(bool on) {
-    if (on == menuOpen_) return;
-    menuOpen_ = on;
     Invalidate();
 }
 
@@ -257,35 +240,13 @@ float Chip::WidthFor(pui::IRenderer& r, const std::wstring& text) {
 
 void Chip::Paint(pui::IRenderer& r, const pui::Theme& t) {
     const RectF& b = Bounds();
-    bool en = IsEffectivelyEnabled(), hov = clickable_ && IsHovered() && en, prs = clickable_ && ((IsPressed() && hov) || menuOpen_);
-    if (prs) r.FillRoundRect(b, t.controlRadius, t.subtleTertiary);
-    else if (hov) r.FillRoundRect(b, t.controlRadius, t.subtleSecondary);
     const float hh = t.hairline / 2;
     r.StrokeRoundRect(RectF{b.l + hh, b.t + hh, b.r - hh, b.b - hh}, t.controlRadius, t.chipStroke, t.hairline);
     pui::TextStyle ts;
     ts.size = 11;
     ts.align = pui::TextAlign::Center;
     ts.ellipsis = false;
-    r.Text(text_, b, ts, en ? t.textSecondary : t.textDisabled);
-    if (clickable_) PaintFocusVisual(r, t, b, t.controlRadius);
-}
-
-bool Chip::OnPointerDown(const pui::PointerEvent& e) { return clickable_ && e.button == pui::PointerButton::Left; }
-
-bool Chip::OnPointerUp(const pui::PointerEvent& e) {
-    if (clickable_ && e.button == pui::PointerButton::Left && Bounds().Contains(e.pt)) Invoke();
-    return clickable_;
-}
-
-bool Chip::OnKeyDown(int vk, unsigned mods) {
-    if (clickable_ && mods == 0 && (vk == pui::key::Enter || vk == pui::key::Space)) { Invoke(); return true; }
-    return false;
-}
-
-void Chip::Invoke() {
-    if (!clickable_ || !IsEffectivelyEnabled()) return;
-    Raise(pui::UiEvent::Invoked);
-    if (onInvoke) onInvoke();
+    r.Text(text_, b, ts, IsEffectivelyEnabled() ? t.textSecondary : t.textDisabled);
 }
 
 ShellSlider::ShellSlider(std::wstring name) : pui::Widget(pui::Role::Slider) {

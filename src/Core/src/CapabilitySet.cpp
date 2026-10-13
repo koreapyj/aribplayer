@@ -152,6 +152,14 @@ CapabilitySet MergeBuildCapabilities(const CapabilitySet& runtime, const Capabil
     return c;
 }
 
+CapabilitySet WithoutHardwareDevices(CapabilitySet caps, const std::string& reason) {
+    for (HwDeviceCap& d : caps.devices) {
+        d.ok = false;
+        d.error = reason;
+    }
+    return caps;
+}
+
 CapabilitySet MergePlatformCapabilities(const CapabilitySet& platform, const CapabilitySet& engine) {
     CapabilitySet c = platform;
     if (c.ffmpegVersion.empty()) c.ffmpegVersion = engine.ffmpegVersion;

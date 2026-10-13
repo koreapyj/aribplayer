@@ -196,7 +196,6 @@ TEST_CASE_INTEGRATION(PipelineReal_a_mpeg2_1080i_ivtc) {
     ContentInfo c = LearnContent(path);
     REQUIRE_MSG(c.Known(), "cannot read the stream info");
     FilterManager fm;
-    fm.SetPlanPreferences(DecoderPref::Auto, "");
     fm.SetCapabilities(*caps);
     fm.SetContent(c);
     FilterSettings s;
@@ -223,7 +222,6 @@ static void RunBwdifAutoCase(const char* row) {
     ContentInfo c = LearnContent(path);
     REQUIRE_MSG(c.Known(), "cannot read the stream info");
     FilterManager fm;
-    fm.SetPlanPreferences(DecoderPref::Auto, "");
     fm.SetCapabilities(*caps);
     fm.SetContent(c);
     FilterSettings s;
@@ -344,10 +342,11 @@ TEST_CASE_INTEGRATION(PipelineReal_d_software_ivtc) {
         }
         ContentInfo c = LearnContent(path);
         REQUIRE_MSG(c.Known(), "cannot read the stream info");
+        CapabilitySet noDecoders = *caps;
+        noDecoders.decoders.clear();
         for (bool cpu : { true, false }) {
             FilterManager fm;
-            fm.SetPlanPreferences(DecoderPref::Software, "");
-            fm.SetCapabilities(*caps);
+            fm.SetCapabilities(noDecoders);
             fm.SetContent(c);
             if (cpu)
                 for (const FilterVariant& v : PipelineTable::Discover(*caps).VariantsFor(PipelineOp::Ivtc))

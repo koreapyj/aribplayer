@@ -818,22 +818,27 @@ int App::RunHeadlessCheck() {
                 Step((pre + "_resume_in_sync_without_drops").c_str(),
                      (playing && drops == 0 && (!audioRunning || (avWhileAudio > -100 && avWhileAudio < 100))) ? S_OK : E_FAIL);
             };
-            const std::string configuredDecoder = svc_->settings.hwDecoder;
+            // An ARIB font change reopens at the position; the bundled font named explicitly renders like the default.
+            const std::string configuredFont = svc_->settings.aribFont;
+            const std::string bundledFont = wvp::ToUtf8(BundledAribFontPath());
+            auto switchFont = [&] {
+                wvp::AppSettings before = svc_->settings, after = before;
+                after.aribFont = before.aribFont == configuredFont ? (configuredFont == bundledFont ? std::string() : bundledFont) : configuredFont;
+                svc_->settings = after;
+                ApplySettingsLive(*ctl_, before, after);
+            };
+            auto restoreFont = [&] {   // playing, not measured
+                if (svc_->settings.aribFont == configuredFont) return;
+                wvp::AppSettings before = svc_->settings, after = before;
+                after.aribFont = configuredFont;
+                svc_->settings = after;
+                ApplySettingsLive(*ctl_, before, after);
+                PumpUntil([&] { return state_ == wvp::PlayerState::Playing; }, 3000);
+            };
             pausedReopen("baseline_pause_play", [] {}, false);   // no reopen: the drop / caption numbers to compare with
             pausedReopen("ui_loss_paused", [&] { SimulateUiDeviceLoss(); });
-            pausedReopen("settings_reopen_paused", [&] {
-                wvp::AppSettings before = svc_->settings, after = before;   // a decoder change reopens at the position
-                after.hwDecoder = before.hwDecoder == "off" ? "auto" : "off";
-                svc_->settings = after;
-                ApplySettingsLive(*ctl_, svc_->filters, before, after);
-            });
-            if (svc_->settings.hwDecoder != configuredDecoder) {   // back to the configured decoder (playing, not measured)
-                wvp::AppSettings before = svc_->settings, after = before;
-                after.hwDecoder = configuredDecoder;
-                svc_->settings = after;
-                ApplySettingsLive(*ctl_, svc_->filters, before, after);
-                PumpUntil([&] { return state_ == wvp::PlayerState::Playing; }, 3000);
-            }
+            pausedReopen("settings_reopen_paused", switchFont);
+            restoreFont();
 
             // repeated loss: 3 attempts per 30 s, then the WARP fallback; no further rebuilds
             for (int i = 0; i < 3; i++) {
@@ -859,20 +864,9 @@ int App::RunHeadlessCheck() {
                 const int extra = GetEnvironmentVariableW(L"WVP_HEADLESS_REOPEN_SAMPLES", n, 16) ? _wtoi(n) : 0;
                 for (int i = 0; i < extra; i++) {
                     const std::string prefix = "reopen_sample_" + std::to_string(i + 1);
-                    pausedReopen(prefix.c_str(), [&] {
-                        wvp::AppSettings before = svc_->settings, after = before;
-                        after.hwDecoder = before.hwDecoder == configuredDecoder ? (configuredDecoder == "off" ? "auto" : "off") : configuredDecoder;
-                        svc_->settings = after;
-                        ApplySettingsLive(*ctl_, svc_->filters, before, after);
-                    });
+                    pausedReopen(prefix.c_str(), switchFont);
                 }
-                if (svc_->settings.hwDecoder != configuredDecoder) {
-                    wvp::AppSettings before = svc_->settings, after = before;
-                    after.hwDecoder = configuredDecoder;
-                    svc_->settings = after;
-                    ApplySettingsLive(*ctl_, svc_->filters, before, after);
-                    PumpUntil([&] { return state_ == wvp::PlayerState::Playing; }, 3000);
-                }
+                restoreFont();
             }
         }
         {   // seek logging (the log-file step below looks for it): the skip key hook ignores keys while the media is not seekable

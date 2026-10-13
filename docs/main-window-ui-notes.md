@@ -68,7 +68,7 @@ Seek row: elapsed (click toggles elapsed / remaining, persisted as `timeRemainin
 with a 10 accent dot) | total. Transport row: Play/Pause (accent fill) - Stop - Prev - Next - Open | chips | Mute + volume slider
 (96) - Subtitle - Control panel - Playlist panel - Full screen.
 
-Chips (`features/BadgeLogic`): "H/W" or "S/W" (shows the actual decoding state; clickable: toggles `ToggleHwDecoding` between the configured decoder - `hwDecoderLastOn`, "auto" by default, updated whenever Settings picks a non-off decoder - and "off", reopening at the same position; tooltip says on/off), video codec as the FourCC from libffplay (container tag, else the RIFF tag: MPG2, H264, HEVC ...; codec name when none), "HDR" before it when the selected video's transfer is PQ or HLG (`smpte2084`, `arib-std-b67`), audio codec, audio channels ("5.1"). Display-only except H/W. Refreshed on open,
+Chips (`features/BadgeLogic`), all display-only: "H/W" or "S/W" (the actual decoding state), video codec as the FourCC from libffplay (container tag, else the RIFF tag: MPG2, H264, HEVC ...; codec name when none), "HDR" before it when the selected video's transfer is PQ or HLG (`smpte2084`, `arib-std-b67`), audio codec, audio channels ("5.1"). Refreshed on open,
 shortly after prepare, then every 2 s while playing.
 
 Tiers (`BarLayout::Compute`, widest that fits wins): all chips -> fewer chips (last first) -> volume slider 96 -> 64 -> Open, Subtitle
@@ -90,7 +90,6 @@ Windowed: no bar fill (the window backdrop shows). Full screen / mini: `barFill`
 | Playlist toggle (F6) | show/hide panel, pressed while visible | - | narrow window: popup mode |
 | Pin (title) | cycle always-on-top: Off -> On -> While playing -> While fullscreen | - | same as Ctrl+T, persisted |
 | Elapsed label | elapsed / remaining | - | |
-| H/W or S/W chip | toggle hardware decoding: configured decoder (auto by default) <-> off, reopens at the same position | - | no key binding; same setting as Settings > Playback > Hardware decoding |
 | Hamburger button / video | main menu | main menu on the video | the main menu is the context menu |
 | Video | double click = play/pause (not fullscreen); left-drag moves the window (not in fullscreen) | main menu | wheel = volume |
 | Playlist toggle, windowed | window grows/shrinks by panel width + gap so the video keeps its size | - | maximized/fullscreen/narrow: video resizes instead |

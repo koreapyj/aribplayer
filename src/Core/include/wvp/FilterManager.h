@@ -54,7 +54,6 @@ public:
     // rebuild, reopen (+ videoRebuild) when the decoder, hwframes mode or filter device changed, or a plan appeared or vanished.
     FilterChange SetCapabilities(CapabilitySet caps);
     bool HasCapabilities() const { return planner_ != nullptr; }
-    FilterChange SetPlanPreferences(DecoderPref decoder, std::string forcedDecoder);
     FilterChange SetContent(const ContentInfo& content);
     /// Adds a runtime-failure key ("hwaccel:d3d11va", "filter:ivtc_d3d11", "hwframes_keep", ...) and replans.
     FilterChange Blacklist(const std::string& key);
@@ -63,7 +62,7 @@ public:
     const Plan* CurrentPlan() const { return PlannerActive() ? &plan_ : nullptr; }
     /// Why there is no plan although capabilities are set; "" otherwise.
     std::string PlanError() const { return planner_ && !plan_.ok ? plan_.error : std::string(); }
-    /// The request the planner is given (settings, tuning, content, preferences, blacklist).
+    /// The request the planner is given (settings, tuning, content, blacklist).
     PlanRequest Request() const;
     bool PlannerActive() const { return planner_ && plan_.ok; }
     const ContentInfo& Content() const { return content_; }
@@ -90,8 +89,6 @@ private:
 
     std::shared_ptr<const PipelinePlanner> planner_;   // null until capabilities are set
     Plan plan_;
-    DecoderPref decoder_ = DecoderPref::Auto;
-    std::string forcedDecoder_;
     ContentInfo content_;
     std::set<std::string> blacklist_;
 };

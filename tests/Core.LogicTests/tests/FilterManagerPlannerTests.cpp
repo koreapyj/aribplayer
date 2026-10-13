@@ -78,7 +78,7 @@ TEST_CASE(FMPlanner_no_plan_without_caps) {
     CHECK(!c.videoRebuild && !c.reopen && c.audioRebuild);
     CHECK_EQ(fm.VideoFilter(), std::string());
     CHECK_EQ(fm.AudioFilter(), std::string("atempo=2"));
-    for (FilterChange x : { fm.SetPlanPreferences(DecoderPref::Software, ""), fm.SetContent(Mpeg2()), fm.Blacklist("hwaccel:d3d11va"), fm.ClearBlacklist() })
+    for (FilterChange x : { fm.SetContent(Mpeg2()), fm.Blacklist("hwaccel:d3d11va"), fm.ClearBlacklist() })
         CHECK(!x.videoRebuild && !x.audioRebuild && !x.reopen);
     FilterProvider p = fm.Provider();
     REQUIRE(p.planOptions);
@@ -154,26 +154,27 @@ TEST_CASE(FMPlanner_blacklist_replans_and_clear_restores) {
     CHECK(!fm.CurrentPlan()->hwframesKeep);
 }
 
-TEST_CASE(FMPlanner_preferences_and_content_replan) {
+TEST_CASE(FMPlanner_content_replan) {
     FilterManager fm;
     FilterSettings off; off.deinterlace = DeinterlaceMode::Off;
     fm.Apply(off);
     fm.SetContent(H264());
     fm.SetCapabilities(fakecaps::Nvidia());
     REQUIRE(fm.PlannerActive());
-    FilterChange c = fm.SetPlanPreferences(DecoderPref::Software, "");
+    CHECK_EQ(fm.CurrentPlan()->hwaccel, std::string("d3d11va"));
+    FilterChange c = fm.SetContent(H264());
+    CHECK(!c.reopen && !c.videoRebuild);
+    ContentInfo deep = H264();
+    deep.codec = "hevc";
+    deep.bitDepth = 12;
+    c = fm.SetContent(deep);
     CHECK(c.reopen && c.videoRebuild);
     CHECK_EQ(fm.CurrentPlan()->hwaccel, std::string());
-    c = fm.SetPlanPreferences(DecoderPref::Forced, "dxva2");
-    CHECK(c.reopen);
-    CHECK_EQ(fm.CurrentPlan()->hwaccel, std::string("dxva2"));
-    c = fm.SetPlanPreferences(DecoderPref::Forced, "d3d11va");
-    CHECK(c.reopen);
-    CHECK_EQ(fm.CurrentPlan()->hwaccel, std::string("d3d11va"));
-    c = fm.SetPlanPreferences(DecoderPref::Forced, "d3d11va");
-    CHECK(!c.reopen && !c.videoRebuild);
+    c = fm.SetCapabilities(WithoutHardwareDevices(fakecaps::Nvidia(), "device lost"));
+    CHECK(!c.reopen);
     c = fm.SetContent(H264());
     CHECK(!c.reopen);
+    CHECK_EQ(fm.CurrentPlan()->hwaccel, std::string());
 }
 
 TEST_CASE(FMPlanner_first_caps_bring_the_plan_or_its_error) {
@@ -248,8 +249,7 @@ TEST_CASE(PCPlan_plan_options_override_base_options_and_audio_filter_is_kept) {
 TEST_CASE(PCPlan_software_plan_adds_no_hwaccel_and_filter_hw_device_comes_from_the_plan) {
     FilterManager fm;
     fm.SetContent(H264());
-    fm.SetCapabilities(fakecaps::Nvidia());
-    fm.SetPlanPreferences(DecoderPref::Software, "");
+    fm.SetCapabilities(WithoutHardwareDevices(fakecaps::Nvidia(), "device lost"));
     REQUIRE(fm.PlannerActive());
     Fake p;
     PlaybackController c(p);

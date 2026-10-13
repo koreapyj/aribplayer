@@ -199,9 +199,8 @@ GPU runtime or device is usable. Log lines (all with `--console` or `--log-file`
 
 The Tab overlay shows a `pipeline` section while a plan is active: the plan, each step with its copy kind, planned vs measured
 copies, and the rejected alternatives; a mismatch (e.g. planned d3d11va, decoding in software) is flagged there too.
-Settings > Playback has "Hardware decoding" (Auto, Prefer GPU, D3D11VA, D3D12VA, DXVA2, Off; an old profile's `cuda` reads
-as Auto); changing it replans and
-reopens the current item at the same position. The overlay also shows
+The planner takes a GPU decoder of the capabilities whenever one fits the stream and decodes in
+software only when none does (e.g. HEVC 12-bit) or when that saves copies. The overlay also shows
 `presenter d3d11 direct N uploaded M` and warns about presenter mismatches/errors or an uploaded count
 against a no-host-copy plan. These are aggregate counters, not copy guarantees: `direct` can include
 D3D11 shader inputs requiring a device-local slice copy. Consult `frames_d3d11_copied` in the debug JSON before diagnosing a

@@ -159,8 +159,7 @@ TEST_CASE(PipelineSession_debug_info_fallbacks_after_warmup) {
     CHECK_EQ(h->key, std::string("hwaccel:d3d11va"));
     PlanRequest r;
     r.content = { "h264", 8, 640, 360, false };
-    r.decoder = DecoderPref::Software;
-    Plan sw = PipelinePlanner(fakecaps::Nvidia()).Make(r);
+    Plan sw = PipelinePlanner(WithoutHardwareDevices(fakecaps::Nvidia(), "device lost")).Make(r);
     PipelineSession s3;
     s3.BeforeOpen("c");
     CHECK(!s3.OnDebugInfo(sw, Dbg("none", "", 500)).has_value());

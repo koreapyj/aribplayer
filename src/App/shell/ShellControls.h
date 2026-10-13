@@ -83,31 +83,21 @@ private:
     ColorFade fade_;
 };
 
-/// Codec / decoder info chip: 22 DIP tall, 1 px outline (Theme::chipStroke), 4 DIP radius, 11 px secondary text. Display-only
-/// by default; clickable chips (the H/W decoder chip) get hover / pressed fills and keep the pressed look while their menu is open.
+/// Display-only codec / decoder info chip: 22 DIP tall, 1 px outline (Theme::chipStroke), 4 DIP radius, 11 px secondary text.
+/// Not focusable and not hit-testable: the pointer falls through to the bar.
 class Chip : public pui::Widget {
 public:
-    explicit Chip(std::wstring text, bool clickable = false);
+    explicit Chip(std::wstring text);
 
     void SetText(const std::wstring& text);
     const std::wstring& Text() const { return text_; }
-    void SetClickable(bool on);
-    bool Clickable() const { return clickable_; }
-    void SetMenuOpen(bool on);
     /// Outer width (DIP): text + 2 x 8 DIP padding + the 1 px borders.
     static float WidthFor(pui::IRenderer& r, const std::wstring& text);
-    std::function<void()> onInvoke;
 
     void Paint(pui::IRenderer& r, const pui::Theme& t) override;
-    bool OnPointerDown(const pui::PointerEvent& e) override;
-    bool OnPointerUp(const pui::PointerEvent& e) override;
-    bool OnKeyDown(int vk, unsigned mods) override;
-    bool SupportsInvoke() const override { return clickable_; }
-    void Invoke() override;
 
 private:
     std::wstring text_;
-    bool clickable_, menuOpen_ = false;
 };
 
 /// Horizontal slider: 4 DIP track, accent fill, 20 DIP thumb with a 10 DIP accent dot. Value is a

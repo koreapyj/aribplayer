@@ -242,28 +242,13 @@ std::wstring ExeBuildStamp() {
 }
 std::wstring LibffplayBuildStamp() { return StampOf(LibffplayPath()); }
 
-LiveApplyResult ApplySettingsLive(wvp::PlaybackController& ctl, wvp::FilterManager& fm, const wvp::AppSettings& before,
-                                  const wvp::AppSettings& after) {
+LiveApplyResult ApplySettingsLive(wvp::PlaybackController& ctl, const wvp::AppSettings& before, const wvp::AppSettings& after) {
     LiveApplyResult r;
-    if (before.hwDecoder != after.hwDecoder) {
-        // the plan encodes the decoder preference: a decoder change reopens the item (before capabilities it is remembered)
-        wvp::PlanPrefs pp = wvp::PlanPrefsFor(after.hwDecoder);
-        wvp::FilterChange fc = fm.SetPlanPreferences(pp.decoder, pp.forcedDecoder);
-        auto st = ctl.Player().State();
-        if (fc.reopen && ctl.Current() && (st == wvp::PlayerState::Playing || st == wvp::PlayerState::Paused)) {
-            r.reopened = ctl.ReopenCurrentHere();
-        } else {
-            ctl.ApplyFilterChange(fc);
-        }
-        const auto& hw = sl::HwDecoderChoices()[(size_t)sl::HwDecoderIndex(after.hwDecoder)];
-        r.toast = std::wstring(Tr(L"Hardware decoding: ", L"하드웨어 디코딩: ")) + hw.label + (r.reopened ? Tr(L"  — reopened", L"  — 다시 열림") : L"");
-    }
     const bool captionDecoderChanged = before.showSuperimpose != after.showSuperimpose || before.aribFont != after.aribFont;
     const auto state = ctl.Player().State();
-    if (captionDecoderChanged && ctl.Current() &&
-        (state == wvp::PlayerState::Playing || state == wvp::PlayerState::Paused) && !r.reopened) {
+    if (captionDecoderChanged && ctl.Current() && (state == wvp::PlayerState::Playing || state == wvp::PlayerState::Paused)) {
         r.reopened = ctl.ReopenCurrentHere();
-        if (r.reopened && r.toast.empty()) r.toast = Tr(L"Caption settings applied", L"자막 설정을 적용했습니다");
+        if (r.reopened) r.toast = Tr(L"Caption settings applied", L"자막 설정을 적용했습니다");
     }
     return r;
 }
@@ -283,10 +268,6 @@ void LoadSettingsAtStartup(AppContext& ctx) {
 
     // playback settings once the controller exists (ffp_create is asynchronous)
     g_appliedSettings = s;
-    {   // planner preference (decoder); it only matters once capabilities arrive
-        wvp::PlanPrefs pp = wvp::PlanPrefsFor(s.hwDecoder);
-        svc.filters.SetPlanPreferences(pp.decoder, pp.forcedDecoder);
-    }
     ApplyPlayback(ctx);   // no-op now; the controller does not exist yet
     if (!g_hooked) {
         g_hooked = true;
@@ -422,10 +403,10 @@ void OnSettingsChanged(AppContext& ctx) {
         if (before.showSuperimpose != s.showSuperimpose)
             c->Player().SetSubtitleVisible(wvp::SubtitleLayer::Superimpose, s.showSuperimpose);
         if (!(before.subtitle == s.subtitle)) c->Player().SetSubtitleStyle(s.subtitle);
-        // live: decoder/planner changes re-open the current item at its position
+        // live: caption decoder changes re-open the current item at its position
         TrackRestore saved = CaptureTrackRestore(ctx);
         EnsureTrackRestoreCancellationHooks(ctx);
-        LiveApplyResult r = ApplySettingsLive(*c, svc.filters, before, s);
+        LiveApplyResult r = ApplySettingsLive(*c, before, s);
         g_appliedSettings = s;
         if (r.reopened) ScheduleTrackRestore(ctx, std::move(saved));
         if (!r.toast.empty()) ctx.ShowToast(r.toast);

@@ -14,14 +14,14 @@
 namespace app {
 class AppContext;
 
-/// Subscribes to OnPlayerReady to apply hardware decoding, volume, shuffle and repeat to the controller.
+/// Subscribes to OnPlayerReady to apply the subtitle layers and style, shuffle and repeat to the controller.
 void LoadSettingsAtStartup(AppContext& ctx);
 void SaveSettingsAtShutdown(AppContext& ctx);
 /// Updates the in-memory saved filter state immediately and debounces disk writes while sliders are dragged.
 void QueueFilterSettingsSave(AppContext& ctx);
 /// Writes the current filter state now (panel close and shutdown); cancels any pending debounce.
 void FlushFilterSettings(AppContext& ctx);
-/// Saves the settings and applies theme/accent immediately; hardware decoding applies to the next opened item.
+/// Saves the settings and applies theme/accent and the playback-affecting settings immediately.
 void OnSettingsChanged(AppContext& ctx);
 
 /// A window's normal placement (screen coordinates; maximized flag; its DPI); nullopt when it cannot be read.
@@ -57,13 +57,11 @@ std::wstring BundledAribFontPath();
 
 /// What ApplySettingsLive did, for the toast and the tests.
 struct LiveApplyResult {
-    bool reopened = false;          // the current item was re-opened at its position (hwaccel / decoder change)
+    bool reopened = false;          // the current item was re-opened at its position (caption decoder change)
     std::wstring toast;             // "" = nothing to say
 };
-/// Applies the playback-affecting differences between `before` and `after` to the running playback:
-///  * hwDecoder -> the planner's decoder preference; when the plan's decoder changes and media is playing/paused:
-///    ReopenCurrentHere (position, pause kept; audio/subtitle selection is restored by the app through SelectTrack after
-///    the new Prepared).
-LiveApplyResult ApplySettingsLive(wvp::PlaybackController& ctl, wvp::FilterManager& fm, const wvp::AppSettings& before,
-                                  const wvp::AppSettings& after);
+/// Applies the playback-affecting differences between `before` and `after` to the running playback: a superimpose or ARIB
+/// font change while media is playing/paused reopens the item through ReopenCurrentHere (position, pause kept; audio/subtitle
+/// selection is restored by the app through SelectTrack after the new Prepared).
+LiveApplyResult ApplySettingsLive(wvp::PlaybackController& ctl, const wvp::AppSettings& before, const wvp::AppSettings& after);
 }

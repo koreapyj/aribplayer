@@ -137,6 +137,9 @@ CapabilitySet MergeBuildCapabilities(const CapabilitySet& runtime, const Capabil
 /// from the platform; interop and features from the engine. Decoders the engine lists that the platform did not verify are
 /// not added (the platform's probe decides decode support); an engine device the platform does not list is added.
 CapabilitySet MergePlatformCapabilities(const CapabilitySet& platform, const CapabilitySet& engine);
+/// `caps` with every hardware device unusable (error `reason`): the planner is left with software decoding and CPU filters on
+/// the same presenter.
+CapabilitySet WithoutHardwareDevices(CapabilitySet caps, const std::string& reason);
 /// Serializes to the same schema (round-trips through ParseCapabilities; used for the app-side cache and the overlay).
 std::string CapabilitiesToJson(const CapabilitySet& caps);
 

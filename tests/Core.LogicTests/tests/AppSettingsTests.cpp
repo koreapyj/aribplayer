@@ -1,6 +1,5 @@
 #include "wvptest.h"
 
-#include <cstring>
 #include <string>
 
 #include "wvp/AppSettings.h"
@@ -31,7 +30,6 @@ TEST_CASE(Settings_defaults_when_missing_or_corrupt_and_round_trip) {
     s.theme = ThemeSetting::Dark;
     s.accentColor = 0xFF3A7BD5u;
     s.alwaysOnTop = AlwaysOnTop::WhenFullscreen;
-    s.hwDecoder = "off";
     s.filters.deinterlace = DeinterlaceMode::On;
     s.filters.deinterlacePriority = DeinterlacePriority::Quality;
     s.filters.speed = 1.25;
@@ -189,7 +187,6 @@ TEST_CASE(Settings_partial_file_keeps_defaults_for_missing_keys) {
     WriteText(store.Path(), "{\"repeat\": 1}");
     AppSettings s = store.Load();
     CHECK_EQ(s.repeat, 1);
-    CHECK_EQ(s.hwDecoder, std::string("auto"));
     CHECK(s.theme == ThemeSetting::System);
 }
 
@@ -263,64 +260,17 @@ TEST_CASE(Settings_subtitle_style_defaults_round_trip_and_clamp) {
     CHECK(clamped.subtitle.outlineWidth == 0.0);
 }
 
-TEST_CASE(Settings_gpu_decoder_round_trip_and_old_presenter_key_ignored) {
+TEST_CASE(Settings_old_presenter_and_decoder_keys_ignored) {
     TempDir t;
     SettingsStore store(t.File("pr.json"));
-    for (const char* v : { "gpu", "dxva2", "videotoolbox" }) {
-        WriteText(store.Path(), std::string("{\"hwDecoder\": \"") + v + "\"}");
-        CHECK_EQ(store.Load().hwDecoder, std::string(v));
-    }
-    WriteText(store.Path(), "{\"presenter\": \"sdl\", \"hwDecoder\": \"gpu\"}");
+    WriteText(store.Path(), "{\"presenter\": \"sdl\", \"hwDecoder\": \"off\", \"hwDecoderLastOn\": \"d3d11va\"}");
     AppSettings old = store.Load();
-    CHECK_EQ(old.hwDecoder, std::string("gpu"));
-    AppSettings expected;
-    expected.hwDecoder = "gpu";
-    CHECK(old == expected);
-    CHECK(SettingsStore::ToJson(old).find("presenter") == std::string::npos);
+    CHECK(old == AppSettings{});
+    const std::string json = SettingsStore::ToJson(old);
+    CHECK(json.find("presenter") == std::string::npos);
+    CHECK(json.find("hwDecoder") == std::string::npos);
     WriteText(store.Path(), "{\"filters\": {\"brightness\": 0.5, \"rotation\": 90, \"flipHorizontal\": true}}");
     CHECK(store.Load() == AppSettings{});
-    CHECK(IsValidHwDecoder("gpu") && IsValidHwDecoder("dxva2") && IsValidHwDecoder("videotoolbox") && !IsValidHwDecoder("vulkan"));
-}
-
-TEST_CASE(Settings_plan_prefs_mapping) {
-    PlanPrefs p = PlanPrefsFor("auto");
-    CHECK(p.decoder == DecoderPref::Auto && p.forcedDecoder.empty());
-    p = PlanPrefsFor("gpu");
-    CHECK(p.decoder == DecoderPref::PreferGpu);
-    for (const char* name : { "d3d11va", "d3d12va", "dxva2", "videotoolbox" }) {
-        p = PlanPrefsFor(std::string(name, name + std::strlen(name)));
-        CHECK(p.decoder == DecoderPref::Forced);
-        CHECK_EQ(p.forcedDecoder, std::string(name));
-    }
-    p = PlanPrefsFor("off");
-    CHECK(p.decoder == DecoderPref::Software && p.forcedDecoder.empty());
-    p = PlanPrefsFor("bogus");
-    CHECK(p == PlanPrefs{});
-    CHECK(PlanPrefsFor("cuda") == PlanPrefs{});   // cuda is not a valid decoder value: normalises to automatic
-}
-
-TEST_CASE(Settings_hwDecoder_defaults_valid_invalid_and_round_trip) {
-    TempDir t;
-    SettingsStore store(t.File("hw.json"));
-    WriteText(store.Path(), "{}");
-    AppSettings a = store.Load();
-    CHECK_EQ(a.hwDecoder, std::string("auto"));
-    WriteText(store.Path(), "{\"hwDecoder\": \"dxva2\"}");
-    a = store.Load();
-    CHECK_EQ(a.hwDecoder, std::string("dxva2"));
-    WriteText(store.Path(), "{\"hwDecoder\": \"cuda\"}");
-    a = store.Load();
-    CHECK_EQ(a.hwDecoder, std::string("auto"));
-    WriteText(store.Path(), "{\"hwDecoder\": \"off\"}");
-    a = store.Load();
-    CHECK_EQ(a.hwDecoder, std::string("off"));
-    WriteText(store.Path(), "{\"hwDecoder\": \"bogus\"}");
-    a = store.Load();
-    CHECK_EQ(a.hwDecoder, std::string("auto"));
-    AppSettings s;
-    s.hwDecoder = "d3d12va";
-    REQUIRE(store.Save(s));
-    CHECK_EQ(store.Load().hwDecoder, std::string("d3d12va"));
 }
 
 TEST_CASE(AribFontOption_is_a_file_value_with_forward_slashes) {

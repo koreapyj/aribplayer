@@ -379,8 +379,6 @@ std::string WhyWorse(const PlanCost& a, const PlanCost& best) {
     return "tie, later in candidate order";
 }
 
-std::string DeviceNote(const std::string& t) { return "forced decoder " + t + " has no usable device"; }
-
 }
 
 const char* ChromaName(Chroma c) {
@@ -545,28 +543,8 @@ Plan PipelinePlanner::Make(const PlanRequest& req) const {
         return true;
     };
     static const char* const kOrder[] = { "d3d11va", "videotoolbox", "d3d12va", "dxva2" };
-    bool software = false;
-    DecoderPref pref = req.decoder;
-    if (pref == DecoderPref::Forced) {
-        if (req.forcedDecoder.empty() || !DomainOfDeviceType(req.forcedDecoder)) {
-            notes.push_back("forced decoder unknown: using automatic choice");
-            pref = DecoderPref::Auto;
-        } else if (c.Black("hwaccel:" + req.forcedDecoder)) {
-            notes.push_back("forced decoder " + req.forcedDecoder + " is blacklisted: software decoding");
-            software = true;
-        } else {
-            if (!caps_.DeviceOk(req.forcedDecoder)) notes.push_back(DeviceNote(req.forcedDecoder));
-            addType(req.forcedDecoder);
-        }
-    }
-    if (pref == DecoderPref::Auto || pref == DecoderPref::PreferGpu) {
-        for (const char* t : kOrder) if (usable(t)) addType(t);
-        if (pref == DecoderPref::Auto) software = true;
-        else if (decs.empty()) { software = true; notes.push_back("no GPU decoder available: software decoding"); }
-    } else if (pref == DecoderPref::Software) {
-        software = true;
-    }
-    if (software) decs.push_back({ "", false });
+    for (const char* t : kOrder) if (usable(t)) addType(t);
+    decs.push_back({ "", false });
 
     std::optional<Pres> pres;
     for (const PresenterCap& pc : caps_.presenters)

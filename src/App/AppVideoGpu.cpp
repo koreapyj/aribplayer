@@ -165,10 +165,7 @@ bool App::SelectVideoGpuNow(const std::string& trigger, bool onlyIfCheaper, wvp:
     if (displayLuid_.empty()) displayLuid_ = displayRawLuid_;
     const std::vector<wvp::AdapterCandidate>& cands = adapters_;
     const wvp::AppSettings& s = svc_->settings;
-    const wvp::PlanPrefs prefs = wvp::PlanPrefsFor(s.hwDecoder);
-    wvp::PlanRequest req = svc_->filters.Request();
-    req.decoder = prefs.decoder;
-    req.forcedDecoder = prefs.forcedDecoder;
+    const wvp::PlanRequest req = svc_->filters.Request();
     wvp::VideoGpuPref pref = s.videoGpu;   // a manual choice stored as an alias means its GPU
     if (!pref.Automatic())
         if (std::string c = wvp::CanonicalLuid(physGpus_, pref.luid); !c.empty()) pref.luid = c;
@@ -197,19 +194,19 @@ bool App::SelectVideoGpuNow(const std::string& trigger, bool onlyIfCheaper, wvp:
     videoChoice_ = ch;
     haveVideoChoice_ = true;
 
-    wvp::PlanPrefs pp = prefs;
     PlaybackAdapter pa;
     pa.note = ch.reason;
+    wvp::CapabilitySet caps;
     if (ch.index >= 0) {
         const auto& c = cands[static_cast<size_t>(ch.index)];
         pa.luid = c.luid;
         pa.name = wvp::ToWide(c.name);
+        caps = c.caps;
     } else {
-        pp.decoder = wvp::DecoderPref::Software;
+        caps = wvp::WithoutHardwareDevices(cands[0].caps, ch.reason);
     }
     playAdapter_ = pa;
-    svc_->filters.SetPlanPreferences(pp.decoder, pp.forcedDecoder);
-    wvp::FilterChange fc = svc_->filters.SetCapabilities(cands[static_cast<size_t>(ch.index >= 0 ? ch.index : 0)].caps);
+    wvp::FilterChange fc = svc_->filters.SetCapabilities(std::move(caps));
     const bool switched = UsePresenterOn(pa.luid);
     if (presenterSwitched) *presenterSwitched = switched;
     if (changed || trigger != "open") {

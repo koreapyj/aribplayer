@@ -100,10 +100,9 @@ PlayerBar::PlayerBar() : pui::Widget(pui::Role::Group) {
     };
     for (int b : {B_Play, B_Stop, B_Prev, B_Next, B_Open}) makeButton(b);
     for (int i = 0; i < BarLayout::kMaxChips; i++) {
-        chips_[(size_t)i] = Add<Chip>(L"", false);
+        chips_[(size_t)i] = Add<Chip>(L"");
         chips_[(size_t)i]->SetAutomationId(L"BarChip" + std::to_wstring(i));
         chips_[(size_t)i]->SetVisible(false);
-        chips_[(size_t)i]->onInvoke = [this] { Fire(CommandId::ToggleHwDecoding); };
     }
     makeButton(B_Mute);
     volume_ = Add<ShellSlider>(Tr(L"Volume", L"볼륨"));
@@ -186,9 +185,6 @@ void PlayerBar::ApplyModel() {
         if ((size_t)i >= model_.chips.size()) { c->SetVisible(false); continue; }
         const badge::Chip& mc = model_.chips[(size_t)i];
         c->SetText(mc.text);
-        c->SetClickable(mc.kind == badge::ChipKind::HwSw);
-        c->SetToolTip(mc.kind != badge::ChipKind::HwSw ? L"" : mc.text == L"H/W" ? Tr(L"Hardware decoding: on (click to turn off)", L"하드웨어 디코딩 켜짐 (클릭하여 끄기)")
-                                                                              : Tr(L"Hardware decoding: off (click to turn on)", L"하드웨어 디코딩 꺼짐 (클릭하여 켜기)"));
     }
     elapsed_->SetToolTip(model_.timeMode == sl::TimeDisplayMode::Elapsed ? Tr(L"Show remaining time", L"남은 시간 표시") : Tr(L"Show elapsed time", L"경과 시간 표시"));
     elapsed_->SetEnabled(model_.loaded);

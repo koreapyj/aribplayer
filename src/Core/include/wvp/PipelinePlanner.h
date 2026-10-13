@@ -1,5 +1,5 @@
 #pragma once
-// Capability-aware video pipeline planner. Turns intents (FilterSettings + IvtcTuning), content info and preferences
+// Capability-aware video pipeline planner. Turns intents (FilterSettings + IvtcTuning) and content info
 // into one Plan: decoder (hwaccel and the decoder name), the vf string with hw transitions, the open options, the planned copy
 // counts and the rejected alternatives. The presenter is the platform's (the PresenterCap of the capabilities); the planner
 // only decides which frames reach it. Pure logic, unit-tested with fakecaps.
@@ -24,9 +24,10 @@
 // (PipelineTable::IsDenied). Other intents are never silently degraded.
 // Chroma: the presenter and the GPU filters take 4:2:0 hw frames only, so 4:2:2 / 4:4:4 content is never planned with
 // hwframes=keep (GPU decode with download, or software).
-// Hardware decoders: "automatic" is resolved here from the capabilities (order d3d11va, videotoolbox, d3d12va, dxva2);
-// libffplay always gets an explicit hwaccel, plus vcodec when the build's decoder for (codec, hwaccel) is not the codec's
-// default decoder.
+// Decoders: every usable hardware decoder of the capabilities (order d3d11va, videotoolbox, d3d12va, dxva2) and software
+// decoding are candidates; cost picks one, so software decoding wins only when no GPU decoder can take the stream or when it
+// saves copies. libffplay always gets an explicit hwaccel for a hardware decoder, plus vcodec when the build's decoder for
+// (codec, hwaccel) is not the codec's default decoder.
 // Option mapping: only options the chosen filter exposes are emitted (FilterVariant::HasOption).
 #include <optional>
 #include <set>
@@ -55,14 +56,10 @@ struct ContentInfo {
     bool operator==(const ContentInfo&) const = default;
 };
 
-enum class DecoderPref { Auto, PreferGpu, Forced, Software };
-
 struct PlanRequest {
     FilterSettings settings;
     IvtcTuning ivtc;
     ContentInfo content;
-    DecoderPref decoder = DecoderPref::Auto;
-    std::string forcedDecoder;           // hwaccel device type for DecoderPref::Forced ("d3d11va", "d3d12va", ...)
     /// Elements that failed at runtime and must not be planned again: "hwaccel:d3d11va", "filter:ivtc_d3d11",
     /// "interop:d3d11>qsv", "hwframes_keep".
     std::set<std::string> blacklist;

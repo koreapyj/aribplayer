@@ -80,24 +80,6 @@ int AccentIndexFor(std::uint32_t argb) {
     return -1;
 }
 
-const std::array<HwDecoderChoice, kHwDecoderCount>& HwDecoderChoices() {
-    static const std::array<HwDecoderChoice, kHwDecoderCount> c = {{
-        {"auto", Tr(L"Auto", L"자동")}, {"gpu", Tr(L"Prefer GPU", L"GPU 우선")}, {"d3d11va", L"D3D11VA"}, {"d3d12va", L"D3D12VA"},
-        {"dxva2", L"DXVA2"}, {"off", Tr(L"Off (software)", L"사용 안 함 (소프트웨어)")},
-    }};
-    return c;
-}
-int HwDecoderIndex(const std::string& v) {
-    const auto& c = HwDecoderChoices();
-    for (int i = 0; i < kHwDecoderCount; i++)
-        if (v == c[(size_t)i].value) return i;
-    return 0;
-}
-std::string HwDecoderValue(int i) {
-    const auto& c = HwDecoderChoices();
-    return i >= 0 && i < kHwDecoderCount ? c[(size_t)i].value : c[0].value;
-}
-
 int AlwaysOnTopIndex(wvp::AlwaysOnTop m) {
     switch (m) {
         case wvp::AlwaysOnTop::Enable: return 1;
@@ -142,7 +124,6 @@ PageState StateFromSettings(const wvp::AppSettings& s) {
     st.useSystemAccent = s.accentColor == 0;
     st.accentIndex = AccentIndexFor(s.accentColor);
     st.alwaysOnTopIndex = AlwaysOnTopIndex(s.alwaysOnTop);
-    st.hwDecoderIndex = HwDecoderIndex(s.hwDecoder);
     st.debugLogging = s.debugLogging;
     return st;
 }
@@ -152,8 +133,6 @@ void ApplyState(wvp::AppSettings& s, const PageState& st) {
     else if (st.accentIndex >= 0 && st.accentIndex < kAccentCount) s.accentColor = AccentPalette()[(size_t)st.accentIndex].argb;
     else if (s.accentColor == 0) s.accentColor = AccentPalette()[0].argb;   // system accent switched off: start from the first swatch
     s.alwaysOnTop = AlwaysOnTopFromIndex(st.alwaysOnTopIndex);
-    s.hwDecoder = HwDecoderValue(st.hwDecoderIndex);
-    if (s.hwDecoder != "off") s.hwDecoderLastOn = s.hwDecoder;   // the bar H/W chip switches back to it
     s.debugLogging = st.debugLogging;
 }
 
@@ -301,24 +280,11 @@ LOGIC_TEST(settings_state_mapping) {
     PageState st = StateFromSettings(s);
     LT_CHECK(st.useSystemAccent);
     LT_CHECK_EQ(st.themeIndex, 0);
-    LT_CHECK(st.hwDecoderIndex == 0 && st.alwaysOnTopIndex == 0);
-    st.themeIndex = 2; st.useSystemAccent = false; st.accentIndex = 6; st.hwDecoderIndex = 5;
+    LT_CHECK_EQ(st.alwaysOnTopIndex, 0);
+    st.themeIndex = 2; st.useSystemAccent = false; st.accentIndex = 6;
     ApplyState(s, st);
     LT_CHECK(s.theme == wvp::ThemeSetting::Dark);
     LT_CHECK_EQ((unsigned)s.accentColor, (unsigned)AccentPalette()[6].argb);
-    LT_CHECK(s.hwDecoder == "off");
-    st.hwDecoderIndex = 3; ApplyState(s, st);
-    LT_CHECK(s.hwDecoder == "d3d12va" && StateFromSettings(s).hwDecoderIndex == 3);
-    st.hwDecoderIndex = 1; ApplyState(s, st);
-    LT_CHECK(s.hwDecoder == "gpu" && StateFromSettings(s).hwDecoderIndex == 1);
-    st.hwDecoderIndex = 4; ApplyState(s, st);
-    LT_CHECK(s.hwDecoder == "dxva2" && StateFromSettings(s).hwDecoderIndex == 4);
-    LT_CHECK_EQ(HwDecoderIndex("off"), 5);
-    LT_CHECK_EQ(kHwDecoderCount, 6);
-    LT_CHECK_EQ(HwDecoderIndex("bogus"), 0);
-    LT_CHECK_EQ(HwDecoderIndex("cuda"), 0);
-    LT_CHECK_EQ(HwDecoderValue(99), std::string("auto"));
-    st.hwDecoderIndex = 5; ApplyState(s, st);
     LT_CHECK(!s.debugLogging);
     st.debugLogging = true; ApplyState(s, st);
     LT_CHECK(s.debugLogging && StateFromSettings(s).debugLogging);
@@ -361,7 +327,7 @@ LOGIC_TEST(settings_service_roundtrip_temp_dir) {
     svc.settings.theme = wvp::ThemeSetting::Light;
     svc.settings.accentColor = AccentPalette()[3].argb;
     svc.settings.alwaysOnTop = wvp::AlwaysOnTop::WhenPlaying;
-    svc.settings.hwDecoder = "off";
+    svc.settings.showSuperimpose = false;
     svc.settings.window = {10, 20, 1000, 600, true, true};
     LT_CHECK(svc.settingsStore.Save(svc.settings));
     app::Services again(td.p.wstring());
@@ -512,10 +478,8 @@ std::string OptOf(const wvp::OpenOptions& o, const char* k) {
 }
 
 namespace {
-// A FilterManager planning for 1080p H.264 on an NVIDIA GPU with the decoder preference of `hwDecoder`.
-void PlanFor(wvp::FilterManager& fm, const std::string& hwDecoder) {
-    wvp::PlanPrefs pp = wvp::PlanPrefsFor(hwDecoder);
-    fm.SetPlanPreferences(pp.decoder, pp.forcedDecoder);
+// A FilterManager planning for 1080p H.264 on an NVIDIA GPU.
+void PlanFor(wvp::FilterManager& fm) {
     fm.SetContent({"h264", 8, 1920, 1080, false});
     fm.SetCapabilities(wvp::fakecaps::Nvidia());
 }
@@ -531,8 +495,6 @@ LOGIC_TEST(settings_every_open_path_waits_for_the_plan) {
     };
     for (auto& open : paths) {
         LiveFake p; wvp::PlaybackController c(p); wvp::FilterManager fm;
-        wvp::PlanPrefs pp = wvp::PlanPrefsFor("d3d11va");
-        fm.SetPlanPreferences(pp.decoder, pp.forcedDecoder);
         c.SetFilters(fm.Provider());
         open(c);
         LT_CHECK(p.opened.empty() && c.HasPendingOpen());   // no capabilities yet: nothing is opened
@@ -541,57 +503,23 @@ LOGIC_TEST(settings_every_open_path_waits_for_the_plan) {
         LT_CHECK_EQ(OptOf(p.opened[0].second, "hwaccel"), std::string("d3d11va"));
         LT_CHECK(!c.HasPendingOpen());
     }
-    // Off really means no hwaccel option
-    LiveFake p; wvp::PlaybackController c(p); wvp::FilterManager fm;
-    PlanFor(fm, "off");
-    c.SetFilters(fm.Provider());
-    c.SetQueue({wvp::MediaItem("x.ts")}, 0, true);
-    LT_CHECK_EQ(p.opened.size(), (size_t)1);
-    LT_CHECK_EQ(OptOf(p.opened[0].second, "hwaccel"), std::string("<none>"));
 }
 
 LOGIC_TEST(settings_live_reopen_while_paused_presents_a_frame) {
     LiveFake p; wvp::PlaybackController c(p); wvp::FilterManager fm;
     wvp::AppSettings before, after;
-    PlanFor(fm, before.hwDecoder);
+    PlanFor(fm);
     c.SetFilters(fm.Provider());
     c.SetQueue({wvp::MediaItem("m.ts")}, 0, true);
     p.pos = 42.5; p.state = wvp::PlayerState::Paused;
-    after.hwDecoder = "off";
-    LT_CHECK(ApplySettingsLive(c, fm, before, after).reopened);
+    after.showSuperimpose = false;
+    LiveApplyResult r = ApplySettingsLive(c, before, after);
+    LT_CHECK(r.reopened && !r.toast.empty());
+    LT_CHECK_EQ(OptOf(p.opened[1].second, "hwaccel"), OptOf(p.opened[0].second, "hwaccel"));
     LT_CHECK(OptOf(p.opened[1].second, "ss").rfind("42.5", 0) == 0);
     p.Prepared.raise(wvp::MediaPreparedInfo{});
     LT_CHECK_EQ(OptOf(p.opened[1].second, "start_paused"), std::string("1"));
     LT_CHECK(p.pauses == 0 && p.state == wvp::PlayerState::Paused);   // the landing frame is shown, still paused
-}
-
-LOGIC_TEST(settings_live_hardware_decoding_change_reopens_at_position_keeping_pause) {
-    LiveFake p; wvp::PlaybackController c(p); wvp::FilterManager fm;
-    wvp::AppSettings before, after;
-    PlanFor(fm, before.hwDecoder);
-    c.SetFilters(fm.Provider());
-    c.SetQueue({wvp::MediaItem("m.ts")}, 0, true);
-    p.pos = 42.5; p.state = wvp::PlayerState::Paused;
-    after.hwDecoder = "off";
-    LiveApplyResult r = ApplySettingsLive(c, fm, before, after);
-    LT_CHECK(r.reopened);
-    LT_CHECK(r.toast.find(L"Hardware decoding") == 0 && r.toast.find(L"reopened") != std::wstring::npos);
-    LT_CHECK_EQ(p.opened.size(), (size_t)2);
-    LT_CHECK_EQ(OptOf(p.opened[1].second, "hwaccel"), std::string("<none>"));
-    LT_CHECK(OptOf(p.opened[1].second, "ss").rfind("42.5", 0) == 0);
-    LT_CHECK_EQ(OptOf(p.opened[1].second, "start_paused"), std::string("1"));   // the pause is kept by the open itself
-    p.Prepared.raise(wvp::MediaPreparedInfo{});
-    LT_CHECK(p.state == wvp::PlayerState::Paused && p.pauses == 0);
-    // nothing playing: the choice applies to the next open, no reopen
-    LiveFake q; wvp::PlaybackController c3(q); wvp::FilterManager fm3;
-    PlanFor(fm3, "auto");
-    c3.SetFilters(fm3.Provider());
-    c3.SetQueue({wvp::MediaItem("m.ts")}, 0, false);
-    wvp::AppSettings a3; a3.hwDecoder = "dxva2";
-    LiveApplyResult r3 = ApplySettingsLive(c3, fm3, wvp::AppSettings{}, a3);
-    LT_CHECK(!r3.reopened && q.opened.empty());
-    c3.Play();
-    LT_CHECK_EQ(OptOf(q.opened.at(0).second, "hwaccel"), std::string("dxva2"));
 }
 
 LOGIC_TEST(settings_filters_survive_restart_and_next_file) {
@@ -659,57 +587,6 @@ LOGIC_TEST(settings_build_stamp_format) {
     LT_CHECK(s.rfind(L"built 20", 0) == 0 && s.size() == 25);
     std::wstring e = ExeBuildStamp();
     LT_CHECK(e.find(L".exe built 20") != std::wstring::npos);
-}
-
-LOGIC_TEST(settings_live_planner_decoder_changes_reopen_through_the_plan) {
-    LiveFake p; wvp::PlaybackController c(p); wvp::FilterManager fm;
-    wvp::AppSettings before, after;
-    fm.SetContent({"h264", 8, 1920, 1080, false});
-    fm.SetCapabilities(wvp::fakecaps::Nvidia());
-    LT_CHECK(fm.PlannerActive());
-    c.SetFilters(fm.Provider());
-    c.SetQueue({wvp::MediaItem("m.ts")}, 0, true);
-    LT_CHECK_EQ(p.opened.size(), (size_t)1);
-    LT_CHECK(OptOf(p.opened[0].second, "hwaccel") != "<none>");
-    LT_CHECK_EQ(OptOf(p.opened[0].second, "presenter"), std::string("<none>"));
-    p.pos = 12.5; p.state = wvp::PlayerState::Paused;
-    // Off (software): reopen at the position, no hwaccel in the new options
-    after.hwDecoder = "off";
-    LiveApplyResult r = ApplySettingsLive(c, fm, before, after);
-    LT_CHECK(r.reopened);
-    LT_CHECK(r.toast.find(L"Hardware decoding") == 0);
-    LT_CHECK_EQ(p.opened.size(), (size_t)2);
-    LT_CHECK_EQ(OptOf(p.opened[1].second, "hwaccel"), std::string("<none>"));
-    LT_CHECK(OptOf(p.opened[1].second, "ss").rfind("12.5", 0) == 0);
-    LT_CHECK(fm.CurrentPlan() && fm.CurrentPlan()->hwaccel.empty());
-    before = after; after.hwDecoder = "dxva2";
-    p.state = wvp::PlayerState::Playing;
-    r = ApplySettingsLive(c, fm, before, after);
-    LT_CHECK(r.reopened);
-    LT_CHECK_EQ(OptOf(p.opened.back().second, "hwaccel"), std::string("dxva2"));
-    before = after; after.hwDecoder = "gpu";
-    size_t n = p.opened.size();
-    r = ApplySettingsLive(c, fm, before, after);
-    LT_CHECK(p.opened.size() == n + 1 || !r.reopened);   // reopened only if the plan's decoder really changed
-    n = p.opened.size();
-    r = ApplySettingsLive(c, fm, after, after);
-    LT_CHECK(!r.reopened && p.opened.size() == n && r.toast.empty());
-}
-
-LOGIC_TEST(settings_live_decoder_choice_before_capabilities_is_remembered) {
-    LiveFake p; wvp::PlaybackController c(p); wvp::FilterManager fm;
-    c.SetFilters(fm.Provider());
-    wvp::AppSettings before, after;
-    c.SetQueue({wvp::MediaItem("m.ts")}, 0, true);
-    LT_CHECK(p.opened.empty() && c.HasPendingOpen());
-    after.hwDecoder = "dxva2";
-    LiveApplyResult r = ApplySettingsLive(c, fm, before, after);
-    LT_CHECK(!r.reopened && p.opened.empty() && c.HasPendingOpen());
-    fm.SetContent({"h264", 8, 1920, 1080, false});
-    c.ApplyFilterChange(fm.SetCapabilities(wvp::fakecaps::Nvidia()));
-    LT_CHECK(fm.CurrentPlan() && fm.CurrentPlan()->hwaccel == "dxva2");
-    LT_CHECK_EQ(p.opened.size(), (size_t)1);
-    LT_CHECK_EQ(OptOf(p.opened[0].second, "hwaccel"), std::string("dxva2"));
 }
 
 LOGIC_TEST(settings_live_filters_in_planner_mode_reopen_when_the_decoder_must_change) {

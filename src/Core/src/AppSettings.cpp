@@ -99,21 +99,6 @@ void ReadPlacement(const Value& root, std::string_view key, WindowPlacement& p) 
 
 }
 
-bool IsValidHwDecoder(const std::string& v) {
-    return v == "auto" || v == "gpu" || v == "off" || v == "d3d11va" || v == "d3d12va" || v == "dxva2" || v == "videotoolbox";
-}
-
-PlanPrefs PlanPrefsFor(const std::string& hwDecoder) {
-    PlanPrefs p;
-    if (hwDecoder == "gpu") p.decoder = DecoderPref::PreferGpu;
-    else if (hwDecoder == "off") p.decoder = DecoderPref::Software;
-    else if (hwDecoder != "auto" && IsValidHwDecoder(hwDecoder)) {
-        p.decoder = DecoderPref::Forced;
-        p.forcedDecoder = hwDecoder;
-    }
-    return p;
-}
-
 SettingsStore::SettingsStore(std::string path) : path_(path.empty() ? DefaultPath() : std::move(path)) {}
 
 std::string SettingsStore::DefaultPath() { return platform::Combine(platform::AppDataDir(), "settings.json"); }
@@ -124,8 +109,6 @@ std::string SettingsStore::ToJson(const AppSettings& s) {
     w.Prop("theme", ThemeName(s.theme));
     w.Prop("accentColor", s.accentColor);
     w.Prop("alwaysOnTop", AlwaysOnTopName(s.alwaysOnTop));
-    w.Prop("hwDecoder", s.hwDecoder);
-    w.Prop("hwDecoderLastOn", s.hwDecoderLastOn);
     if (s.videoGpu.Automatic()) w.Prop("videoGpu", "auto");
     else {
         w.Key("videoGpu").BeginObject();
@@ -181,16 +164,6 @@ bool SettingsStore::FromJson(const std::string& utf8, AppSettings& out) {
         if (v->s == "Enable") out.alwaysOnTop = AlwaysOnTop::Enable;
         else if (v->s == "WhenPlaying") out.alwaysOnTop = AlwaysOnTop::WhenPlaying;
         else if (v->s == "WhenFullscreen") out.alwaysOnTop = AlwaysOnTop::WhenFullscreen;
-    }
-    {
-        std::string dec;
-        GetStr(r, "hwDecoder", dec);
-        out.hwDecoder = IsValidHwDecoder(dec) ? dec : std::string("auto");
-    }
-    {
-        std::string last;
-        GetStr(r, "hwDecoderLastOn", last);
-        out.hwDecoderLastOn = IsValidHwDecoder(last) && last != "off" ? last : std::string("auto");
     }
     if (auto* g = Member(r, "videoGpu", Value::Kind::Object)) {
         if (auto* v = Member(*g, "luid", Value::Kind::String)) out.videoGpu.luid = v->s;

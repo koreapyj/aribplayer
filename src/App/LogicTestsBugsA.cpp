@@ -112,7 +112,7 @@ LOGIC_TEST(bar_responsive_widgets_follow_the_layout_tiers) {
                 }
             }
             for (int i = 0; i < 3; i++) LT_CHECK(f.shell->Bar()->ChipWidget(i)->Visible() == (i < l.visibleChips));
-            LT_CHECK(f.shell->Bar()->ChipWidget(0)->Clickable() && !f.shell->Bar()->ChipWidget(1)->Clickable());   // only H/W toggles decoding
+            for (int i = 0; i < 3; i++) LT_CHECK(!f.shell->Bar()->ChipWidget(i)->CanFocus());
             LT_CHECK(f.shell->Bar()->Volume()->Visible() == l.volumeVisible);
         }
     }

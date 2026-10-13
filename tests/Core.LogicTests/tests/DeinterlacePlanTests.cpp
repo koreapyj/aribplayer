@@ -81,8 +81,8 @@ TEST_CASE(Deint_gpu_path_not_cheapest_says_so) {
     // Software decoding to a presenter that takes system frames only: the GPU deinterlacer would cost an upload and a
     // download, the CPU one nothing.
     PlanRequest r = Req("h264", 8, DeinterlaceMode::On);
-    r.decoder = DecoderPref::Software;
     CapabilitySet caps = fakecaps::Intel();
+    caps.decoders.clear();
     caps.presenters[0].inputs = { FrameDomain::System };
     Plan p = Run(caps, r);
     CHECK(p.ok);

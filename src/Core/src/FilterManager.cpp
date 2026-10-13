@@ -104,8 +104,6 @@ PlanRequest FilterManager::Request() const {
     r.settings = s_;
     r.ivtc = tuning_;
     r.content = content_;
-    r.decoder = decoder_;
-    r.forcedDecoder = forcedDecoder_;
     r.blacklist = blacklist_;
     return r;
 }
@@ -131,12 +129,6 @@ FilterChange FilterManager::SetCapabilities(CapabilitySet caps) {
     planner_ = std::make_shared<const PipelinePlanner>(std::move(caps));
     Replan();
     return Flush(before);
-}
-
-FilterChange FilterManager::SetPlanPreferences(DecoderPref decoder, std::string forcedDecoder) {
-    decoder_ = decoder;
-    forcedDecoder_ = std::move(forcedDecoder);
-    return Commit();
 }
 
 FilterChange FilterManager::SetContent(const ContentInfo& content) {
