@@ -1,0 +1,41 @@
+--- a/fftools/Makefile
++++ b/fftools/Makefile
+@@ -65,6 +65,23 @@ LIBFFPLAY_IMPLIB  = libffplay.dll.a
+ LIBFFPLAY_LDFLAGS = -shared -Wl,--out-implib,$(LIBFFPLAY_IMPLIB) -Wl,--disable-auto-image-base
+ LIBFFPLAY_CFLAGS  =
+ LIBFFPLAY_DLLDIR  = $(BINDIR)
++else ifeq ($(SLIBSUF),.dylib)
++# macOS: install name under INSTALL_NAME_DIR (configure --install-name-dir, e.g. @rpath), @loader_path
++# rpath so the libav*/libsw* dylibs next to it resolve. Exported: exactly the FFP_API functions of
++# ffplay.h (what __declspec(dllexport) exports on Windows), not every non-static ffp_* symbol.
++# Apple ld has no -soname (the generic branch below).
++LIBFFPLAY_SO      = libffplay.dylib
++LIBFFPLAY_IMPLIB  = $(LIBFFPLAY_SO)
++LIBFFPLAY_EXP     = fftools/libffplay.exp
++LIBFFPLAY_LDFLAGS = -dynamiclib -Wl,-install_name,$(INSTALL_NAME_DIR)/$(LIBFFPLAY_SO) \
++                    -Wl,-current_version,1,-compatibility_version,1 \
++                    -Wl,-exported_symbols_list,$(LIBFFPLAY_EXP) -Wl,-rpath,@loader_path
++LIBFFPLAY_CFLAGS  =
++LIBFFPLAY_DLLDIR  = $(SHLIBDIR)
++$(LIBFFPLAY_EXP): $(SRC_PATH)/fftools/ffplay.h | fftools
++	$(Q)sed -n 's/^FFP_API.*FFP_CALL *\(ffp_[A-Za-z0-9_]*\) *(.*/_\1/p' $< > $@
++	$(Q)test -s $@ || { echo "no FFP_API functions found in $<" >&2; rm -f $@; exit 1; }
++$(LIBFFPLAY_SO): $(LIBFFPLAY_EXP)
+ else
+ LIBFFPLAY_SO      = libffplay$(SLIBSUF)
+ LIBFFPLAY_IMPLIB  = $(LIBFFPLAY_SO)
+@@ -138,7 +155,7 @@ ifeq ($(CONFIG_FFPLAY),yes)
+ install-progs: install-libffplay
+ 
+ install-libffplay: $(LIBFFPLAY_SO) $(LIBFFPLAY_IMPLIB) $(FFCAPSDUMP)
+-	$(Q)mkdir -p "$(LIBFFPLAY_DLLDIR)" "$(LIBDIR)" "$(INCDIR)/libffplay"
++	$(Q)mkdir -p "$(LIBFFPLAY_DLLDIR)" "$(LIBDIR)" "$(INCDIR)/libffplay" "$(BINDIR)"
+ 	$(INSTALL) -m 755 $(LIBFFPLAY_SO) "$(LIBFFPLAY_DLLDIR)"
+ 	$(INSTALL) -m 755 $(FFCAPSDUMP) "$(BINDIR)"
+ ifeq ($(SLIBSUF),.dll)
+@@ -163,4 +180,4 @@ uninstall-progs:
+ 	$(RM) $(addprefix "$(BINDIR)/", $(ALLAVPROGS))
+ 
+ clean::
+-	$(RM) $(ALLAVPROGS) $(ALLAVPROGS_G) $(CLEANSUFFIXES:%=fftools/%) $(CLEANSUFFIXES:%=fftools/graph/%) $(CLEANSUFFIXES:%=fftools/textformat/%) libffplay.dll libffplay.dll.a libffplay.so ffcapsdump$(EXESUF)
++	$(RM) $(ALLAVPROGS) $(ALLAVPROGS_G) $(CLEANSUFFIXES:%=fftools/%) $(CLEANSUFFIXES:%=fftools/graph/%) $(CLEANSUFFIXES:%=fftools/textformat/%) libffplay.dll libffplay.dll.a libffplay.so libffplay.dylib fftools/libffplay.exp ffcapsdump$(EXESUF)

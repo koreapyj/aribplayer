@@ -1,0 +1,437 @@
+name: Build DMG
+
+on:
+  push:
+  pull_request:
+
+# Build and PR code receive read-only tokens. Only the release job can write.
+permissions:
+  contents: read
+
+jobs:
+  version:
+    name: Calculate shared MSI and DMG version
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      windows-run-id: ${{ steps.windows.outputs.run-id }}
+      windows-run-number: ${{ steps.windows.outputs.run-number }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Find the Windows run for the same event
+        id: windows
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const repo = context.repo;
+            const { data: current } = await github.rest.actions.getWorkflowRun({
+              ...repo, run_id: context.runId
+            });
+            // Workflow run numbers differ by workflow; reruns retain the original event time.
+            // Ref, source repository and event distinguish tags, branches and fork PRs at one SHA.
+            for (let attempt = 0; attempt < 30; attempt++) {
+              const runs = await github.paginate(github.rest.actions.listWorkflowRuns, {
+                ...repo, workflow_id: 'build-msi.yml', event: current.event,
+                head_sha: current.head_sha, branch: current.head_branch, per_page: 100
+              });
+              const matches = runs.filter(run =>
+                run.head_repository?.id === current.head_repository?.id &&
+                Math.abs(Date.parse(run.created_at) - Date.parse(current.created_at)) <= 60000
+              );
+              if (matches.length > 1) throw new Error('Ambiguous Windows run for this event');
+              if (matches.length === 1) {
+                core.setOutput('run-id', matches[0].id);
+                core.setOutput('run-number', matches[0].run_number);
+                core.info(`Windows version source: ${matches[0].html_url} (#${matches[0].run_number})`);
+                return;
+              }
+              await new Promise(resolve => setTimeout(resolve, 10000));
+            }
+            throw new Error('No matching Windows run appears within five minutes');
+      - name: Calculate MSI version
+        id: version
+        shell: pwsh
+        env:
+          WINDOWS_RUN_NUMBER: ${{ steps.windows.outputs.run-number }}
+        run: ./scripts/ci-version.ps1 -RunNumber $env:WINDOWS_RUN_NUMBER
+
+  mac:
+    name: App and DMG (macOS, arm64)
+    needs: version
+    # Shared Core's floating-point std::from_chars uses macOS 26's libc++.
+    runs-on: macos-26
+    timeout-minutes: 90
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
+      HOMEBREW_NO_AUTO_UPDATE: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Select Xcode and install build dependencies
+        timeout-minutes: 15
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = arm64
+          sudo xcode-select --switch "$DEVELOPER_DIR"
+          xcodebuild -version
+          if ! xcrun -sdk macosx metal --version; then
+            xcodebuild -downloadComponent MetalToolchain
+          fi
+          xcrun -sdk macosx metal --version
+          brew install cmake ninja nasm pkg-config quilt autoconf automake libtool coreutils
+      - name: Diagnose VideoToolbox, Metal and GUI session
+        id: host
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/host.m" <<'OBJC'
+          #import <Foundation/Foundation.h>
+          #import <VideoToolbox/VideoToolbox.h>
+          #import <Metal/Metal.h>
+          #import <ApplicationServices/ApplicationServices.h>
+          int main(void) {
+              @autoreleasepool {
+                  BOOL h264 = VTIsHardwareDecodeSupported(kCMVideoCodecType_H264);
+                  BOOL hevc = VTIsHardwareDecodeSupported(kCMVideoCodecType_HEVC);
+                  id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+                  BOOL virtualGPU = device && [device.name containsString:@"Paravirtual"];
+                  NSDictionary *session = CFBridgingRelease(CGSessionCopyCurrentDictionary());
+                  BOOL gui = [session[(__bridge NSString *)kCGSessionOnConsoleKey] boolValue] &&
+                             [session[(__bridge NSString *)kCGSessionLoginDoneKey] boolValue];
+                  printf("VTIsHardwareDecodeSupported: H.264=%d HEVC=%d\n", h264, hevc);
+                  printf("Metal device: %s\n", device ? device.name.UTF8String : "none");
+                  printf("GUI session available: %d; %s\n", gui, session.description.UTF8String ?: "none");
+                  FILE *out = fopen(getenv("GITHUB_OUTPUT"), "a");
+                  if (!out) return 1;
+                  fprintf(out, "h264=%d\nhevc=%d\nmetal=%d\ngui=%d\nvirtual_gpu=%d\n", h264, hevc, device != nil, gui, virtualGPU);
+                  fclose(out);
+              }
+          }
+          OBJC
+          xcrun clang -fobjc-arc "$RUNNER_TEMP/host.m" -o "$RUNNER_TEMP/host" \
+            -framework Foundation -framework VideoToolbox -framework Metal -framework ApplicationServices
+          "$RUNNER_TEMP/host"
+          launchctl print "gui/$(id -u)" > "$RUNNER_TEMP/gui-session.log" 2>&1 || true
+      - name: Compute the engine stamp digest
+        id: digest
+        shell: bash
+        run: |
+          set -euo pipefail
+          digest="$(bash ffmpeg/darwin/build-ffplay.sh --print-digest)"
+          [[ "$digest" =~ ^[0-9a-f]{64}$ ]]
+          echo "key=darwin-arm64-macos26-xcode26.3-$digest" >> "$GITHUB_OUTPUT"
+          echo "stamp=$digest" >> "$GITHUB_OUTPUT"
+      - name: Restore exact engine cache
+        id: cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ffmpeg/dist/darwin-arm64
+          # Only an exact input digest is reusable; no prefix fallback.
+          key: ${{ steps.digest.outputs.key }}
+      - name: Build the engine
+        timeout-minutes: 55
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash ffmpeg/darwin/build-ffplay.sh --work-dir "$RUNNER_TEMP/ffmpeg-work"
+      - name: Check the engine distributable
+        shell: bash
+        env:
+          EXPECTED_DIGEST: ${{ steps.digest.outputs.stamp }}
+        run: |
+          set -euo pipefail
+          dist=ffmpeg/dist/darwin-arm64
+          test "$(cat "$dist/.stamp")" = "$EXPECTED_DIGEST"
+          for file in libffplay.dylib ffplay.h ffmpeg ffprobe ffcapsdump ffmpeg-caps.inc \
+            include/libavutil/hwcontext.h licenses/ffmpeg/LICENSE.md licenses/ffmpeg/COPYING.GPLv3; do
+            test -s "$dist/$file"
+          done
+          for lib in avcodec avdevice avformat avutil avfilter swresample swscale; do
+            test -s "$dist/lib$lib.dylib"
+          done
+      - name: Save exact engine cache
+        if: steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ffmpeg/dist/darwin-arm64
+          key: ${{ steps.digest.outputs.key }}
+      - name: Diagnose VideoToolbox encoders
+        id: encoders
+        shell: bash
+        run: |
+          set -euo pipefail
+          ffmpeg="$PWD/ffmpeg/dist/darwin-arm64/ffmpeg"
+          "$ffmpeg" -hide_banner -encoders | tee "$RUNNER_TEMP/encoders.log"
+          # A compiled-in encoder is not evidence that the VM exposes the hardware.
+          available=1
+          for spec in 'h264_videotoolbox high nv12 1920x1080' \
+                      'hevc_videotoolbox main10 p010le 1920x1080' \
+                      'hevc_videotoolbox main10 p010le 7680x4320'; do
+            read -r codec profile format size <<< "$spec"
+            if "$ffmpeg" -hide_banner -nostdin -v warning -f lavfi \
+              -i "color=size=$size:rate=30,format=$format" -frames:v 1 \
+              -c:v "$codec" -profile:v "$profile" -allow_sw 0 -f null -; then
+              echo "Hardware encode supported: $spec"
+            else
+              echo "Hardware encode unavailable: $spec"
+              available=0
+            fi
+          done
+          echo "available=$available" >> "$GITHUB_OUTPUT"
+      - name: Build presenter and platform
+        shell: bash
+        run: |
+          set -euo pipefail
+          make -C mac/presenter -j"$(sysctl -n hw.ncpu)"
+          cmake -S mac/platform -B .tmp/build-mac-platform -G Ninja
+          cmake --build .tmp/build-mac-platform
+      - name: Build app and DMG
+        timeout-minutes: 10
+        shell: bash
+        env:
+          MSI_VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          mac/app/build-app.sh --version "$MSI_VERSION"
+          mv ".tmp/dist-mac/ARIB-Player-$MSI_VERSION.dmg" ".tmp/dist-mac/ARIB-Player-$MSI_VERSION-macos-arm64.dmg"
+      - name: Upload DMG on every push and PR
+        uses: actions/upload-artifact@v4
+        with:
+          name: aribplayer-dmg
+          path: .tmp/dist-mac/*.dmg
+          if-no-files-found: error
+          retention-days: 14
+      - name: Build portable Core logic tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake -S . -B .tmp/build-portable -G Ninja -DWVP_PORTABLE_CORE=ON -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            "-DCMAKE_CXX_FLAGS=-include $PWD/mac/core/include/wvpmac/libcxx_clock_cast.h"
+          cmake --build .tmp/build-portable
+      - name: Run portable Core logic tests
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -I - <<'PY'
+          from pathlib import Path
+          import re
+          import subprocess
+          skipped = {
+              "Loader_HttpAgainstLocalServer",
+              "ReferenceStore_refetches_each_time_and_uses_offline_cache_from_test_server",
+          }
+          exe = ".tmp/build-portable/bin/RelWithDebInfo/PlayerCore.LogicTests/PlayerCore.LogicTests"
+          sources = sorted(Path("tests/Core.LogicTests/tests").glob("*.cpp")) + sorted(Path("tests/Core.LogicTests/posix").glob("*.cpp"))
+          names = [name for src in sources for name in re.findall(r"^TEST_CASE\((\w+)\)", src.read_text(), re.M)]
+          assert names and skipped <= set(names)
+          for name in names:
+              if name in skipped:
+                  print(f"SKIP {name}: LocalHttpServer shutdown hangs on macOS (mac/README.md)", flush=True)
+                  continue
+              result = subprocess.run([exe, name], text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=30)
+              print(result.stdout, end="", flush=True)
+              assert result.returncode == 0 and "[  OK  ] " + name + "\n" in result.stdout, name
+          print(f"Portable Core: {len(names) - len(skipped)} selected, {len(skipped)} explicitly skipped")
+          PY
+      - name: Run platform tests
+        timeout-minutes: 5
+        shell: bash
+        env:
+          H264: ${{ steps.host.outputs.h264 }}
+          HEVC: ${{ steps.host.outputs.hevc }}
+        run: |
+          set -euo pipefail
+          python3 -I - <<'PY'
+          from pathlib import Path
+          import os
+          import re
+          import subprocess
+          names = re.findall(r"^TEST_CASE\((\w+)\)", Path("mac/platform/test/main.mm").read_text(), re.M)
+          assert names
+          for name in names:
+              if (name == "probe_reports_videotoolbox_and_metal" and (os.environ["H264"] != "1" or os.environ["HEVC"] != "1")) or (name == "build_capabilities_list_videotoolbox_decoders" and os.environ["HEVC"] != "1"):
+                  print(f"SKIP {name}: requires hardware VideoToolbox decode (H.264={os.environ['H264']}, HEVC={os.environ['HEVC']})", flush=True)
+                  continue
+              result = subprocess.run([".tmp/build-mac-platform/wvp_platform_mac_test", name], text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=30)
+              print(result.stdout, end="", flush=True)
+              assert result.returncode == 0 and "[  OK  ] " + name + "\n" in result.stdout, name
+          PY
+      - name: Build and test Mac theme
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake -S mac/ui -B .tmp/build-mac-ui -G Ninja
+          cmake --build .tmp/build-mac-ui
+          ctest --test-dir .tmp/build-mac-ui --output-on-failure --timeout 30
+      - name: Generate test media
+        id: media
+        timeout-minutes: 10
+        shell: bash
+        env:
+          ENCODERS: ${{ steps.encoders.outputs.available }}
+        run: |
+          set -euo pipefail
+          if [[ "$ENCODERS" = 1 ]]; then
+            mac/app/make-testmedia.sh "$RUNNER_TEMP/media"
+            echo 'available=1' >> "$GITHUB_OUTPUT"
+          else
+            echo '::notice::SKIP make-testmedia.sh: hardware VideoToolbox H.264 / HEVC Main10 encoding (including 8K) is unavailable.'
+          fi
+      - name: Run presenter harness
+        timeout-minutes: 10
+        shell: bash
+        env:
+          # Paravirtual GPU scheduling cannot validate wall-clock present() latency.
+          ARIBPLAYER_PRESENTER_SKIP_PRESENT_LATENCY: ${{ steps.host.outputs.virtual_gpu }}
+          MEDIA_AVAILABLE: ${{ steps.media.outputs.available }}
+          VIRTUAL_GPU: ${{ steps.host.outputs.virtual_gpu }}
+          HEVC: ${{ steps.host.outputs.hevc }}
+          METAL: ${{ steps.host.outputs.metal }}
+          GUI: ${{ steps.host.outputs.gui }}
+        run: |
+          set -euo pipefail
+          if [[ "$METAL" != 1 || "$GUI" != 1 ]]; then
+            echo '::notice::SKIP presenter harness: a Metal device and GUI session are required.'
+          elif [[ "$MEDIA_AVAILABLE" = 1 && "$HEVC" = 1 ]]; then
+            tests=abcdefghi
+            if [[ "$VIRTUAL_GPU" = 1 ]]; then
+              tests=abcdefgi
+              echo '::notice::SKIP presenter h: Apple Paravirtual GPU misses presentation deadlines; this test requires zero timeout drops across entire clips.'
+            fi
+            # Slow VM decoding must not discard frames before the presenter is tested.
+            mac/presenter/build/ffp_metal_test --media "$RUNNER_TEMP/media" --tests "$tests" --no-framedrop
+          else
+            echo '::notice::SKIP presenter a/b/d/e/f/h/i: hardware VideoToolbox decode and encoded fixtures are required; c/g use synthetic system-memory frames.'
+            mkdir -p "$RUNNER_TEMP/presenter-media"
+            mac/presenter/build/ffp_metal_test --media "$RUNNER_TEMP/presenter-media" --tests cg
+          fi
+      - name: Run app self-test
+        if: ${{ !cancelled() && steps.media.outcome == 'success' }}
+        timeout-minutes: 12
+        shell: bash
+        env:
+          # macOS supplies Services/window-tiling entries and their artwork, not the app.
+          ARIBPLAYER_SELFTEST_SKIP_SYSTEM_MENU_ICONS: '1'
+          MEDIA_AVAILABLE: ${{ steps.media.outputs.available }}
+          H264: ${{ steps.host.outputs.h264 }}
+          HEVC: ${{ steps.host.outputs.hevc }}
+          METAL: ${{ steps.host.outputs.metal }}
+          GUI: ${{ steps.host.outputs.gui }}
+        run: |
+          set -euo pipefail
+          if [[ "$MEDIA_AVAILABLE" = 1 && "$H264" = 1 && "$HEVC" = 1 && "$METAL" = 1 && "$GUI" = 1 ]]; then
+            if ! mac/app/selftest.sh '.tmp/dist-mac/ARIB Player.app' "$RUNNER_TEMP/media"; then
+              grep -h -E '^(FAIL|skip|selftest:)' .tmp/app-tests/*.log
+              exit 1
+            fi
+          else
+            echo '::notice::SKIP app self-test: requires hardware VideoToolbox H.264/HEVC, generated media, Metal and a GUI session.'
+          fi
+      - name: Preserve build and test logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-logs
+          include-hidden-files: true # Build and self-test logs live under .tmp/ and .work/.
+          path: |
+            ffmpeg/.work/build-darwin.log
+            .tmp/*.log
+            .tmp/app-tests/*.log
+            ${{ runner.temp }}/ffmpeg-work/build/*.out
+            ${{ runner.temp }}/ffmpeg-work/build/ffbuild/config.log
+            ${{ runner.temp }}/encoders.log
+            ${{ runner.temp }}/gui-session.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+  windows-release:
+    name: Wait for Windows release
+    needs: [version, mac]
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      # Waiting outside the publish concurrency group lets Windows acquire the same lock.
+      - name: Wait for the matching Windows workflow to succeed
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          WINDOWS_RUN_ID: ${{ needs.version.outputs.windows-run-id }}
+        run: gh run watch "$WINDOWS_RUN_ID" --interval 60 --exit-status
+
+  release:
+    name: Publish release
+    needs: [version, mac, windows-release]
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    concurrency:
+      # Both platforms serialize release mutations; builds still produce every artifact.
+      # The upload also skips stale main runs, since this queue is not FIFO.
+      group: windows-video-player-release-${{ github.ref }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: aribplayer-dmg
+          path: artifacts/release
+      - name: Add DMG to the Windows tag or rolling main pre-release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          MSI_VERSION: ${{ needs.version.outputs.version }}
+          WINDOWS_RUN_NUMBER: ${{ needs.version.outputs.windows-run-number }}
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF#refs/tags/}"
+          commit_line="Commit: $GITHUB_SHA"
+          msi="aribplayer-$MSI_VERSION-x64.msi"
+          if [[ "$GITHUB_REF" = refs/heads/main ]]; then
+            tag=main
+            head=$(gh api "repos/$GH_REPO/git/ref/heads/main" --jq '.object.sha')
+            if [[ "$head" != "$GITHUB_SHA" ]]; then
+              echo 'Skipping rolling release: a newer main commit exists.'
+              exit 0
+            fi
+            commit_line="Commit: ${GITHUB_SHA:0:8} ($GITHUB_SHA)"
+            msi="aribplayer-${GITHUB_SHA:0:8}-x64.msi"
+          fi
+          release=$(gh release view "$tag" --json body,assets,isDraft)
+          body=$(jq -r '.body' <<< "$release")
+          # Windows owns creation, tags, titles and release status. Never create a second release.
+          jq -e --arg msi "$msi" '.isDraft == false and any(.assets[]; .name == $msi)' <<< "$release" > /dev/null
+          grep -Fxq "$commit_line" <<< "$body"
+          if [[ "$tag" = main ]]; then
+            grep -Fxq "<!-- ci-run:$WINDOWS_RUN_NUMBER -->" <<< "$body"
+          fi
+          asset="ARIB-Player-$MSI_VERSION-macos-arm64.dmg"
+          test -s "artifacts/release/$asset"
+          gh release upload "$tag" "artifacts/release/$asset" --clobber
+          if [[ "$tag" = main ]]; then
+            # Windows prunes only MSI files; Mac prunes only its own older arm64 DMGs.
+            while IFS= read -r old; do
+              gh release delete-asset "$tag" "$old" --yes
+            done < <(jq -r --arg keep "$asset" '.assets[].name | select(startswith("ARIB-Player-") and endswith("-macos-arm64.dmg") and . != $keep)' <<< "$release")
+          fi
+          signing_note='macOS arm64: ad-hoc signed, not notarized.'
+          if [[ "$body" == *unsigned* ]] && ! grep -Fxq "$signing_note" <<< "$body"; then
+            printf '%s\n\n%s\n' "$body" "$signing_note" > "$RUNNER_TEMP/release-notes.txt"
+            gh release edit "$tag" --notes-file "$RUNNER_TEMP/release-notes.txt"
+          fi
+          echo "Published $tag ($MSI_VERSION, macOS arm64)."
