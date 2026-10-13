@@ -309,6 +309,7 @@ private:
     dbg::OverlayContext BuildDebugContext();
 
     void WirePipeline();
+    void ApplyPipelineContent();                          // replans from the current media info (at Prepared and when it changes)
     void OnPipelinePrepared();                            // content-aware replanning once per open generation
     void PipelinePoll(uint64_t now);                      // 1 Hz debug-info check for the first 10 s of an open
     void PipelineFallback(const wvp::PipelineSession::Fallback& fb);

@@ -28,6 +28,7 @@ public:
     Event<> Ended;
     Event<const PlayerErrorInfo&> Error;
     Event<const FilterErrorInfo&> FilterError;
+    Event<> MediaInfoChanged;                     // GetMediaInfo now differs (the video field order was decided from decoded frames)
     Event<const PresenterErrorInfo&> PresenterError;   // the presenter stopped for this open; the host reopens
     Event<int, bool> FrameStepDone;               // StepFrame finished (after its PositionChanged): direction, a frame was presented
     Event<int, bool, double, double> KeyframeSeekDone;   // SeekKeyframe finished (after its PositionChanged): direction, a keyframe was presented,

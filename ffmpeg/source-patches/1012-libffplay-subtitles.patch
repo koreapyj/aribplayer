@@ -116,7 +116,16 @@
      AVDictionary *format_opts, *codec_opts, *sws_dict, *swr_opts;
  } FFPOptions;
  
-@@ -525,6 +584,11 @@ typedef struct VideoState {
+@@ -508,6 +567,8 @@ typedef struct VideoState {
+     double kf_drop_pts;             /* decoder thread: drop decoded frames of kf_drop_serial earlier than this */
+     int kf_drop_serial;
+     SDL_atomic_t kf_drop_left;      /* published last: frames still allowed to be dropped */
++    int field_probe_frames;         /* decoder thread: frames inspected while the stream field order is unknown */
++    SDL_atomic_t field_probe_order; /* AV_FIELD_PROGRESSIVE / TT / BB once decided from frames, AV_FIELD_UNKNOWN before */
+     int read_pause_return;
+     AVFormatContext *ic;
+     int realtime;
+@@ -525,6 +586,11 @@ typedef struct VideoState {
      FrameQueue pictq;
      FrameQueue sampq;
      SubtitleLayer subtitles[FFP_SUBTITLE_LAYER_COUNT];
@@ -128,7 +137,7 @@
  
      Decoder auddec;
      Decoder viddec;
-@@ -603,7 +667,7 @@ typedef struct VideoState {
+@@ -603,7 +669,7 @@ typedef struct VideoState {
      AVFilterContext *out_audio_filter;  // the last filter in the audio chain
      AVFilterGraph *agraph;              // audio filter graph
  
@@ -137,7 +146,7 @@
  
      SDL_cond *continue_read_thread;
  
-@@ -650,6 +714,9 @@ typedef struct VideoState {
+@@ -650,6 +716,9 @@ typedef struct VideoState {
  #define FFP_CMD_REFRESH_CAPTION_STYLE 8 /* i: ignore_background | (force_outline << 1) */
  #define FFP_CMD_STEP_FRAME 9 /* i: +1 next output frame, -1 previous output frame */
  #define FFP_CMD_SEEK_KEYFRAME 10 /* i: +1 next keyframe, -1 previous keyframe */
@@ -147,7 +156,7 @@
  
  #define FFP_REVERSE_STEP_NONE 0
  #define FFP_REVERSE_STEP_SEEKING 1
-@@ -665,6 +732,8 @@ typedef struct FFPCmd {
+@@ -665,6 +734,8 @@ typedef struct FFPCmd {
      int i;
      char *s;                    /* OPEN: url */
      FFPOptions *o;              /* OPEN: options (ownership moves to the VideoState) */
@@ -156,7 +165,7 @@
      SDL_sem *done;              /* synchronous commands */
      VideoState *is_out;         /* DETACH/DESTROY: the detached media, to be closed by the caller */
  } FFPCmd;
-@@ -700,6 +769,9 @@ struct FFPlayer {
+@@ -700,6 +771,9 @@ struct FFPlayer {
      SDL_atomic_t volume, muted;
      SDL_atomic_t audio_pref;        /* FFP_ARIB_PREF_*, persists across opens (the host resets it) */
      SDL_atomic_t subtitle_visible[FFP_SUBTITLE_LAYER_COUNT];
@@ -166,7 +175,7 @@
      double position, duration;      /* mirrors for ffp_get_position/duration */
      char *media_info;
      int state;
-@@ -748,7 +820,8 @@ struct FFPlayer {
+@@ -748,7 +822,8 @@ struct FFPlayer {
      int last_subtitle_width[FFP_SUBTITLE_LAYER_COUNT];
      int last_subtitle_height[FFP_SUBTITLE_LAYER_COUNT];
      int last_subtitle_visible[FFP_SUBTITLE_LAYER_COUNT];
@@ -176,7 +185,7 @@
      int last_subtitle_serial[FFP_SUBTITLE_LAYER_COUNT];
      int last_subtitle_stream_index[FFP_SUBTITLE_LAYER_COUNT];
      uint64_t last_subtitle_generation[FFP_SUBTITLE_LAYER_COUNT];
-@@ -805,6 +878,7 @@ static void ffp_opts_free(FFPOptions *o)
+@@ -805,6 +880,7 @@ static void ffp_opts_free(FFPOptions *o)
      av_freep(&o->hwaccel);
      av_freep(&o->filter_hw_device);
      av_freep(&o->hwframes);
@@ -184,7 +193,7 @@
      av_dict_free(&o->format_opts);
      av_dict_free(&o->codec_opts);
      av_dict_free(&o->sws_dict);
-@@ -1297,7 +1371,8 @@ static void ffp_store_snapshot(FFPlayer
+@@ -1297,7 +1373,8 @@ static void ffp_store_snapshot(FFPlayer
          avsubtitle_free(&ffp->last_subtitles[i]);
          ffp->last_subtitle_width[i] = ffp->last_subtitle_height[i] = 0;
          ffp->last_subtitle_visible[i] = i != FFP_SUBTITLE_SUPERIMPOSE || is->o->superimpose;
@@ -194,7 +203,7 @@
          ffp->last_subtitle_stream_index[i] = layer->stream_index;
          ffp->last_subtitle_generation[i] = layer->generation;
          SDL_LockMutex(layer->packets.mutex);
-@@ -1844,7 +1919,7 @@ static void decoder_subtitle_snapshot(De
+@@ -1844,7 +1921,7 @@ static void decoder_subtitle_snapshot(De
      if (request->expected_pts != AV_NOPTS_VALUE &&
          d->avctx->pkt_timebase.num > 0 && d->avctx->pkt_timebase.den > 0)
          empty_pkt.pts = av_rescale_q(request->expected_pts, AV_TIME_BASE_Q, d->avctx->pkt_timebase);
@@ -203,7 +212,7 @@
          d->pkt_serial != request->serial ||
          !ffp_subtitle_snapshot_state_matches(layer, request)) {
          ret = AVERROR(EAGAIN);
-@@ -2420,6 +2495,573 @@ static int ffp_subtitle_queue_attime(Sub
+@@ -2420,6 +2497,573 @@ static int ffp_subtitle_queue_attime(Sub
      return ret;
  }
  
@@ -777,7 +786,7 @@
  static void ffp_subtitle_update_layer(SubtitleLayer *layer, double pts, int serial)
  {
      Frame *sp;
-@@ -2431,13 +3073,27 @@ static void ffp_subtitle_update_layer(Su
+@@ -2431,13 +3075,27 @@ static void ffp_subtitle_update_layer(Su
      int attime_valid, attime_serial = 0, attime_width = 0, attime_height = 0;
      int packet_serial;
  
@@ -806,7 +815,7 @@
          layer->attime_requested_serial != packet_serial &&
          ffp_subtitle_queue_attime(layer, pts, packet_serial) >= 0)
          layer->attime_requested_serial = packet_serial;
-@@ -2600,7 +3256,7 @@ static void ffp_subtitle_check_resize(Vi
+@@ -2600,7 +3258,7 @@ static void ffp_subtitle_check_resize(Vi
      for (i = 0; i < FFP_SUBTITLE_LAYER_COUNT; i++) {
          SubtitleLayer *layer = &is->subtitles[i];
          int width, height;
@@ -815,7 +824,7 @@
              layer->resize_candidate_width <= 0 || layer->resize_candidate_height <= 0 ||
              now - layer->resize_candidate_since < 100000)
              continue;
-@@ -3426,18 +4082,8 @@ static int ffp_overlay_build(VideoState
+@@ -3426,18 +4084,8 @@ static int ffp_overlay_build(VideoState
      if (!layer->active_valid || layer->active.format != 0 || !layer->active.num_rects)
          return 0;
      n = layer->active.num_rects;
@@ -836,7 +845,7 @@
  
      for (i = 0; i < n; i++) {
          AVSubtitleRect *r = layer->active.rects[i];
-@@ -3502,6 +4148,16 @@ static void ffp_overlay_layers(VideoStat
+@@ -3502,6 +4150,16 @@ static void ffp_overlay_layers(VideoStat
          SubtitleLayer *layer = &is->subtitles[i];
          int width, height, ret;
  
@@ -853,7 +862,7 @@
          SDL_LockMutex(is->dbg_mutex);
          width = layer->canvas_width;
          height = layer->canvas_height;
-@@ -3624,6 +4280,10 @@ static void stream_component_close(Video
+@@ -3624,6 +4282,10 @@ static void stream_component_close(Video
          packet_queue_abort_routed(&sl->packets, &sl->routing_stream_index);
          decoder_abort(&sl->decoder, &sl->frames);
          decoder_destroy(&sl->decoder);
@@ -864,7 +873,7 @@
          if (sl->startup_sem)
              SDL_DestroySemaphore(sl->startup_sem);
          sl->startup_sem = NULL;
-@@ -3652,7 +4312,7 @@ static void stream_component_close(Video
+@@ -3652,7 +4314,7 @@ static void stream_component_close(Video
          ffp_dbg_subtitle_closed(is, subtitle_layer);
          sl->st = NULL;
          sl->stream_index = -1;
@@ -873,7 +882,7 @@
      } else {
          ffp_dbg_stream_closed(is, codecpar->codec_type);
      }
-@@ -3707,6 +4367,15 @@ static void stream_close(VideoState *is)
+@@ -3707,6 +4369,15 @@ static void stream_close(VideoState *is)
          avsubtitle_free(&is->subtitles[i].active);
          ffp_overlay_release(&is->subtitles[i]);
      }
@@ -889,7 +898,52 @@
      SDL_DestroyCond(is->continue_read_thread);
      sws_freeContext(is->subtitle_rgba_ctx);
      av_free(is->filename);
-@@ -6602,10 +7271,17 @@ static int subtitle_thread(void *arg)
+@@ -4250,6 +4921,34 @@ static int ffp_keep_hw_frame(VideoState
+     return !empty;
+ }
+ 
++/* Frames the field order probe inspects before it calls the stream progressive: three full 3:2 pulldown cycles,
++ * about half a second at 30 fps. A single interlaced frame decides at once. */
++#define FFP_FIELD_PROBE_FRAMES 15
++
++static void ffp_update_media_info(VideoState *is);
++
++/* Decoder output, before any filter (IVTC / deinterlacing rewrite the interlaced flag). */
++static void ffp_probe_field_order(VideoState *is, const AVFrame *frame)
++{
++    int order = AV_FIELD_UNKNOWN;
++    char json[64];
++
++    if (is->video_st->codecpar->field_order != AV_FIELD_UNKNOWN || SDL_AtomicGet(&is->field_probe_order))
++        return;
++    if (frame->flags & AV_FRAME_FLAG_INTERLACED)
++        order = (frame->flags & AV_FRAME_FLAG_TOP_FIELD_FIRST) ? AV_FIELD_TT : AV_FIELD_BB;
++    else if (++is->field_probe_frames >= FFP_FIELD_PROBE_FRAMES)
++        order = AV_FIELD_PROGRESSIVE;
++    if (order == AV_FIELD_UNKNOWN)
++        return;
++
++    SDL_AtomicSet(&is->field_probe_order, order);
++    ffp_update_media_info(is);
++    snprintf(json, sizeof(json), "{\"field_order\":\"%s\"}",
++             order == AV_FIELD_PROGRESSIVE ? "progressive" : order == AV_FIELD_TT ? "tt" : "bb");
++    ffp_emit(is->ffp, FFP_EVENT_MEDIA_INFO, json);
++}
++
+ static int get_video_frame(VideoState *is, AVFrame *frame)
+ {
+     const FFPOptions *o = is->o;
+@@ -4263,6 +4962,9 @@ static int get_video_frame(VideoState *i
+     if (got_picture && frame->colorspace == AVCOL_SPC_UNSPECIFIED)
+         frame->colorspace = frame->height > 576 ? AVCOL_SPC_BT709 : AVCOL_SPC_SMPTE170M;
+ 
++    if (got_picture)
++        ffp_probe_field_order(is, frame);
++
+     /* After a keyframe step the decoder can output frames in front of the keyframe (open-GOP leading B pictures
+      * that still decode); the step lands on the keyframe, so those never reach the audio alignment or the queue. */
+     if (got_picture && SDL_AtomicGet(&is->kf_drop_left) > 0) {
+@@ -6602,10 +7304,17 @@ static int subtitle_thread(void *arg)
  
          if ((got_subtitle = decoder_decode_frame(dec, NULL, &sp->sub)) < 0)
              break;
@@ -909,7 +963,7 @@
              pts = sp->sub.pts != AV_NOPTS_VALUE ? sp->sub.pts / (double)AV_TIME_BASE :
                    dec->subtitle_packet_pts != AV_NOPTS_VALUE ? dec->subtitle_packet_pts / (double)AV_TIME_BASE : 0.0;
              sp->pts = pts;
-@@ -7222,31 +7898,6 @@ static void ffp_history_key(AVFormatCont
+@@ -7222,31 +7931,6 @@ static void ffp_history_key(AVFormatCont
      snprintf(key, size, "%s|%"PRId64"|%"PRId64"|%d|%d", url, file_size, (int64_t)st.st_mtime, stream_index, layer);
  }
  
@@ -941,7 +995,7 @@
  /* open a given stream. Return 0 if OK */
  static int stream_component_open(VideoState *is, int stream_index, int subtitle_layer)
  {
-@@ -7286,8 +7937,7 @@ static int stream_component_open(VideoSt
+@@ -7286,8 +7970,7 @@ static int stream_component_open(VideoSt
  
      switch(codec_type){
          case AVMEDIA_TYPE_AUDIO   : is->last_audio_stream    = stream_index; forced_codec_name =    o->audio_codec_name; break;
@@ -951,7 +1005,7 @@
          case AVMEDIA_TYPE_VIDEO   : is->last_video_stream    = stream_index; forced_codec_name =    o->video_codec_name; break;
      }
      if (forced_codec_name)
-@@ -7356,6 +8006,13 @@ static int stream_component_open(VideoSt
+@@ -7356,6 +8039,13 @@ static int stream_component_open(VideoSt
          }
      }
  
@@ -965,7 +1019,16 @@
      av_dict_set(&opts, "flags", "+copy_opaque", AV_DICT_MULTIKEY);
  
      if (codec_type == AVMEDIA_TYPE_VIDEO) {
-@@ -7501,12 +8158,12 @@ static int stream_component_open(VideoSt
+@@ -7489,6 +8179,8 @@ static int stream_component_open(VideoSt
+             goto fail;
+         is->viddec.reorder_pts = o->decoder_reorder_pts;
+         is->viddec.vs = is;
++        is->field_probe_frames = 0;
++        SDL_AtomicSet(&is->field_probe_order, AV_FIELD_UNKNOWN);
+         if ((ret = decoder_start(&is->viddec, stream_index, video_thread, "video_decoder", is)) < 0)
+             goto out;
+         is->queue_attachments_req = 1;
+@@ -7501,12 +8193,12 @@ static int stream_component_open(VideoSt
          if (arib) {
              sl->stream_index = -1;
              sl->st = NULL;
@@ -980,7 +1043,7 @@
              sl->startup_stream_index = -1;
          }
          if (arib) {
-@@ -7566,7 +8223,7 @@ static int stream_component_open(VideoSt
+@@ -7566,7 +8258,7 @@ static int stream_component_open(VideoSt
                  sl->startup_stream_index = -1;
                  sl->stream_index = -1;
                  sl->st = NULL;
@@ -989,7 +1052,7 @@
                  ic->streams[stream_index]->discard = AVDISCARD_ALL;
                  goto out;
              }
-@@ -7593,7 +8250,7 @@ static int stream_component_open(VideoSt
+@@ -7593,7 +8285,7 @@ static int stream_component_open(VideoSt
                  sl->startup_stream_index = -1;
                  sl->stream_index = -1;
                  sl->st = NULL;
@@ -998,7 +1061,7 @@
                  goto out;
              }
              SDL_DestroySemaphore(sl->startup_sem);
-@@ -7603,24 +8260,35 @@ static int stream_component_open(VideoSt
+@@ -7603,24 +8295,35 @@ static int stream_component_open(VideoSt
              sl->startup_stream_index = -1;
              sl->stream_index = stream_index;
              sl->st = ic->streams[stream_index];
@@ -1036,7 +1099,7 @@
                  ic->streams[stream_index]->discard = AVDISCARD_ALL;
                  goto out;
              }
-@@ -7648,7 +8316,7 @@ fail:
+@@ -7648,7 +8351,7 @@ fail:
          sl->startup_stream_index = -1;
          sl->stream_index = -1;
          sl->st = NULL;
@@ -1045,7 +1108,7 @@
          ic->streams[stream_index]->discard = AVDISCARD_ALL;
      }
      if (avctx)
-@@ -7787,7 +8455,9 @@ static void ffp_build_media_info(VideoSt
+@@ -7787,7 +8490,9 @@ static void ffp_build_media_info(VideoSt
      av_bprintf(bp, ",\"seekable\":%s,\"bit_rate\":%"PRId64",\"streams\":[",
                 ffp_is_seekable(is) ? "true" : "false", (int64_t)ic->bit_rate);
  
@@ -1056,20 +1119,30 @@
          AVStream *st = ic->streams[i];
          AVCodecParameters *par = st->codecpar;
          const char *type;
-@@ -7825,6 +8495,12 @@ static void ffp_build_media_info(VideoSt
+@@ -7825,6 +8530,22 @@ static void ffp_build_media_info(VideoSt
              json_string(bp, pf ? pf : "");
              av_bprintf(bp, ",\"color_transfer\":");
              json_string(bp, av_color_transfer_name(par->color_trc));
-+            av_bprintf(bp, ",\"field_order\":\"%s\"",
-+                       par->field_order == AV_FIELD_PROGRESSIVE ? "progressive" :
-+                       par->field_order == AV_FIELD_TT          ? "tt" :
-+                       par->field_order == AV_FIELD_BB          ? "bb" :
-+                       par->field_order == AV_FIELD_TB          ? "tb" :
-+                       par->field_order == AV_FIELD_BT          ? "bt" : "unknown");
++            {
++                enum AVFieldOrder fo = par->field_order;
++                int from_frames = 0;
++
++                if (fo == AV_FIELD_UNKNOWN && st == is->video_st) {
++                    fo = SDL_AtomicGet(&is->field_probe_order);
++                    from_frames = fo != AV_FIELD_UNKNOWN;
++                }
++                av_bprintf(bp, ",\"field_order\":\"%s\",\"field_order_source\":\"%s\"",
++                           fo == AV_FIELD_PROGRESSIVE ? "progressive" :
++                           fo == AV_FIELD_TT          ? "tt" :
++                           fo == AV_FIELD_BB          ? "bb" :
++                           fo == AV_FIELD_TB          ? "tb" :
++                           fo == AV_FIELD_BT          ? "bt" : "unknown",
++                           from_frames ? "frames" : "stream");
++            }
          } else if (par->codec_type == AVMEDIA_TYPE_AUDIO) {
              av_bprintf(bp, ",\"sample_rate\":%d,\"channels\":%d",
                         par->sample_rate, par->ch_layout.nb_channels);
-@@ -7844,6 +8520,9 @@ static void ffp_build_media_info(VideoSt
+@@ -7844,6 +8565,9 @@ static void ffp_build_media_info(VideoSt
              }
              av_bprintf(bp, ",\"component_tag\":%ld", component_tag);
          }
@@ -1079,7 +1152,7 @@
          av_bprintf(bp, ",\"selected\":%s,\"language\":", selected ? "true" : "false");
          t = av_dict_get(st->metadata, "language", NULL, 0);
          json_string(bp, t && t->value[0] ? t->value : "und");
-@@ -7854,6 +8533,24 @@ static void ffp_build_media_info(VideoSt
+@@ -7854,6 +8578,24 @@ static void ffp_build_media_info(VideoSt
          }
          av_bprintf(bp, "}");
      }
@@ -1104,7 +1177,7 @@
      av_bprintf(bp, "]");
      if (is->arib) {
          /* roles at the time of the call; audio 2 may appear later (index -1 now) */
-@@ -8903,7 +9600,6 @@ static VideoState *stream_open(FFPlayer
+@@ -8903,7 +9645,6 @@ static VideoState *stream_open(FFPlayer
      is->id = SDL_AtomicAdd(&g_ffp.next_id, 1) + 1;
      is->last_video_stream = is->video_stream = -1;
      is->last_audio_stream = is->audio_stream = -1;
@@ -1112,7 +1185,7 @@
      is->last_seek_pos = NAN;
      is->pt_want = -1;
      is->displayed_video_pts = NAN;
-@@ -8918,6 +9614,8 @@ static VideoState *stream_open(FFPlayer
+@@ -8918,6 +9659,8 @@ static VideoState *stream_open(FFPlayer
          is->subtitles[i].stream_index = -1;
          SDL_AtomicSet(&is->subtitles[i].routing_stream_index, -1);
          is->subtitles[i].startup_stream_index = -1;
@@ -1121,7 +1194,7 @@
          is->subtitles[i].active_serial = -1;
          is->subtitles[i].active_start = is->subtitles[i].active_end = NAN;
          is->subtitles[i].ov_generation = UINT64_MAX;
-@@ -8950,7 +9648,7 @@ static VideoState *stream_open(FFPlayer
+@@ -8950,7 +9693,7 @@ static VideoState *stream_open(FFPlayer
          av_log(NULL, AV_LOG_FATAL, "SDL_CreateCond(): %s\n", SDL_GetError());
          goto fail;
      }
@@ -1130,7 +1203,7 @@
          av_log(NULL, AV_LOG_FATAL, "SDL_CreateMutex(): %s\n", SDL_GetError());
          goto fail;
      }
-@@ -8995,8 +9693,7 @@ static void stream_cycle_channel(VideoSt
+@@ -8995,8 +9738,7 @@ static void stream_cycle_channel(VideoSt
          start_index = is->last_audio_stream;
          old_index = is->audio_stream;
      } else {
@@ -1140,7 +1213,7 @@
      }
      stream_index = start_index;
  
-@@ -9016,12 +9713,6 @@ static void stream_cycle_channel(VideoSt
+@@ -9016,12 +9758,6 @@ static void stream_cycle_channel(VideoSt
      for (;;) {
          if (++stream_index >= nb_streams)
          {
@@ -1153,7 +1226,7 @@
              if (start_index == -1)
                  return;
              stream_index = 0;
-@@ -9039,10 +9730,6 @@ static void stream_cycle_channel(VideoSt
+@@ -9039,10 +9775,6 @@ static void stream_cycle_channel(VideoSt
                  break;
              case AVMEDIA_TYPE_VIDEO:
                  goto the_end;
@@ -1164,7 +1237,7 @@
              default:
                  break;
              }
-@@ -9056,8 +9743,117 @@ static void stream_cycle_channel(VideoSt
+@@ -9056,8 +9788,117 @@ static void stream_cycle_channel(VideoSt
             old_index,
             stream_index);
  
@@ -1284,7 +1357,7 @@
  }
  
  
-@@ -9477,7 +10273,7 @@ static void ffp_cmd_refresh_caption_styl
+@@ -9477,7 +10318,7 @@ static void ffp_cmd_refresh_caption_styl
      is->o->arib_ignore_background = !!(flags & 1);
      is->o->arib_force_outline = !!(flags & 2);
      layer = &is->subtitles[FFP_SUBTITLE_CAPTION];
@@ -1293,7 +1366,7 @@
          return;
      stream_index = layer->stream_index;
      stream_component_close(is, stream_index, FFP_SUBTITLE_CAPTION);
-@@ -9488,6 +10284,28 @@ static void ffp_cmd_refresh_caption_styl
+@@ -9488,6 +10329,28 @@ static void ffp_cmd_refresh_caption_styl
      is->force_refresh = 1;
  }
  
@@ -1322,7 +1395,7 @@
  /* returns 1 if the instance was destroyed (and must not be touched anymore) */
  static int ffp_exec_cmd(FFPlayer *ffp, FFPCmd *c)
  {
-@@ -9542,6 +10360,23 @@ static int ffp_exec_cmd(FFPlayer *ffp, F
+@@ -9542,6 +10405,23 @@ static int ffp_exec_cmd(FFPlayer *ffp, F
      case FFP_CMD_REFRESH_CAPTION_STYLE:
          ffp_cmd_refresh_caption_style(ffp, c->i);
          break;
@@ -1346,7 +1419,7 @@
      }
      return destroyed;
  }
-@@ -9668,6 +10503,17 @@ static void ffp_tick(FFPlayer *ffp, doub
+@@ -9668,6 +10548,17 @@ static void ffp_tick(FFPlayer *ffp, doub
          if (pending)
              is->force_refresh = 1;
      }
@@ -1364,7 +1437,7 @@
      if (SDL_AtomicGet(&is->prepared) && !is->video_st && !is->cleared_audio_only) {
          is->cleared_audio_only = 1;
          ffp_pres_clear(ffp);
-@@ -10057,6 +10903,12 @@ FFP_API FFPlayer *FFP_CALL ffp_create(co
+@@ -10057,6 +10948,12 @@ FFP_API FFPlayer *FFP_CALL ffp_create(co
      SDL_AtomicSet(&ffp->muted, 0);
      SDL_AtomicSet(&ffp->subtitle_visible[FFP_SUBTITLE_CAPTION], 1);
      SDL_AtomicSet(&ffp->subtitle_visible[FFP_SUBTITLE_SUPERIMPOSE], 1);
@@ -1377,7 +1450,7 @@
  
  #if CONFIG_AVDEVICE
      avdevice_register_all();
-@@ -10180,6 +11032,7 @@ static const FFPOptDef ffp_optdefs[] = {
+@@ -10180,6 +11077,7 @@ static const FFPOptDef ffp_optdefs[] = {
      { "filter_hw_device", OT_STRING, OO(filter_hw_device) },
      { "hwframes",         OT_STRING, OO(hwframes) },
      { "start_paused",     OT_BOOL,   OO(start_paused) },
@@ -1385,7 +1458,7 @@
      { NULL }
  };
  
-@@ -10392,6 +11245,7 @@ FFP_API int FFP_CALL ffp_open(FFPlayer *
+@@ -10392,6 +11290,7 @@ FFP_API int FFP_CALL ffp_open(FFPlayer *
      c->o = o;
  
      ffp_close_media(ffp);
@@ -1393,7 +1466,7 @@
  
      SDL_LockMutex(ffp->mutex);
      if (ov.has_vf) {
-@@ -10556,7 +11410,7 @@ FFP_API char *FFP_CALL ffp_get_media_inf
+@@ -10556,7 +11455,7 @@ FFP_API char *FFP_CALL ffp_get_media_inf
  
  FFP_API int FFP_CALL ffp_cycle_stream(FFPlayer *ffp, int type)
  {
@@ -1402,7 +1475,7 @@
          return FFP_EINVAL;
      return ffp_post_simple(ffp, FFP_CMD_CYCLE, 0, type);
  }
-@@ -10900,7 +11754,8 @@ FFP_API int FFP_CALL ffp_snapshot_ex(FFP
+@@ -10900,7 +11799,8 @@ FFP_API int FFP_CALL ffp_snapshot_ex(FFP
      int canvas_w[FFP_SUBTITLE_LAYER_COUNT] = { 0, 0 };
      int canvas_h[FFP_SUBTITLE_LAYER_COUNT] = { 0, 0 };
      int visible[FFP_SUBTITLE_LAYER_COUNT] = { 0, 0 };
@@ -1412,7 +1485,7 @@
      int serial[FFP_SUBTITLE_LAYER_COUNT] = { 0, 0 };
      int stream_index[FFP_SUBTITLE_LAYER_COUNT] = { -1, -1 };
      uint64_t generation[FFP_SUBTITLE_LAYER_COUNT] = { 0, 0 };
-@@ -10919,7 +11774,8 @@ FFP_API int FFP_CALL ffp_snapshot_ex(FFP
+@@ -10919,7 +11819,8 @@ FFP_API int FFP_CALL ffp_snapshot_ex(FFP
          visible[i] = SDL_AtomicGet(&ffp->subtitle_visible[i]) && ffp->last_subtitle_visible[i];
          canvas_w[i] = ffp->last_subtitle_width[i];
          canvas_h[i] = ffp->last_subtitle_height[i];
@@ -1422,7 +1495,7 @@
          serial[i] = ffp->last_subtitle_serial[i];
          stream_index[i] = ffp->last_subtitle_stream_index[i];
          generation[i] = ffp->last_subtitle_generation[i];
-@@ -10944,8 +11800,14 @@ FFP_API int FFP_CALL ffp_snapshot_ex(FFP
+@@ -10944,8 +11845,14 @@ FFP_API int FFP_CALL ffp_snapshot_ex(FFP
          goto end;
      }
      for (i = 0; i < FFP_SUBTITLE_LAYER_COUNT; i++) {
@@ -1439,7 +1512,7 @@
                  (canvas_w[i] != *width || canvas_h[i] != *height)) {
                  AVSubtitle rerendered = { 0 };
                  int rerender_ret = AVERROR(EAGAIN);
-@@ -10953,7 +11815,7 @@ FFP_API int FFP_CALL ffp_snapshot_ex(FFP
+@@ -10953,7 +11860,7 @@ FFP_API int FFP_CALL ffp_snapshot_ex(FFP
                  /* Keep the video frame and its cue snapshot paired. The mutex also prevents the media
                   * from being destroyed while the request is queued and serviced by its decoder thread. */
                  SDL_LockMutex(ffp->snap_mutex);
@@ -1448,7 +1521,7 @@
                      ffp->last_subtitle_stream_index[i] == stream_index[i] &&
                      ffp->last_subtitle_serial[i] == serial[i] &&
                      ffp->last_subtitle_generation[i] == generation[i] &&
-@@ -11779,3 +12641,274 @@ FFP_API void FFP_CALL ffp_set_log_callba
+@@ -11779,3 +12686,274 @@ FFP_API void FFP_CALL ffp_set_log_callba
      SDL_AtomicUnlock(&g_ffp_log.lock);
      av_log_set_callback(cb ? ffp_log_trampoline : av_log_default_callback);
  }
@@ -1725,7 +1798,13 @@
 +}
 --- a/fftools/ffplay.h
 +++ b/fftools/ffplay.h
-@@ -79,13 +79,14 @@ enum {
+@@ -75,17 +75,20 @@ enum {
+                                         "removed_reason":"..."}; see FFPPresenterSink.failed */
+     FFP_EVENT_STEP_DONE    = 10,     /* json: {"direction":1|-1,"moved":0|1}; see ffp_step_frame */
+     FFP_EVENT_KEYSEEK_DONE = 11,     /* json: {"direction":1|-1,"moved":0|1,"position":s,"key":s}; see ffp_seek_keyframe */
++    FFP_EVENT_MEDIA_INFO   = 12,     /* json: {"field_order":"progressive"|"tt"|"bb"}: the video field order was decided
++                                        from decoded frames; ffp_get_media_info now reports it */
+ };
  
  enum { FFP_SEEK_ABSOLUTE = 0, FFP_SEEK_RELATIVE = 1 };
  
@@ -1743,7 +1822,7 @@
   * drawn in index order (caption first, superimpose above it). The same generation with the same canvas size always has
   * the same pixels, so a presenter may keep its upload and skip the copy. */
  enum {
-@@ -298,7 +299,8 @@ FFP_API int         FFP_CALL ffp_set_out
+@@ -298,7 +301,8 @@ FFP_API int         FFP_CALL ffp_set_out
   * "filter_hw_device" = "type" (the device chosen like hwaccel's) or "type:device" (av_hwdevice_ctx_create with that
   * device string) for the video graph (like ffmpeg's -filter_hw_device). The device is attached lazily when the graph is
   * first built; if that fails FFP_EVENT_FILTER_ERROR is raised and the previous filter string is restored.
@@ -1753,7 +1832,7 @@
  FFP_API int         FFP_CALL ffp_open(FFPlayer *p, const char *url, const char *options_kv);
  FFP_API int         FFP_CALL ffp_stop(FFPlayer *p);               /* closes media; the presenter is cleared to black */
  
-@@ -361,7 +363,44 @@ FFP_API double      FFP_CALL ffp_get_pos
+@@ -361,7 +365,44 @@ FFP_API double      FFP_CALL ffp_get_pos
  FFP_API double      FFP_CALL ffp_get_duration(FFPlayer *p);       /* seconds; <= 0 if unknown/live */
  FFP_API char       *FFP_CALL ffp_get_media_info(FFPlayer *p);     /* JSON (see below) or NULL; ffp_free */
  
@@ -1798,7 +1877,7 @@
  
  /* ARIB audio model. For an ARIB transport stream (media info "arib_audio" present) the video program's audio is
   * "audio 1" (ADTS AAC with component tag 0x10 / 0x83 / 0x85, else the first untagged AAC) and "audio 2" (tag 0x11),
-@@ -408,9 +447,10 @@ FFP_API int         FFP_CALL ffp_filter_
+@@ -408,9 +449,10 @@ FFP_API int         FFP_CALL ffp_filter_
  FFP_API int         FFP_CALL ffp_snapshot(FFPlayer *p, uint8_t **out_bgra, int *width,
                                            int *height, int *stride);
  /* ffp_snapshot_ex uses the same native-size video path. FFP_SNAPSHOT_SUBTITLES composites the

@@ -214,6 +214,9 @@ void FfPlayer::HandleNative(int ev, const char* jsonText) {
             Enqueue([this, dir, moved, position, key] { KeyframeSeekDone.raise(dir, moved, position, key); });
         }
         break;
+    case FFP_EVENT_MEDIA_INFO:
+        Enqueue([this] { MediaInfoChanged.raise(); });
+        break;
     default: break;
     }
 }

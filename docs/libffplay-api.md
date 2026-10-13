@@ -146,6 +146,7 @@ a seekable video stream (audio only, cover art, live) it queues a plain relative
 | 9 | PRESENTER_ERROR | `{"presenter":"<FFPPresenter.name>","error":"<reason>","device_lost":false,"removed_reason":""}` (the presenter called `sink.failed()` or returned an error: no more pictures for this open, audio continues; the host reopens, the presenter recovers its device in its next `open`) |
 | 10 | STEP_DONE | `{"direction":1,"moved":1}` (the `ffp_step_frame` request finished, after its POSITION event; `moved` is `0` when no frame was presented) |
 | 11 | KEYSEEK_DONE | `{"direction":-1,"moved":1,"position":12.480,"key":12.480}` (the `ffp_seek_keyframe` / `ffp_skip` request finished, after its POSITION event; `position` is the presented output frame, `key` the source PTS of the decoder frame it came from, both media-relative seconds; both `-1` and `moved` `0` when nothing moved) |
+| 12 | MEDIA_INFO | `{"field_order":"progressive"}` (`ffp_get_media_info` now differs: the video stream declared no field order and the engine decided it from the decoded frames; raised at most once per video stream open, after PREPARED; see `field_order_source`) |
 
 Order on a successful open: `STATE opening` -> `PREPARED` -> `STATE playing` -> `POSITION`...
 `ffp_stop` -> `STATE stopped`. `ffp_pause`/`ffp_play` -> `STATE paused`/`playing`.
@@ -159,7 +160,7 @@ Order on a successful open: `STATE opening` -> `PREPARED` -> `STATE playing` -> 
   "render": {"width": 1920, "height": 1080},
   "streams": [
     {"index":0,"type":"video","codec":"h264","width":1920,"height":1080,"sar_num":1,"sar_den":1,
-     "fps":25.0,"pix_fmt":"yuv420p","color_transfer":"bt709","field_order":"progressive","fourcc":"avc1","selected":true,"language":"und"},
+     "fps":25.0,"pix_fmt":"yuv420p","color_transfer":"bt709","field_order":"progressive","field_order_source":"stream","fourcc":"avc1","selected":true,"language":"und"},
     {"index":1,"type":"audio","codec":"aac","fourcc":"mp4a","sample_rate":48000,"channels":2,"selected":true,"language":"eng"},
     {"index":2,"type":"subtitle","codec":"subrip","external":false,"text":true,"selected":false,"language":"eng","title":"..."},
     {"index":3,"type":"subtitle","codec":"subrip","external":true,"path":"C:\\v\\movie.ko.srt","text":true,"selected":true,"language":"und"}
@@ -177,7 +178,12 @@ listed. `language` / `title` of an external track come from the file's stream me
 of the codec id (`avformat_get_riff_video_tags` / `avformat_get_riff_audio_tags`; video and audio only); absent when there is none.
 Case is as stored (`avc1`, `mpg2`), compare case-insensitively. Video streams also carry `color_transfer`: `av_color_transfer_name` of the
 stream's `color_trc` (`"bt709"`, `"smpte2084"` = PQ, `"arib-std-b67"` = HLG, `"unknown"` when unspecified). and `field_order`: the codec parameters' field order (`"progressive"`, `"tt"`, `"bb"`, `"tb"`, `"bt"`, `"unknown"`);
-the host treats only `"progressive"` as proof that deinterlacing is not needed.
+the host treats only `"progressive"` as proof that deinterlacing is not needed. `field_order_source` is `"stream"` for the codec
+parameters' value (including `"unknown"`) and `"frames"` once the engine decided an unknown order from the decoder output (selected
+video stream only): the first frame flagged interlaced gives `"tt"` / `"bb"` (top field first flag), 15 consecutive frames without
+the flag give `"progressive"`. The frames are inspected before any filter, so IVTC and deinterlacing do not influence it. The
+decision arrives after `PREPARED` (when the frames have been decoded) as `FFP_EVENT_MEDIA_INFO`; it is not revised later and a
+paused open that never decodes that many frames stays `"unknown"`.
 
 For an ARIB transport stream the object has one more key, `"arib_audio":{"audio1":1,"audio2":-1}`: the AVStream
 indexes of the two audio roles at the time of the call (`-1` = no stream holds the role now; audio 2 may appear later).

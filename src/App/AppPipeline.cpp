@@ -64,6 +64,7 @@ void App::WirePipeline() {
         ReportPlanProblem();
     };
     player_->Prepared.add([this](const wvp::MediaPreparedInfo&) { OnPipelinePrepared(); });
+    player_->MediaInfoChanged.add([this] { ApplyPipelineContent(); });
     player_->Error.add([this](const wvp::PlayerErrorInfo& e) {
         if (e.DeviceLost) OnVideoDeviceLost("decoder: " + e.Message + " " + e.RemovedReason);
     });
@@ -81,6 +82,11 @@ void App::OnPipelinePrepared() {
         firstPreparedMs_ = Now() - startMs_;
         log::Event("open", "first media prepared " + std::to_string(firstPreparedMs_) + " ms after start");
     }
+    ApplyPipelineContent();
+}
+
+void App::ApplyPipelineContent() {
+    if (!player_ || !ctl_) return;
     auto mi = player_->GetMediaInfo();
     if (!mi) return;
     const std::string url = lastOpenUrl_;
@@ -93,7 +99,7 @@ void App::OnPipelinePrepared() {
         return;
     }
     log::Event("pipeline", "content: " + pr.content.codec + " " + std::to_string(pr.content.width) + "x" + std::to_string(pr.content.height) + " " +
-                               std::to_string(pr.content.bitDepth) + "-bit" + (pr.changed ? " (changed since the plan was made)" : ""));
+                               std::to_string(pr.content.bitDepth) + "-bit" + (pr.content.progressive ? " progressive" : "") + (pr.changed ? " (changed since the plan was made)" : ""));
     wvp::FilterChange ch = svc_->filters.SetContent(pr.content);
     RefreshFiltersPanel(*this);
     if (ch.reopen) {

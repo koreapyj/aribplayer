@@ -175,6 +175,21 @@ TEST_CASE_INTEGRATION(FfPlayer_open_raises_prepared_with_media_properties) {
     CHECK(a);
 }
 
+TEST_CASE_INTEGRATION(FfPlayer_decides_unknown_field_order_from_decoded_frames) {
+    Session s;
+    int changed = 0;
+    s.player->MediaInfoChanged.add([&] { changed++; });
+    s.OpenAndPrepare(Media("mpeg4-240p-short.mp4"));
+    auto fieldOrder = [&] {
+        auto mi = s.player->GetMediaInfo();
+        REQUIRE(mi.has_value());
+        for (auto& st : mi->Of(StreamType::Video)) return st.FieldOrder;
+        return std::string();
+    };
+    REQUIRE_MSG(WaitFor([&] { return changed > 0; }), "no MediaInfoChanged");
+    CHECK_EQ(fieldOrder(), std::string("progressive"));
+}
+
 TEST_CASE_INTEGRATION(FfPlayer_seek_pause_and_volume) {
     Session s;
     s.OpenAndPrepare(Media("testsrc2-720p.mp4"));
