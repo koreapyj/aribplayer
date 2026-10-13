@@ -237,6 +237,32 @@ TEST_CASE(Settings_currentPlaylist_round_trips_and_defaults_empty_when_missing) 
     CHECK(old.currentPlaylist.empty());
 }
 
+TEST_CASE(Settings_subtitle_style_defaults_round_trip_and_clamp) {
+    AppSettings d;
+    CHECK(d.subtitle.font == "Malgun Gothic");
+    CHECK(d.subtitle.fontScale == 1.0);
+    CHECK(d.subtitle.primaryRgba == 0xFFFFFFFFu && d.subtitle.outlineRgba == 0x000000FFu);
+    CHECK(!d.subtitle.overrideFont && !d.subtitle.overrideSize && !d.subtitle.overrideColors && !d.subtitle.overrideBorder && !d.subtitle.applyToAss);
+
+    AppSettings s;
+    s.subtitle.font = "Noto Sans KR";
+    s.subtitle.fontScale = 1.25;
+    s.subtitle.primaryRgba = 0xFFFF00FFu;
+    s.subtitle.outlineRgba = 0x112233FFu;
+    s.subtitle.outlineWidth = 3.5;
+    s.subtitle.overrideFont = s.subtitle.overrideSize = s.subtitle.overrideColors = s.subtitle.overrideBorder = s.subtitle.applyToAss = true;
+    AppSettings back;
+    CHECK(SettingsStore::FromJson(SettingsStore::ToJson(s), back));
+    CHECK(back.subtitle == s.subtitle);
+    CHECK(back == s);
+
+    AppSettings clamped;
+    CHECK(SettingsStore::FromJson("{\"subtitle\":{\"font\":\"\",\"fontScale\":99,\"outlineWidth\":-4}}", clamped));
+    CHECK(clamped.subtitle.font == "Malgun Gothic");
+    CHECK(clamped.subtitle.fontScale == 4.0);
+    CHECK(clamped.subtitle.outlineWidth == 0.0);
+}
+
 TEST_CASE(Settings_gpu_decoder_round_trip_and_old_presenter_key_ignored) {
     TempDir t;
     SettingsStore store(t.File("pr.json"));

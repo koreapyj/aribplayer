@@ -8,6 +8,7 @@ enum class DropRoute;
 class AppContext;
 void OpenFiles(AppContext& ctx);     // multi-select; video-only opens replace the unnamed slot, playlist-only opens create references
 void OpenFolder(AppContext& ctx);    // non-recursive media + playlist open, naturally sorted
+void LoadSubtitleFile(AppContext& ctx);   // "Load subtitle file…": picks subtitle files, attaches them to the current media and selects the first
 void OpenUrl(AppContext& ctx);       // URL classification (video/HLS vs. playlist reference) -> OpenPaths
 void ImportPlaylist(AppContext& ctx, std::function<void(const std::string&)> onImported = {}); // local editable copy; never touches the source
 void AddPlaylistUrlFromPrompt(AppContext& ctx, std::function<void(const std::string&)> onAdded = {});  // prompts for a URL, then AddPlaylistUrl

@@ -15,7 +15,7 @@ namespace app {
 enum class CommandId : int {
     None = 0,
     PlayPause, Previous, Next, SeekBack5, SkipForward30,
-    CycleSubtitles,
+    ToggleSubtitles, CycleSubtitleTrack, LoadSubtitleFile, SubtitleDelayEarlier, SubtitleDelayLater, SubtitleDelayReset,
     ToggleMute, VolumeUp, VolumeDown,
     ToggleFullscreen, Escape, ToggleMiniPlayer,
     OpenFiles, OpenFolder, OpenUrl, CaptureFrame, CaptureFrameWithCaptions,

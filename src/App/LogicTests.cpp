@@ -405,7 +405,7 @@ LOGIC_TEST(keyboard_table_mapping) {
         {0xA6, 0}, {0xAC, 0}, {'F', kModCtrl | kModShift}, {'Y', kModCtrl}, {'Q', kModCtrl}, {'G', kModCtrl},
         {'O', kModCtrl | kModShift}, {0x72, kModCtrl}, {0x74, kModCtrl}, {0x75, kModCtrl}, {'E', kModCtrl | kModShift}};
     for (auto [vk, mods] : removed) LT_CHECK(LookupKey(vk, mods) == C::None);
-    for (C gone : {C::Previous, C::Next, C::CycleSubtitles, C::ToggleMiniPlayer, C::ZoomToFill})
+    for (C gone : {C::Previous, C::Next, C::ToggleSubtitles, C::ToggleMiniPlayer, C::ZoomToFill})
         LT_CHECK(ShortcutText(gone).empty());
     LT_CHECK(LookupKey('C', kModCtrl | kModAlt) == C::None);
     LT_CHECK(LookupKey('X', kModCtrl) == C::None);
@@ -958,7 +958,7 @@ LOGIC_TEST(title_bar_modes_in_the_shell) {
 
 LOGIC_TEST(shell_focus_order_tab_cycle) {
     ShellFixture f(ShellMode::NowPlaying);
-    BarModel m; m.loaded = true; m.prepared = true; m.seekable = true; m.dur = 60; m.playing = true; m.hasNext = true; m.subCount = 1;
+    BarModel m; m.loaded = true; m.prepared = true; m.seekable = true; m.dur = 60; m.playing = true; m.hasNext = true;
     f.shell->Bar()->SetModel(m);
     auto order = f.host.FocusOrder();
     LT_CHECK(order.size() > 8);

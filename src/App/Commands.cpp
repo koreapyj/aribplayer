@@ -9,6 +9,7 @@ namespace {
 // Virtual-key codes (numeric so this file needs no windows.h).
 constexpr int VK_TAB_ = 0x09, VK_RETURN_ = 0x0D, VK_ESCAPE_ = 0x1B, VK_SPACE_ = 0x20, VK_PRIOR_ = 0x21, VK_NEXT_ = 0x22,
               VK_LEFT_ = 0x25, VK_UP_ = 0x26, VK_RIGHT_ = 0x27, VK_DOWN_ = 0x28,
+              VK_OEM_2_ = 0xBF, VK_OEM_COMMA_ = 0xBC, VK_OEM_PERIOD_ = 0xBE,
               VK_F1_ = 0x70, VK_F2_ = 0x71, VK_F3_ = 0x72, VK_F4_ = 0x73, VK_F5_ = 0x74, VK_F6_ = 0x75, VK_F7_ = 0x76;
 constexpr unsigned N = 0, S = kModShift, C = kModCtrl, A = kModAlt, CS = kModCtrl | kModShift, CA = kModCtrl | kModAlt;
 
@@ -59,6 +60,10 @@ std::vector<KeyBinding> Make() {
         {'E', S, K::ShowEqualizer},
         {'V', CS, K::VideoEnhancements},
         {VK_TAB_, N, K::ToggleDebugOverlay},
+        {'W', N, K::CycleSubtitleTrack},
+        {VK_OEM_COMMA_, N, K::SubtitleDelayEarlier},
+        {VK_OEM_PERIOD_, N, K::SubtitleDelayLater},
+        {VK_OEM_2_, N, K::SubtitleDelayReset},
     };
 }
 }
@@ -94,6 +99,9 @@ std::wstring ShortcutText(CommandId c) {
         case VK_NEXT_: s += L"PageDown"; break;
         case VK_RETURN_: s += L"Enter"; break;
         case VK_ESCAPE_: s += L"Esc"; break;
+        case VK_OEM_2_: s += L"/"; break;
+        case VK_OEM_COMMA_: s += L","; break;
+        case VK_OEM_PERIOD_: s += L"."; break;
         case VK_F1_: s += L"F1"; break;
         case VK_F2_: s += L"F2"; break;
         case VK_F3_: s += L"F3"; break;

@@ -40,14 +40,11 @@ std::wstring Widen(const std::string& s) {
 bool SameModel(const BarModel& a, const BarModel& b) {
     return a.loaded == b.loaded && a.canPlaySelection == b.canPlaySelection && a.prepared == b.prepared && a.seekable == b.seekable && a.pos == b.pos && a.dur == b.dur &&
            a.playing == b.playing && a.hasPrev == b.hasPrev && a.hasNext == b.hasNext && a.shuffle == b.shuffle && a.repeat == b.repeat &&
-           a.volume == b.volume && a.muted == b.muted && a.subCount == b.subCount && a.fullscreen == b.fullscreen && a.mini == b.mini &&
+           a.volume == b.volume && a.muted == b.muted && a.fullscreen == b.fullscreen && a.mini == b.mini &&
            a.panelOpen == b.panelOpen && a.panelAvailable == b.panelAvailable && a.controlPanelOpen == b.controlPanelOpen &&
            a.timeMode == b.timeMode && a.chips == b.chips && a.title == b.title;
 }
 
-int CycleableSubtitleCount(const wvp::MediaInfo& mi) {
-    return (int)std::count_if(mi.Streams.begin(), mi.Streams.end(), fx::IsCycleableSubtitle);
-}
 }
 
 void App::RestoreCurrentPlaylist() {
@@ -311,8 +308,6 @@ void App::WirePlayer() {
         RefreshChips();
         mediaAspect_ = p.HasVideo ? MiniAspectForMedia(p.DisplayWidth(), p.DisplayHeight()) : 16.0 / 9.0;
         if (!p.Title.empty()) model_.title = wvp::ToWide(p.Title);
-        model_.subCount = 0;
-        if (auto mi = player_->GetMediaInfo()) model_.subCount = CycleableSubtitleCount(*mi);
         CheckReady();
         UpdateTitleText();
         OnMediaPrepared.raise(p);
@@ -421,7 +416,7 @@ void App::WirePlayer() {
         acrylicPresenterFailed_ = false;
         acrylicNeedsApply_ = true;
         model_.title = it ? wvp::ToWide(it->DisplayTitle()) : std::wstring();
-        model_.prepared = false; model_.seekable = false; model_.pos = 0; model_.dur = 0; model_.subCount = 0;
+        model_.prepared = false; model_.seekable = false; model_.pos = 0; model_.dur = 0;
         if (!it && !pending_ && currentPlaylistItems_.empty()) {   // nothing left to play: leave the video-only modes, stay in the player view
             if (modes_.mini) SetMiniPlayer(false);
             else if (modes_.fullscreen) SetFullscreen(false);
@@ -766,16 +761,12 @@ void App::Execute(CommandId c) {
     case C::WindowSize50: case C::WindowSize100: case C::WindowSize150: case C::WindowSize200: case C::WindowSizeMax:
         SizeWindowToVideo(WindowScale(c));
         break;
-    case C::CycleSubtitles: {
-        auto mi = player_ ? player_->GetMediaInfo() : std::nullopt;
-        if (mi && fx::ToggleAribCaptionVisibility(*mi, svc_->settings.showCaptions)) {
-            OnSettingsChanged(*this);
-            ShowToast(svc_->settings.showCaptions ? Tr(L"Captions on", L"자막 켜짐") : Tr(L"Captions off", L"자막 꺼짐"));
-        } else if (model_.subCount > 0) {
-            CycleTrack(*this, wvp::StreamType::Subtitle);
-        }
-        break;
-    }
+    case C::ToggleSubtitles: ToggleSubtitles(*this); break;
+    case C::CycleSubtitleTrack: CycleSubtitleTrack(*this); break;
+    case C::LoadSubtitleFile: LoadSubtitleFile(*this); break;
+    case C::SubtitleDelayEarlier: AdjustSubtitleDelay(*this, -500); break;
+    case C::SubtitleDelayLater: AdjustSubtitleDelay(*this, +500); break;
+    case C::SubtitleDelayReset: AdjustSubtitleDelay(*this, 0); break;
     case C::Stop:
         if (modes_.mini) SetMiniPlayer(false);   // the mini player needs media: Stop returns to the player view first
         CloseMedia();
@@ -857,7 +848,7 @@ dbg::OverlayContext App::BuildDebugContext() {
                              std::to_string(videoChoice_.runnerUpTotal.Weighted()) + ", device " + std::to_string(videoChoice_.runnerUpTotal.deviceCopies) + "]";
         c.adapterWarn = haveVideoChoice_ && (videoChoice_.crossAdapter || videoChoice_.manualMissing || videoChoice_.index < 0);
     }
-    c.deinterlaceRequested = fs.deinterlace == wvp::DeinterlaceMode::On ? "deinterlace" : fs.deinterlace == wvp::DeinterlaceMode::Ivtc ? "ivtc" : "";
+    c.deinterlaceRequested = svc_->filters.Content().progressive ? "" : fs.deinterlace == wvp::DeinterlaceMode::On ? "deinterlace" : fs.deinterlace == wvp::DeinterlaceMode::Ivtc ? "ivtc" : "";
     return c;
 }
 

@@ -29,9 +29,10 @@ enum class Cmd {
     SetSpeed,        // value = speed
     Zoom,            // flag = new state
     SetAlwaysOnTop,  // index = sl::AlwaysOnTopIndex
-    SelectAudio,     // index = position among the audio streams
+    SelectAudio,     // index = media-info stream index
     SelectAribAudio, // ARIB TS: index = 0 audio 1, 1 audio 2 (the audio preference)
-    SelectSubtitle,  // index = position among cycleable subtitle streams (superimpose excluded), -1 = off
+    SelectSubtitle,  // index = media-info stream index (embedded or external), -1 = off
+    SetSubtitleVisible,   // flag = new state
 };
 struct MenuCmd {
     Cmd cmd = Cmd::Execute;
@@ -47,6 +48,7 @@ struct MenuState {
     double speed = 1.0;
     bool zoom = false;
     std::vector<wvp::StreamInfo> audio, subs;   // same-type streams of the current media
+    bool subVisible = true;                     // the caption layer is shown (setting showCaptions)
     // ARIB TS: the audio item is a fixed pair Audio 1 / Audio 2 (the preference); audio 2 stays selectable while no
     // stream holds it, because it may appear later. The check mark is the user's selection, never the source playing.
     bool aribAudio = false;
@@ -55,7 +57,7 @@ struct MenuState {
     bool arib1Present = false, arib2Present = false;
 };
 std::vector<pui::MenuItemDesc> BuildMenu(const MenuState& s, std::function<void(const MenuCmd&)> run);
-/// The subtitle track items (Off + the tracks); empty when the media has no subtitle stream.
+/// The subtitle items (Off, the tracks, Load subtitle file, Show, Sync); empty when no media is open.
 std::vector<pui::MenuItemDesc> BuildSubtitleItems(const MenuState& s, std::function<void(const MenuCmd&)> run);
 MenuState CaptureMenuState(AppContext& ctx);
 }

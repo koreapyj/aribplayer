@@ -55,6 +55,7 @@ ContentInfo PipelineSession::ContentOf(const MediaInfo& info) {
     c.height = v->Height;
     c.bitDepth = BitDepthOf(v->PixFmt);
     c.chroma = ChromaOf(v->PixFmt);
+    c.progressive = v->FieldOrder == "progressive";
     return c;
 }
 

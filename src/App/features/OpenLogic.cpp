@@ -4,6 +4,8 @@
 
 #include <algorithm>
 #include <cwctype>
+#include <exception>
+#include <filesystem>
 
 #include "LogicTest.h"
 #include "Localize.h"
@@ -31,6 +33,41 @@ std::wstring Join(const std::vector<std::wstring>& v) {
     }
     return s;
 }
+std::wstring StripExt(const std::wstring& name) {
+    size_t dot = name.rfind(L'.');
+    return dot == std::wstring::npos || dot == 0 ? name : name.substr(0, dot);
+}
+// "ko", "kor", "ko-kr", "zh-hans": a 2-3 letter primary subtag, then optional subtags of 1-8 letters or digits.
+bool IsLangTag(const std::wstring& t) {
+    size_t start = 0;
+    for (bool first = true;; first = false) {
+        size_t end = t.find(L'-', start);
+        if (end == std::wstring::npos) end = t.size();
+        size_t len = end - start;
+        if (first ? (len < 2 || len > 3) : (len < 1 || len > 8)) return false;
+        for (size_t k = start; k < end; k++) {
+            wchar_t c = t[k];
+            bool alpha = (c >= L'a' && c <= L'z');
+            bool digit = (c >= L'0' && c <= L'9');
+            if (!(alpha || (!first && digit))) return false;
+        }
+        if (end == t.size()) return true;
+        start = end + 1;
+    }
+}
+// `base` (lower-case, subtitle extension removed) is `stem` or `stem.<lang>`.
+bool MatchSubtitleBase(const std::wstring& base, const std::wstring& stem, std::wstring& langTag) {
+    if (base.empty()) return false;
+    if (base == stem) {
+        langTag.clear();
+        return true;
+    }
+    if (base.size() > stem.size() + 1 && base.compare(0, stem.size(), stem) == 0 && base[stem.size()] == L'.') {
+        langTag = base.substr(stem.size() + 1);
+        return IsLangTag(langTag);
+    }
+    return false;
+}
 }
 
 const std::vector<std::wstring>& MediaExtensions() {
@@ -52,6 +89,87 @@ bool IsMediaFile(const std::wstring& path) {
 bool IsPlaylistFile(const std::wstring& path) {
     auto e = ExtOf(path);
     return e == L".m3u" || e == L".m3u8";
+}
+
+const std::vector<std::wstring>& SubtitleExtensions() {
+    static const std::vector<std::wstring> e = {L".srt", L".smi", L".sami", L".ass", L".ssa", L".vtt", L".sup"};
+    return e;
+}
+std::wstring SubtitleFilterPattern() { return Join(SubtitleExtensions()); }
+bool IsSubtitleFile(const std::wstring& path) {
+    auto e = ExtOf(path);
+    if (e.empty()) return false;
+    const auto& v = SubtitleExtensions();
+    return std::find(v.begin(), v.end(), e) != v.end();
+}
+
+std::vector<SidecarSubtitle> FindSidecarSubtitles(const std::wstring& videoPath, const std::vector<std::wstring>& dirEntries) {
+    size_t slash = videoPath.find_last_of(L"\\/");
+    const std::wstring prefix = slash == std::wstring::npos ? std::wstring() : videoPath.substr(0, slash + 1);
+    const std::wstring videoName = Lower(videoPath.substr(prefix.size()));
+    const std::wstring videoStem = StripExt(videoName);
+
+    std::vector<SidecarSubtitle> found;
+    for (const auto& entry : dirEntries) {
+        if (!IsSubtitleFile(entry)) continue;
+        const std::wstring lower = Lower(entry);
+        const std::wstring base = lower.substr(0, lower.size() - ExtOf(entry).size());
+        SidecarSubtitle s;
+        if (!MatchSubtitleBase(base, videoName, s.langTag) && !MatchSubtitleBase(base, videoStem, s.langTag)) continue;
+        s.path = prefix + entry;
+        found.push_back(std::move(s));
+    }
+    std::sort(found.begin(), found.end(), [](const SidecarSubtitle& a, const SidecarSubtitle& b) {
+        bool ta = !a.langTag.empty(), tb = !b.langTag.empty();
+        if (ta != tb) return tb;
+        return Lower(a.path) < Lower(b.path);
+    });
+    return found;
+}
+
+std::vector<SidecarSubtitle> ListSidecarSubtitles(const std::wstring& videoPath) {
+    std::vector<std::wstring> names;
+    try {
+        std::filesystem::path dir = std::filesystem::path(videoPath).parent_path();
+        if (dir.empty()) dir = L".";
+        for (const auto& entry : std::filesystem::directory_iterator(dir)) {
+            std::error_code ec;
+            if (entry.is_regular_file(ec)) names.push_back(entry.path().filename().wstring());
+        }
+    } catch (const std::exception&) {
+        return {};
+    }
+    return FindSidecarSubtitles(videoPath, names);
+}
+
+namespace {
+std::string LangKey(std::string tag) {
+    for (auto& c : tag) c = (char)tolower((unsigned char)c);
+    if (size_t dash = tag.find_first_of("-_"); dash != std::string::npos) tag.resize(dash);
+    struct Alias { const char* two; const char* three; const char* alt; };
+    static const Alias aliases[] = {
+        {"ko", "kor", ""}, {"en", "eng", ""}, {"ja", "jpn", ""}, {"zh", "zho", "chi"}, {"fr", "fra", "fre"}, {"de", "deu", "ger"},
+        {"es", "spa", ""}, {"it", "ita", ""}, {"pt", "por", ""}, {"ru", "rus", ""}, {"nl", "nld", "dut"}};
+    for (const auto& a : aliases)
+        if (tag == a.two || tag == a.three || (*a.alt && tag == a.alt)) return a.three;
+    return tag;
+}
+}
+
+int PickSidecarTrack(const std::vector<SidecarTrack>& tracks, const std::vector<std::string>& preferredLangs) {
+    for (const auto& want : preferredLangs) {
+        const std::string key = LangKey(want);
+        for (const auto& t : tracks)
+            if (!t.lang.empty() && LangKey(t.lang) == key) return t.streamIndex;
+    }
+    return tracks.empty() ? -1 : tracks.front().streamIndex;
+}
+
+std::vector<std::string> PreferredSubtitleLanguages() {
+    std::vector<std::string> langs = {"kor"};
+    wchar_t name[LOCALE_NAME_MAX_LENGTH]{};
+    if (GetUserDefaultLocaleName(name, LOCALE_NAME_MAX_LENGTH) > 0) langs.push_back(wvp::ToUtf8(name));
+    return langs;
 }
 
 std::string PlaylistName(const std::string& source, const std::string& title) {
@@ -248,6 +366,34 @@ LOGIC_TEST(open_relative_time) {
     LT_CHECK(RelativeTime(now, now - 3 * 86400000LL) == L"3 days ago");
     LT_CHECK(RelativeTime(now, now - 70 * 86400000LL) == L"2 months ago");
     LT_CHECK(RelativeTime(now, 0).empty());
+}
+
+LOGIC_TEST(open_sidecar_subtitles) {
+    LT_CHECK(IsSubtitleFile(L"C:\\s\\Show.SMI"));
+    LT_CHECK(!IsSubtitleFile(L"notes.txt"));
+    const std::wstring video = L"C:\\m\\video.mp4";
+    auto m = FindSidecarSubtitles(video, {L"video.srt", L"video.ko.srt", L"video.mp4.smi", L"video.mp4.ko.srt", L"video2.srt",
+                                          L"other.mp4.smi", L"video.mp4.extra.words.srt", L"video.txt"});
+    LT_CHECK_EQ(m.size(), (size_t)4);
+    if (m.size() == 4) {
+        LT_CHECK(m[0].path == L"C:\\m\\video.mp4.smi" && m[0].langTag.empty());
+        LT_CHECK(m[1].path == L"C:\\m\\video.srt" && m[1].langTag.empty());
+        LT_CHECK(m[2].path == L"C:\\m\\video.ko.srt" && m[2].langTag == L"ko");
+        LT_CHECK(m[3].path == L"C:\\m\\video.mp4.ko.srt" && m[3].langTag == L"ko");
+    }
+    auto upper = FindSidecarSubtitles(video, {L"VIDEO.SRT"});
+    LT_CHECK_EQ(upper.size(), (size_t)1);
+    auto tagged = FindSidecarSubtitles(video, {L"video.zh-Hans.vtt"});
+    LT_CHECK(tagged.size() == 1 && tagged[0].langTag == L"zh-hans");
+}
+
+LOGIC_TEST(open_sidecar_pick) {
+    const std::vector<std::string> pref = {"kor", "en-US"};
+    LT_CHECK_EQ(PickSidecarTrack({}, pref), -1);
+    LT_CHECK_EQ(PickSidecarTrack({{5, ""}, {6, "jpn"}}, pref), 5);
+    LT_CHECK_EQ(PickSidecarTrack({{5, "eng"}, {6, "ja"}, {7, "ko"}}, pref), 7);
+    LT_CHECK_EQ(PickSidecarTrack({{5, "ja"}, {6, "en"}}, pref), 6);
+    LT_CHECK_EQ(PickSidecarTrack({{5, "und"}, {6, "KOR"}}, pref), 6);
 }
 
 }

@@ -20,6 +20,8 @@ void ShowFiltersPanel(AppContext& ctx, FiltersTab tab);
 bool IsFiltersPanelOpen(AppContext& ctx);
 /// 제어창 button / F7: closes the panel when open, otherwise opens it on the Video tab.
 void ToggleFiltersPanel(AppContext& ctx);
+/// Rebuilds the open panel (the opened file's content decides whether the Deinterlace group is usable); no-op when closed.
+void RefreshFiltersPanel(AppContext& ctx);
 
 // All of these go FilterManager::Apply -> PlaybackController::ApplyFilterChange and only touch the player when the change
 // has a rebuild flag or commands.

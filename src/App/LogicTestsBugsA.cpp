@@ -96,7 +96,7 @@ LOGIC_TEST(bar_responsive_widgets_follow_the_layout_tiers) {
         for (int width : {500, 640, 800, 1000}) {
             BarFixture f(ShellMode::NowPlaying, scale, width, 374);
             BarModel m;
-            m.loaded = m.prepared = m.seekable = true; m.dur = 100; m.hasPrev = m.hasNext = true; m.subCount = 2;
+            m.loaded = m.prepared = m.seekable = true; m.dur = 100; m.hasPrev = m.hasNext = true;
             m.chips = {{badge::ChipKind::HwSw, L"H/W"}, {badge::ChipKind::VideoCodec, L"HEVC"}, {badge::ChipKind::AudioCodec, L"AAC"}};
             f.shell->Bar()->SetModel(m);
             const BarLayout& l = f.shell->Bar()->Layout();

@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <memory>
+#include <vector>
 
 #include "AppContext.h"
 #include "features/DialogGuard.h"
@@ -212,6 +213,26 @@ std::wstring PickAribFont(HWND owner) {
     return out;
 }
 
+int CALLBACK CollectFontFamily(const LOGFONTW* lf, const TEXTMETRICW*, DWORD, LPARAM lp) {
+    if (lf->lfFaceName[0] != L'@') reinterpret_cast<std::vector<std::wstring>*>(lp)->push_back(lf->lfFaceName);
+    return 1;
+}
+
+// Installed font families, sorted; the stored family is always listed so the combo can show it.
+std::vector<std::wstring> SubtitleFontChoices(const std::string& current) {
+    std::vector<std::wstring> v;
+    LOGFONTW lf{};
+    lf.lfCharSet = DEFAULT_CHARSET;
+    if (HDC dc = GetDC(nullptr)) {
+        EnumFontFamiliesExW(dc, &lf, CollectFontFamily, reinterpret_cast<LPARAM>(&v), 0);
+        ReleaseDC(nullptr, dc);
+    }
+    v.push_back(wvp::ToWide(current));
+    std::sort(v.begin(), v.end());
+    v.erase(std::unique(v.begin(), v.end()), v.end());
+    return v;
+}
+
 std::wstring CaptionFontDescription(const wvp::AppSettings& settings) {
     if (settings.aribFont.empty()) return Tr(L"Using the bundled WLC Maru ARIB font; the decoder falls back to Windows fonts if unavailable.", L"내장된 WLC Maru ARIB 글꼴을 사용합니다. 사용할 수 없으면 디코더가 Windows 글꼴로 대체합니다.");
     return std::wstring(Tr(L"Custom font: ", L"사용자 지정 글꼴: ")) + wvp::ToWide(settings.aribFont);
@@ -235,7 +256,7 @@ public:
         col_->SetName(Tr(L"Settings list", L"설정 목록"));
         BuildAppearance();
         BuildPlayback();
-        BuildCaptions();
+        BuildSubtitles();
         BuildAbout();
         Refresh();
         listener_ = env_.host->AddListener([this](pui::Widget* w, pui::UiEvent ev) {
@@ -380,14 +401,81 @@ private:
         braw->onClick = [this] { if (env_.editFilters) env_.editFilters(); else ShowFiltersPanel(ctx_, FiltersTab::Video); };
     }
 
-    void BuildCaptions() {
-        Section(Tr(L"Captions", L"자막"));
+    pui::ComboBox* Combo(SettingRow* row, const wchar_t* name, const wchar_t* id, std::vector<std::wstring> items, int sel,
+                         std::function<void(int)> fn) {
+        auto cb = std::make_unique<pui::ComboBox>();
+        cb->SetName(name);
+        cb->SetAutomationId(id);
+        cb->SetItems(std::move(items));
+        cb->SetSelectedIndex(sel);
+        pui::ComboBox* raw = row->SetControl(std::move(cb));
+        raw->onSelectionChanged = [fn = std::move(fn)](int i) { if (i >= 0) fn(i); };
+        return raw;
+    }
+
+    void BuildSubtitles() {
+        Section(Tr(L"Subtitles", L"자막"));
         const auto& settings = ctx_.Svc().settings;
-        auto* captionRow = Row(L'\xE8D2', Tr(L"Show captions", L"자막 표시"), Tr(L"Show or hide ARIB subtitles without stopping caption decoding.", L"자막 디코딩을 멈추지 않고 ARIB 자막을 표시하거나 숨깁니다."));
-        Toggle(captionRow, Tr(L"Show captions", L"자막 표시"), L"ShowCaptionsToggle", settings.showCaptions, [this](bool on) {
+        const wvp::SubtitleStyle& st = settings.subtitle;
+        auto edit = [this](std::function<void(wvp::SubtitleStyle&)> fn) {
+            fn(ctx_.Svc().settings.subtitle);
+            Commit();
+        };
+
+        auto* showRow = Row(L'\xE8D2', Tr(L"Show subtitles", L"자막 표시"), Tr(L"Show or hide subtitles of every kind without stopping their decoding.", L"자막 디코딩을 멈추지 않고 모든 종류의 자막을 표시하거나 숨깁니다."));
+        Toggle(showRow, Tr(L"Show subtitles", L"자막 표시"), L"ShowCaptionsToggle", settings.showCaptions, [this](bool on) {
             ctx_.Svc().settings.showCaptions = on;
             Commit();
         });
+
+        auto* fontRow = Row(L'\xE8D2', Tr(L"Subtitle font", L"자막 글꼴"), Tr(L"Font family for text subtitles (SRT, SAMI, WebVTT, ASS/SSA).", L"텍스트 자막(SRT, SAMI, WebVTT, ASS/SSA)에 사용할 글꼴입니다."));
+        fonts_ = SubtitleFontChoices(st.font);
+        int fontSel = (int)(std::find(fonts_.begin(), fonts_.end(), wvp::ToWide(st.font)) - fonts_.begin());
+        Combo(fontRow, Tr(L"Subtitle font", L"자막 글꼴"), L"SubtitleFontCombo", fonts_, fontSel, [this, edit](int i) {
+            edit([&](wvp::SubtitleStyle& v) { v.font = wvp::ToUtf8(fonts_[(size_t)i]); });
+        });
+        Toggle(Row(L'\xE8D2', Tr(L"Always use this font", L"항상 이 글꼴 사용"), Tr(L"Off keeps the font of SRT, SAMI and WebVTT as the player's default; ASS/SSA keep their own styles.", L"끄면 자막 파일 형식에 맞는 기본 글꼴을 사용합니다. ASS/SSA는 자체 스타일을 유지합니다.")),
+               Tr(L"Always use this font", L"항상 이 글꼴 사용"), L"SubtitleOverrideFontToggle", st.overrideFont,
+               [edit](bool on) { edit([&](wvp::SubtitleStyle& v) { v.overrideFont = on; }); });
+
+        auto* sizeRow = Row(L'\xE8D2', Tr(L"Subtitle size", L"자막 크기"), {});
+        std::vector<std::wstring> scales;
+        for (double v : sl::kSubtitleScalePresets) scales.push_back(sl::PercentLabel(v));
+        Combo(sizeRow, Tr(L"Subtitle size", L"자막 크기"), L"SubtitleSizeCombo", scales, sl::NearestPreset(sl::kSubtitleScalePresets, st.fontScale),
+              [edit](int i) { edit([&](wvp::SubtitleStyle& v) { v.fontScale = sl::kSubtitleScalePresets[(size_t)i]; }); });
+        Toggle(Row(L'\xE8D2', Tr(L"Apply the size", L"크기 적용"), {}), Tr(L"Apply the size", L"크기 적용"), L"SubtitleOverrideSizeToggle", st.overrideSize,
+               [edit](bool on) { edit([&](wvp::SubtitleStyle& v) { v.overrideSize = on; }); });
+
+        auto colorNames = [] {
+            std::vector<std::wstring> v;
+            for (const auto& c : sl::SubtitleColorPresets()) v.push_back(c.name);
+            return v;
+        };
+        auto* textRow = Row(L'\xE8D2', Tr(L"Text colour", L"글자 색"), {});
+        Combo(textRow, Tr(L"Text colour", L"글자 색"), L"SubtitleTextColorCombo", colorNames(), sl::ColorPresetIndex(st.primaryRgba),
+              [edit](int i) { edit([&](wvp::SubtitleStyle& v) { v.primaryRgba = sl::SubtitleColorPresets()[(size_t)i].rgba; }); });
+        auto* outlineColorRow = Row(L'\xE8D2', Tr(L"Outline colour", L"외곽선 색"), {});
+        Combo(outlineColorRow, Tr(L"Outline colour", L"외곽선 색"), L"SubtitleOutlineColorCombo", colorNames(), sl::ColorPresetIndex(st.outlineRgba),
+              [edit](int i) { edit([&](wvp::SubtitleStyle& v) { v.outlineRgba = sl::SubtitleColorPresets()[(size_t)i].rgba; }); });
+        Toggle(Row(L'\xE8D2', Tr(L"Apply the colours", L"색 적용"), {}), Tr(L"Apply the colours", L"색 적용"), L"SubtitleOverrideColorsToggle", st.overrideColors,
+               [edit](bool on) { edit([&](wvp::SubtitleStyle& v) { v.overrideColors = on; }); });
+
+        auto* borderRow = Row(L'\xE8D2', Tr(L"Outline width", L"외곽선 두께"), {});
+        std::vector<std::wstring> widths;
+        for (double v : sl::kSubtitleOutlinePresets) widths.push_back(sl::PixelLabel(v));
+        Combo(borderRow, Tr(L"Outline width", L"외곽선 두께"), L"SubtitleOutlineWidthCombo", widths, sl::NearestPreset(sl::kSubtitleOutlinePresets, st.outlineWidth),
+              [edit](int i) { edit([&](wvp::SubtitleStyle& v) { v.outlineWidth = sl::kSubtitleOutlinePresets[(size_t)i]; }); });
+        Toggle(Row(L'\xE8D2', Tr(L"Apply the outline", L"외곽선 적용"), {}), Tr(L"Apply the outline", L"외곽선 적용"), L"SubtitleOverrideBorderToggle", st.overrideBorder,
+               [edit](bool on) { edit([&](wvp::SubtitleStyle& v) { v.overrideBorder = on; }); });
+
+        Toggle(Row(L'\xE8D2', Tr(L"Also apply to ASS/SSA subtitles", L"ASS/SSA 자막에도 적용"), Tr(L"The settings above normally leave ASS/SSA subtitles with their own styles.", L"위 설정은 기본적으로 ASS/SSA 자막의 자체 스타일에는 적용되지 않습니다.")),
+               Tr(L"Also apply to ASS/SSA subtitles", L"ASS/SSA 자막에도 적용"), L"SubtitleOverrideAssToggle", st.applyToAss,
+               [edit](bool on) { edit([&](wvp::SubtitleStyle& v) { v.applyToAss = on; }); });
+
+        col_->Add<pui::Spacer>(0.f, 10.f);
+        auto* aribTitle = col_->Add<pui::TextBlock>(Tr(L"ARIB captions", L"ARIB 자막"), pui::TextKind::BodyStrong);
+        aribTitle->SetName(Tr(L"ARIB captions", L"ARIB 자막"));
+        col_->Add<pui::Spacer>(0.f, 4.f);
 
         auto* superRow = Row(L'\xE8D2', Tr(L"Show superimpose", L"슈퍼임포즈 표시"), Tr(L"Show ARIB on-screen text (文字スーパー) independently of captions.", L"자막과 별도로 ARIB 화면 문자(文字スーパー)를 표시합니다."));
         Toggle(superRow, Tr(L"Show superimpose", L"슈퍼임포즈 표시"), L"ShowSuperimposeToggle", settings.showSuperimpose, [this](bool on) {
@@ -395,7 +483,7 @@ private:
             Commit();
         });
 
-        captionFontRow_ = Row(L'\xE8D2', Tr(L"Caption font", L"자막 글꼴"), CaptionFontDescription(settings));
+        captionFontRow_ = Row(L'\xE8D2', Tr(L"ARIB caption font", L"ARIB 자막 글꼴"), CaptionFontDescription(settings));
         auto buttons = std::make_unique<pui::StackPanel>(pui::Orientation::Horizontal, 8.f);
         buttons->SetName(Tr(L"Caption font buttons", L"자막 글꼴 단추"));
         auto* choose = buttons->Add<pui::Button>(Tr(L"Choose font\x2026", L"글꼴 선택\x2026"));
@@ -480,6 +568,7 @@ private:
     pui::ToggleSwitch* sysAccent_ = nullptr;
     SettingRow* accentRow_ = nullptr;
     SwatchGrid* swatches_ = nullptr;
+    std::vector<std::wstring> fonts_;
     SettingRow* captionFontRow_ = nullptr;
     pui::Button* captionFontReset_ = nullptr;
     int listener_ = 0;

@@ -50,6 +50,7 @@ struct ContentInfo {
     int width = 0, height = 0; // 0 = unknown
     bool hdr = false;
     Chroma chroma = Chroma::Yuv420;
+    bool progressive = false;  // the stream declares field_order progressive; unknown or interlaced orders stay false
     bool Known() const { return !codec.empty(); }
     bool operator==(const ContentInfo&) const = default;
 };

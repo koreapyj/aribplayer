@@ -276,6 +276,18 @@ TEST_CASE(Plan_vcodec_only_for_a_non_default_build_decoder) {
     CHECK(Run(nv, unknown).decoder.empty());
 }
 
+TEST_CASE(Plan_progressive_content_plans_no_deinterlace_or_ivtc) {
+    for (Case c : { Case::A, Case::B }) {
+        PlanRequest r = Req(c);
+        CHECK(Run(fakecaps::Nvidia(), r).videoFilter.size() > 0);
+        r.content.progressive = true;
+        Plan p = Run(fakecaps::Nvidia(), r);
+        CHECK(p.ok);
+        CHECK(p.videoFilter.empty());
+        for (const PlanStep& s : p.steps) CHECK(s.kind != PlanStep::Kind::Filter || s.text.empty());
+    }
+}
+
 TEST_CASE(Plan_unknown_content_note) {
     PlanRequest r;
     r.settings.deinterlace = DeinterlaceMode::Ivtc;

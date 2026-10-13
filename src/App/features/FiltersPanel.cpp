@@ -371,19 +371,28 @@ private:
 
     void BuildVideo(pui::StackPanel& sp) {
         sp.AddChild(Heading(Tr(L"Picture", L"화면")));
-        sp.AddChild(ComboRow(Tr(L"Deinterlace", L"디인터레이스"), fx::DeinterlaceLabels(), (int)cur_.deinterlace, [this](int i) {
+        const fx::DeinterlaceControls dc = fx::DeinterlaceControlsFor(cur_.deinterlace, ctx_.Svc().filters.Content().progressive);
+        auto addDeint = [&](std::unique_ptr<FxRow> row) {
+            row->Control()->SetEnabled(dc.enabled);
+            sp.AddChild(std::move(row));
+        };
+        addDeint(ComboRow(Tr(L"Deinterlace", L"디인터레이스"), fx::DeinterlaceLabels(), (int)cur_.deinterlace, [this](int i) {
             Edit([&](FilterSettings& s) { s.deinterlace = (wvp::DeinterlaceMode)i; });
             RebuildLater();   // show/hide the mode's sub-controls (reloads cur_ from the manager, which sanitizes it)
         }));
-        const fx::DeinterlaceControls dc = fx::DeinterlaceControlsFor(cur_.deinterlace);
+        if (!dc.enabled) {
+            auto hint = std::make_unique<pui::TextBlock>(Tr(L"Progressive video: deinterlacing not needed", L"프로그레시브 영상: 디인터레이스 불필요"), pui::TextKind::Body);
+            hint->SetColorRole(pui::TextColorRole::Secondary);
+            sp.AddChild(std::move(hint));
+        }
         if (dc.priority)
-            sp.AddChild(ComboRow(Tr(L"Priority", L"우선순위"), fx::DeinterlacePriorityLabels(), (int)cur_.deinterlacePriority,
+            addDeint(ComboRow(Tr(L"Priority", L"우선순위"), fx::DeinterlacePriorityLabels(), (int)cur_.deinterlacePriority,
                                  [this](int i) { Edit([&](FilterSettings& s) { s.deinterlacePriority = (wvp::DeinterlacePriority)i; }); }));
         if (dc.rate)
-            sp.AddChild(ComboRow(Tr(L"Output rate", L"출력 속도"), {Tr(L"One frame per frame", L"프레임당 한 프레임"), Tr(L"One frame per field", L"필드당 한 프레임")}, (int)cur_.deinterlaceRate,
+            addDeint(ComboRow(Tr(L"Output rate", L"출력 속도"), {Tr(L"One frame per frame", L"프레임당 한 프레임"), Tr(L"One frame per field", L"필드당 한 프레임")}, (int)cur_.deinterlaceRate,
                                  [this](int i) { Edit([&](FilterSettings& s) { s.deinterlaceRate = (wvp::DeinterlaceRate)i; }); }));
         if (dc.onlyInterlaced)
-            sp.AddChild(ToggleRow(Tr(L"Only interlaced frames", L"인터레이스 프레임만"), cur_.deinterlaceOnlyInterlaced,
+            addDeint(ToggleRow(Tr(L"Only interlaced frames", L"인터레이스 프레임만"), cur_.deinterlaceOnlyInterlaced,
                                   [this](bool v) { Edit([&](FilterSettings& s) { s.deinterlaceOnlyInterlaced = v; }); }));
         sp.AddChild(CheckRow(Tr(L"Zoom to fill", L"화면 채우기"), fx::Zoom().on, [this](bool v) { SetZoomToFill(ctx_, v); }));
         sp.AddChild(std::make_unique<FxRow>(m_, L"", MakeButton(Tr(L"Reset video settings", L"영상 설정 초기화"), [this] {
@@ -530,6 +539,10 @@ FiltersPanelGeometry PanelGeometry(float clientW, float clientH) {
 }
 
 bool IsFiltersPanelOpen(AppContext& ctx) { return g_open && g_open->Host() && ctx.Ui().IsPopupOpen(g_open); }
+
+void RefreshFiltersPanel(AppContext& ctx) {
+    if (IsFiltersPanelOpen(ctx)) g_open->SetTab(g_open->Tab());
+}
 
 void ToggleFiltersPanel(AppContext& ctx) {
     if (IsFiltersPanelOpen(ctx)) ctx.Ui().ClosePopup(g_open);

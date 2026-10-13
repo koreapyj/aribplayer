@@ -29,7 +29,7 @@ Libraries included in ARIB Player
   https://curl.se/
 
 
-Libraries included in the FFmpeg DLLs
+Libraries included in the FFmpeg and libffplay DLLs (libass and its dependencies render subtitles in libffplay)
 
 - AMF headers 1.5.2 - MIT, Copyright (c) Advanced Micro Devices, Inc.
   https://github.com/GPUOpen-LibrariesAndSDKs/AMF

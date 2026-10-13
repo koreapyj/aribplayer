@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cwctype>
 
 namespace pui {
 
@@ -19,6 +20,30 @@ RectF ComputeComboPopupRect(const RectF& box, int n, int sel, float itemH, float
     return RectF::XYWH(x, y, w, h);
 }
 
+namespace {
+bool StartsWithNoCase(const std::wstring& s, const std::wstring& prefix) {
+    if (s.size() < prefix.size()) return false;
+    for (size_t i = 0; i < prefix.size(); i++)
+        if (std::towlower(s[i]) != std::towlower(prefix[i])) return false;
+    return true;
+}
+}
+
+int TypeAhead::Next(wchar_t ch, uint64_t now, const std::vector<std::wstring>& items, int current) {
+    if (now - last_ > kTimeoutMs) prefix_.clear();
+    last_ = now;
+    prefix_ += ch;
+    const int n = (int)items.size();
+    if (n == 0) return -1;
+    const bool repeated = std::all_of(prefix_.begin(), prefix_.end(), [&](wchar_t c) { return std::towlower(c) == std::towlower(prefix_[0]); });
+    const std::wstring key = repeated ? prefix_.substr(0, 1) : prefix_;
+    const int start = std::max(current, 0) + (repeated ? 1 : 0);
+    for (int k = 0; k < n; k++) {
+        int i = (start + k) % n;
+        if (StartsWithNoCase(items[(size_t)i], key)) return i;
+    }
+    return -1;
+}
 
 class ComboItem : public Widget {
 public:
@@ -91,6 +116,12 @@ public:
         case key::Escape: CloseOnly(); return true;
         default: return false;
         }
+    }
+    bool OnChar(wchar_t ch) override {
+        if (ch <= L' ' || ownerLife_.expired()) return false;
+        int i = owner_->typeAhead_.Next(ch, Host() ? Host()->Now() : 0, owner_->items_, highlight_);
+        if (i >= 0) Highlight(i);
+        return true;
     }
 
     bool SupportsSelection() const override { return true; }
@@ -260,6 +291,13 @@ bool ComboBox::OnKeyDown(int vk, unsigned mods) {
     case key::End: UserSelect(n - 1); return true;
     default: return false;
     }
+}
+
+bool ComboBox::OnChar(wchar_t ch) {
+    if (IsOpen() || ch <= L' ') return false;
+    int i = typeAhead_.Next(ch, Host() ? Host()->Now() : 0, items_, selected_);
+    if (i >= 0) UserSelect(i);
+    return true;
 }
 
 }

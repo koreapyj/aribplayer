@@ -85,7 +85,7 @@ Windowed: no bar fill (the window backdrop shows). Full screen / mini: `barFill`
 | Prev / Next | seek -5 s / +5 s | previous / next file | tooltips "L: back, R: previous file" |
 | Open | open file dialog | - | |
 | Mute | toggle | - | wheel over the slider = volume |
-| Subtitle | toggle captions / subtitles | subtitle track menu | |
+| Subtitle | show / hide the subtitle layer (every kind: embedded, external, ARIB caption) | subtitle menu (tracks, load, show, sync) | `W` cycles the track (next, then Off) |
 | Control panel (F7) | filters panel, pressed while open | - | |
 | Playlist toggle (F6) | show/hide panel, pressed while visible | - | narrow window: popup mode |
 | Pin (title) | cycle always-on-top: Off -> On -> While playing -> While fullscreen | - | same as Ctrl+T, persisted |
@@ -96,8 +96,16 @@ Windowed: no bar fill (the window backdrop shows). Full screen / mini: `barFill`
 | Playlist toggle, windowed | window grows/shrinks by panel width + gap so the video keeps its size | - | maximized/fullscreen/narrow: video resizes instead |
 
 Main menu (`features/Menus`): Open file / folder / URL, Close; Play submenu (play/pause, prev/next, seek
-steps, speed, repeat, shuffle, mini player); Subtitle / Video / Sound submenus; Always on top submenu; Equalizer, Copy frame, Properties;
+steps, speed, repeat, shuffle, mini player); Subtitles / Video / Sound submenus; Always on top submenu; Equalizer, Copy frame, Properties;
 Playlist panel (F6), Control panel (F7), Settings (F5: opens the separate Settings window, see §9); Exit.
+
+Subtitles submenu (`BuildSubtitleItems`, also the bar button's right-click menu; needs open media): Off, then every selectable subtitle track,
+embedded and external together (an external one is labelled with its file name and its title or language; ARIB superimpose is listed
+but disabled), Load subtitle file… (file dialog with the subtitle filter; attaches and selects), Show subtitles (check), Sync >
+Slower (+0.5 s, `.`) / Faster (-0.5 s, `,`) / Default (`/`). Tracks are selected by media-info index through `ffp_select_stream`. After
+PREPARED the sidecar files of a local video (`video.srt`, `video.ko.srt`, `video.<ext>.smi`, ...) are added and one is selected (Korean,
+then the Windows language, else the first); subtitle-only drops on the video attach to the open media and select it (ignored while
+nothing is open). The delay is per file (reset on open) and the track choice survives a decoder-change reopen (external tracks by path).
 
 Menus are NATIVE Win32 popup menus (`features/NativeMenu`): the `pui::MenuItemDesc` trees from the builders (`menus::BuildMenu`,
 `BuildSubtitleItems`, playlist panel) are converted to an `HMENU` and tracked with `TrackPopupMenuEx(TPM_RETURNCMD)` on the owner
@@ -150,6 +158,9 @@ Edge snapping (`WindowSnap.h`, `App::SnapWindowMessage` on WM_MOVING / WM_SIZING
 | F2 / F4 / F5 / F6 / F7 | open folder / stop / Settings window / playlist panel / control panel | - |
 | Ctrl+T | cycle always on top | - |
 | Ctrl+S | focus playlist search | - |
+| W | next subtitle track (then Off) | - |
+| `,` / `.` | subtitle sync -0.5 s / +0.5 s, with a toast | - |
+| `/` | subtitle sync back to 0 | - |
 
 Mini player: Esc leaves it; Stop leaves it then stops; the control panel command is a no-op; the playlist panel toggle is disabled.
 
@@ -226,8 +237,10 @@ The player keeps running and keeps its own keyboard / view state meanwhile.
   capture / keys / WM_CHAR / tooltips and its own UIA bridge. Esc closes an open flyout or the licenses dialog first, otherwise the window. Deactivating
   it closes its flyouts (not for its own dialogs, e.g. the caption font picker, which it owns).
 - Edit filters... closes the window and opens the filters panel in the main window (Settings could cover it). Toasts from
-  the page (caption font) still appear in the main window.
-- Sections: Appearance, Playback, Captions, About. About = player version, "Open source licenses" (View opens an in-app modal
+  the page (ARIB caption font) still appear in the main window.
+- Sections: Appearance, Playback, Subtitles, About. Subtitles: Show subtitles, font family (installed fonts) + "Always use this font", size
+  preset + apply, text / outline colour presets + apply, outline width + apply, "Also apply to ASS/SSA subtitles" (the overrides normally
+  reach plain-text formats only); the ARIB captions sub-group keeps Show superimpose, the ARIB caption font and the Windows caption style link. About = player version, "Open source licenses" (View opens an in-app modal
   `pages/LicensesDialog`: scrollable read-only text of `THIRD-PARTY-NOTICES.txt`, embedded in the exe as RCDATA `IDR_THIRD_PARTY_NOTICES`
   via `app.rc`; Close button / Esc), then the Debug logging toggle. The libffplay version row is gone.
 - Close: close button / Esc / Alt+F4 destroy it (placement saved); closing the main window closes it first.

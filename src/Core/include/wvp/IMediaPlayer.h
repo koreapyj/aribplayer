@@ -60,6 +60,14 @@ public:
     // seekable video stream, where a plain relative Seek is queued instead). Unsupported backends return -1.
     virtual int Skip(double seconds) { (void)seconds; return -1; }
     virtual int CycleStream(StreamType type) = 0;
+    /// Selects a stream by MediaInfo index; subtitle index -1 turns the caption layer's track off. Unsupported backends return -22.
+    virtual int SelectStream(StreamType type, int index) { (void)type; (void)index; return -22; }
+    /// Preloads a subtitle file (after PREPARED); returns the first new stream index or a negative error. Does not select.
+    virtual int AddSubtitleFile(const std::string& utf8Path) { (void)utf8Path; return -22; }
+    /// Milliseconds, positive = subtitles later; reset to 0 by Open().
+    virtual int SetSubtitleDelay(std::int64_t ms) { (void)ms; return -22; }
+    virtual std::int64_t SubtitleDelay() const { return 0; }
+    virtual int SetSubtitleStyle(const SubtitleStyle& style) { (void)style; return -22; }
     /// ARIB TS (MediaInfo::AribAudio.Present): 0 = audio 1, 1 = audio 2 wherever it has samples and audio 1 otherwise
     /// (gapless, never announced). Every Open() starts on audio 1. Unsupported backends return -22.
     virtual int SetAudioPreference(int pref) { (void)pref; return -22; }

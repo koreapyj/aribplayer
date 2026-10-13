@@ -3,6 +3,7 @@
 // window placement validation and the Settings page row/page layout.
 // Covered by LOGIC_TESTs in SettingsLogic.cpp.
 #include <array>
+#include <cmath>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -67,6 +68,23 @@ std::optional<wvp::WindowPlacement> ValidatePlacement(const wvp::WindowPlacement
 /// Size (device px) saved at `p.dpi` converted to `targetDpi` (the monitor the window will be shown on). x/y are screen
 /// coordinates and stay; the result's dpi is `targetDpi`. No-op for equal or invalid DPIs.
 wvp::WindowPlacement RescalePlacement(const wvp::WindowPlacement& p, int targetDpi);
+
+/// Settings > Subtitles presets (the page offers these values; a stored value outside them shows the nearest one).
+inline constexpr std::array<double, 9> kSubtitleScalePresets = {0.5, 0.75, 0.9, 1.0, 1.1, 1.25, 1.5, 2.0, 3.0};
+inline constexpr std::array<double, 7> kSubtitleOutlinePresets = {0.0, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0};
+struct ColorPreset { const wchar_t* name; std::uint32_t rgba; };   // 0xRRGGBBAA
+const std::array<ColorPreset, 6>& SubtitleColorPresets();
+/// Index of the preset whose value is closest to `value`.
+template <size_t N> int NearestPreset(const std::array<double, N>& presets, double value) {
+    int best = 0;
+    for (size_t i = 1; i < N; i++)
+        if (std::abs(presets[i] - value) < std::abs(presets[(size_t)best] - value)) best = (int)i;
+    return best;
+}
+/// Index of the colour preset equal to `rgba`, -1 when custom.
+int ColorPresetIndex(std::uint32_t rgba);
+std::wstring PercentLabel(double scale);   // 1.25 -> "125%"
+std::wstring PixelLabel(double px);        // 0 -> "None", 1.5 -> "1.5 px"
 
 inline constexpr float kPageMarginH = 36, kHeaderTop = 20, kHeaderH = 44, kMaxContentW = 1000;
 struct PageLayout {

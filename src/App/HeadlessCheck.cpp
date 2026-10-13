@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <functional>
 
@@ -1177,6 +1178,64 @@ int App::RunHeadlessCheck() {
             Step("settings_window_flyout_in_its_own_host_and_escape_closes_it_first", flyout && sw->IsOpen() && sw->Ui().PopupCount() == 0 ? S_OK : E_FAIL);
             if (sh) SendMessageW(sh, WM_KEYDOWN, VK_ESCAPE, 0);
             Step("settings_window_escape_closes_it", sw && !sw->IsOpen() && !IsWindow(sh) ? S_OK : E_FAIL);
+        }
+        {   // A video with a sidecar subtitle in its folder: the external track is attached on PREPARED (no deadlock inside the
+            // engine's callback), selected, and drawn into a subtitle snapshot.
+            namespace fs = std::filesystem;
+            fs::path source;
+            {
+                std::error_code ec;
+                fs::path dir = fs::absolute(fs::path(opt_.inputs[0]), ec).parent_path();
+                for (const fs::path& d : {dir, dir.parent_path()})
+                    if (source.empty() && fs::is_regular_file(d / L"testsrc2-360p-short.mp4", ec)) source = d / L"testsrc2-360p-short.mp4";
+            }
+            Step("sidecar_fixture_video_found", source.empty() ? E_FAIL : S_OK);
+            if (!source.empty()) {
+                wchar_t tmp[MAX_PATH];
+                const DWORD tn = GetTempPathW((DWORD)std::size(tmp), tmp);
+                const fs::path dir = fs::path(std::wstring(tmp, tn)) / L"aribplayer-sidecar-check";
+                std::error_code ec;
+                fs::remove_all(dir, ec);
+                fs::create_directories(dir, ec);
+                fs::copy_file(source, dir / L"video.mp4", ec);
+                {
+                    std::ofstream srt(dir / L"video.ko.srt", std::ios::binary);
+                    srt << "1\r\n00:00:00,000 --> 00:00:30,000\r\nSidecar \xEC\x9E\x90\xEB\xA7\x89\r\n";
+                }
+                OpenPaths(*this, {(dir / L"video.mp4").wstring()});
+                PumpUntil([&] { return !model_.prepared; }, 5000);
+                const bool prepared = PumpUntil([&] { return model_.prepared && state_ == wvp::PlayerState::Playing; }, 20000);
+                Step("sidecar_open_prepared_without_hang", prepared ? S_OK : E_FAIL);
+                if (prepared) PumpUntil([&] { const double pos = player_->Position(); return pos == pos && pos > 0.5; }, 3000);
+                const bool paused = prepared && player_ && player_->Pause() == 0 && PumpUntil([&] { return state_ == wvp::PlayerState::Paused; }, 5000);
+                bool attached = false, selected = false;
+                if (prepared && player_) {
+                    PumpUntil([&] {
+                        auto mi = player_->GetMediaInfo();
+                        if (!mi) return false;
+                        for (const auto& s : mi->Streams)
+                            if (s.Type == wvp::StreamType::Subtitle && s.external && !s.path.empty()) {
+                                attached = true;
+                                selected = s.Selected;
+                            }
+                        return selected;
+                    }, 3000);
+                }
+                Step("sidecar_attached_as_external_track", attached ? S_OK : E_FAIL);
+                Step("sidecar_auto_selected", selected ? S_OK : E_FAIL);
+                bool drawn = false;
+                if (selected && paused) {
+                    drawn = PumpUntil([&] {
+                        auto plain = player_->Snapshot(false);
+                        auto with = player_->Snapshot(true);
+                        return plain && with && plain->Data.size() == with->Data.size() && !plain->Data.empty() &&
+                               std::mismatch(plain->Data.begin(), plain->Data.end(), with->Data.begin()).first != plain->Data.end();
+                    }, 3000);
+                    player_->Play();
+                }
+                Step("sidecar_subtitle_pixels_in_snapshot", drawn ? S_OK : E_FAIL);
+                fs::remove_all(dir, ec);
+            }
         }
         // Reopen the supplied short clip: the drop smoke test above may have switched to a longer, different codec.
         // Natural EOF avoids coupling this navigation regression to decoder-specific near-EOF seeking.

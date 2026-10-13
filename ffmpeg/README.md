@@ -14,7 +14,7 @@ The build is GPL (jellyfin enables `--enable-gpl`); fdk-aac is dropped so it can
 builder.lock                 builder-ffmpeg URL + pinned commit, jellyfin FF_REPO/FF_REF
 patches/                     build/dependency/packaging patches (git apply, after builder's 0001-*), ours: 1001-1002
 source-patches/              ffmpeg-source patches (appended to debian/patches/series, applied last
-                             via quilt), ours: 1002-1010 (+1006a), grouped by concern:
+                             via quilt), ours: 1002-1012 (+1006a), grouped by concern:
                              FFmpeg library changes (separate from libffplay integration)
                                1002-libaribcaption-clear-and-type.patch = clear events yield an empty subtitle, caption_type option
                                1003-libaribcaption-runtime-rerender.patch = runtime canvas_size, caption history (10 min / 5 MiB) and re-render
@@ -42,6 +42,12 @@ source-patches/              ffmpeg-source patches (appended to debian/patches/s
                                                               ARIB audio 1 / audio 2 decoded in parallel with ffp_set_audio_preference
                                1010-libffplay-ffcapsdump.patch = ffcapsdump (what the build fixes: filters, the decoder of each hwaccel,
                                                               build features; compiled into the app) + its Makefile rules
+                               1011-sami-subtitles.patch  = SAMI: one stream per <P Class> (language / title from the CSS or the class name,
+                                                              CSS colour as <font color>), charenc=CP949 for non-UTF-8 files, HTML entities,
+                                                              <font size> as \fscx/\fscy, ruby text dropped
+                               1012-libffplay-subtitles.patch = libass (static) in libffplay: text subtitles rendered by libass,
+                                                              bitmap (PGS) cues, external subtitle files, ffp_select_stream,
+                                                              subtitle style / delay
 scripts/build-ffplay.sh      the build (Linux/WSL), mirrors builder's CI `build-windows` job
 scripts/author.sh            quilt authoring flow + incremental build
 scripts/lib.sh               shared helpers
@@ -70,7 +76,7 @@ dist/win64/  (ignored)       output + .stamp
   (and builder's `0002`, `0003`, `0005`-`0007`), so they apply last. Authored with quilt (see below). The library changes
   and libffplay integration are grouped separately, but the series is ordered and may have
   dependencies between patches; individual patches are not guaranteed to apply or build alone.
-* Build patches (`1001-1002`) and source patches (`1002-1010`) use separate numbering namespaces.
+* Build patches (`1001-1002`) and source patches (`1002-1012`) use separate numbering namespaces.
   The `1000+` range keeps our patches separate from builder's patches.
 
 For win64, `1009-libffplay-engine.patch` provides the build/install integration for

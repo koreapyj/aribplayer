@@ -504,8 +504,8 @@ Plan PipelinePlanner::Make(const PlanRequest& req) const {
     const FilterSettings& s = c.s;
 
     if (!s.advancedMode) {
-        if (s.deinterlace == DeinterlaceMode::Ivtc) c.stages.push_back({ SK::Ivtc, PipelineOp::Ivtc });
-        else if (s.deinterlace == DeinterlaceMode::On) c.stages.push_back({ SK::Deint, PipelineOp::Bwdif });
+        if (!req.content.progressive && s.deinterlace == DeinterlaceMode::Ivtc) c.stages.push_back({ SK::Ivtc, PipelineOp::Ivtc });
+        else if (!req.content.progressive && s.deinterlace == DeinterlaceMode::On) c.stages.push_back({ SK::Deint, PipelineOp::Bwdif });
         if (s.speed != 1) c.stages.push_back({ SK::Setpts, PipelineOp::Setpts });
     }
     c.raw = s.customVideoFilter;

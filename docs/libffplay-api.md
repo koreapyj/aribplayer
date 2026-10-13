@@ -77,7 +77,7 @@ declarations here. The following contracts supplement it.
   before window scaling. The filtered size is stretched by sample aspect ratio: width is
   `round(w*sar)` for `sar>1`, height is `round(h/sar)` for `sar<1`, rounded to even dimensions.
   The presenter's `readback` renders it as shown when the presenter has one. Free pixels with `ffp_free`; no displayed
-  frame returns `FFP_EAGAIN`. `ffp_snapshot_ex` optionally includes visible bitmap subtitle layers.
+  frame returns `FFP_EAGAIN`. `ffp_snapshot_ex` optionally includes the visible subtitle layers.
 
 ### Seeking and frame stepping
 
@@ -159,17 +159,25 @@ Order on a successful open: `STATE opening` -> `PREPARED` -> `STATE playing` -> 
   "render": {"width": 1920, "height": 1080},
   "streams": [
     {"index":0,"type":"video","codec":"h264","width":1920,"height":1080,"sar_num":1,"sar_den":1,
-     "fps":25.0,"pix_fmt":"yuv420p","color_transfer":"bt709","fourcc":"avc1","selected":true,"language":"und"},
+     "fps":25.0,"pix_fmt":"yuv420p","color_transfer":"bt709","field_order":"progressive","fourcc":"avc1","selected":true,"language":"und"},
     {"index":1,"type":"audio","codec":"aac","fourcc":"mp4a","sample_rate":48000,"channels":2,"selected":true,"language":"eng"},
-    {"index":2,"type":"subtitle","codec":"subrip","selected":false,"language":"eng","title":"..."}
+    {"index":2,"type":"subtitle","codec":"subrip","external":false,"text":true,"selected":false,"language":"eng","title":"..."},
+    {"index":3,"type":"subtitle","codec":"subrip","external":true,"path":"C:\\v\\movie.ko.srt","text":true,"selected":true,"language":"und"}
   ]
 }
 ```
 
+Subtitle entries carry `external` (`true` for a track added with `ffp_add_subtitle_file`, then also `path`, the UTF-8
+path it was loaded from) and `text` (`true` = rendered by libass, `false` = ARIB or a bitmap codec such as
+`hdmv_pgs_subtitle`). External tracks follow the container's streams: index = the container's stream count at the
+first `ffp_add_subtitle_file` of the media + position. Streams a growing container (MPEG-TS) adds after that are not
+listed. `language` / `title` of an external track come from the file's stream metadata (`"und"` when it has none).
+
 `fourcc` (optional, every stream type): 4 printable ASCII chars, the container's `codec_tag` when it has that form, else the RIFF tag
 of the codec id (`avformat_get_riff_video_tags` / `avformat_get_riff_audio_tags`; video and audio only); absent when there is none.
 Case is as stored (`avc1`, `mpg2`), compare case-insensitively. Video streams also carry `color_transfer`: `av_color_transfer_name` of the
-stream's `color_trc` (`"bt709"`, `"smpte2084"` = PQ, `"arib-std-b67"` = HLG, `"unknown"` when unspecified).
+stream's `color_trc` (`"bt709"`, `"smpte2084"` = PQ, `"arib-std-b67"` = HLG, `"unknown"` when unspecified). and `field_order`: the codec parameters' field order (`"progressive"`, `"tt"`, `"bb"`, `"tb"`, `"bt"`, `"unknown"`);
+the host treats only `"progressive"` as proof that deinterlacing is not needed.
 
 For an ARIB transport stream the object has one more key, `"arib_audio":{"audio1":1,"audio2":-1}`: the AVStream
 indexes of the two audio roles at the time of the call (`-1` = no stream holds the role now; audio 2 may appear later).
@@ -444,7 +452,7 @@ required API includes `ffp_set_subtitle_visible`, `ffp_refresh_caption_style` an
 The installed header defines `FFP_SUBTITLE_CAPTION`, `FFP_SUBTITLE_SUPERIMPOSE` and
 `FFP_SNAPSHOT_SUBTITLES` (bit 0, the only supported snapshot flag).
 
-`ffp_set_subtitle_visible` accepts `FFP_SUBTITLE_CAPTION` or `FFP_SUBTITLE_SUPERIMPOSE`; `on` is zero or non-zero. Visibility only affects presentation: decoding continues, so an active indefinite caption reappears when made visible again. Unknown layers return `FFP_EINVAL`. `ffp_cycle_stream(FFP_STREAM_SUBTITLE)` continues to cycle the regular caption stream and never changes the superimpose layer.
+`ffp_set_subtitle_visible` accepts `FFP_SUBTITLE_CAPTION` or `FFP_SUBTITLE_SUPERIMPOSE`; `on` is zero or non-zero. Visibility only affects presentation: decoding continues, so an active indefinite caption reappears when made visible again. Unknown layers return `FFP_EINVAL`. The caption layer is chosen with `ffp_select_stream(FFP_STREAM_SUBTITLE, index)` (see "Subtitles"); `ffp_cycle_stream(FFP_STREAM_SUBTITLE)` returns `FFP_EINVAL`. The superimpose layer is never changed by either.
 
 `ffp_refresh_caption_style` reopens only the active ARIB caption decoder with the updated background and outline flags. It leaves the video, audio and superimpose decoders running; the caption layer continues at the current playback position. Hosts can call it after a Windows caption-settings change.
 
@@ -464,9 +472,99 @@ Both subtitle layers are handed to the presenter with every picture (`FFPPicture
 
 The ARIB decoder keeps the decoded caption objects, and the clear events, of the last 10 minutes of media time around its decode position in a history capped at 5 MiB (`history_window`, `history_max_bytes`; oldest first out). A seek flush keeps it, and the history of a closed decoder is parked under the file's identity (`history_key`: path, size, mtime and stream, set by libffplay for local files), so a reopen of the same file after a device loss or a settings change continues from it while another file starts empty. The first video frame shown after a seek or open asks the decoder for the caption on screen at that frame's pts: the cue appears with the landing frame, paused too, unless it ended or a clear event followed it. This works for the part of the file already decoded in this session; a forward seek into an unplayed part, or a fresh open, has no history and waits for the next cue. A cue read from the queue always wins over one from the history. `ffp_get_debug_info` reports `subtitle_layers.<layer>.history` (`events`, `bytes`, `appended_bytes`, `landed`).
 
-`ffp_get_debug_info` includes per-layer stream/decoder options, resolved font, active cue timing and rectangle count, cue/clear/upload counters, current canvas size and re-render count. The two layer records are independent; fields unavailable in a non-ARIB subtitle layer remain empty or null.
+`ffp_get_debug_info` includes per-layer stream/decoder options, resolved font, active cue timing and rectangle count, cue/clear/upload counters, current canvas size and re-render count. The two layer records are independent; fields unavailable in a non-ARIB subtitle layer remain empty or null. An external track shows `"decoder":"external"` and its media-info index as `stream_index`.
 
-A `FFP_SNAPSHOT_SUBTITLES` snapshot is composed at the snapshot's native, SAR-stretched size. Active layers are re-rendered at that canvas size, then the live canvas is restored. If re-rendering fails, the current cue bitmaps are scaled for the snapshot and the debug log records the fallback. Snapshot calls still return `FFP_EAGAIN` if no video frame has been displayed yet.
+A `FFP_SNAPSHOT_SUBTITLES` snapshot is composed at the snapshot's native, SAR-stretched size. Active ARIB layers are re-rendered at that canvas size, then the live canvas is restored. If re-rendering fails, the current cue bitmaps are scaled for the snapshot and the debug log records the fallback. libass text is rendered again at the snapshot size for the time of the snapshot's frame; bitmap subtitles (PGS) are scaled from their own canvas. Snapshot calls still return `FFP_EAGAIN` if no video frame has been displayed yet.
+
+## Subtitles (`1012-libffplay-subtitles.patch`)
+
+The caption layer has one of three renderers, chosen by the codec of the selected stream:
+
+| codec | renderer |
+|---|---|
+| `arib_caption` | libaribcaption (see above) |
+| a bitmap codec (`AV_CODEC_PROP_BITMAP_SUB`: `hdmv_pgs_subtitle`, also dvdsub / dvbsub / xsub) | the bitmap cue path: PAL8 cues converted to RGBA in the subtitle's own canvas |
+| every other (text) codec: subrip / srt, sami, webvtt, mov_text, text, ass / ssa, ... | libass (linked statically into `libffplay.dll`) |
+
+The superimpose layer is ARIB only.
+
+### libass
+
+* The decoder's `subtitle_header` is the track's script header (`ass_process_codec_private`); every decoded event
+  (`AVSubtitleRect.ass`) becomes an `ass_process_chunk` with start = packet pts + `start_display_time` and duration =
+  `end_display_time - start_display_time` (5 s when the decoder gives none). The ReadOrder of each chunk is replaced
+  with a counter of the engine, so overlapping and repeated events are all kept.
+* Embedded streams: events are added as the subtitle thread decodes them. A seek (new packet serial) empties the track
+  (`ass_flush_events`) together with the decoder flush, so an event that started before the landing point and is still
+  running there is not shown again after that seek (its packet is not read again).
+* Stream metadata `charenc` (the SAMI demuxer sets `charenc=CP949` for legacy-encoded files) is passed to the text
+  decoder as `sub_charenc`, for embedded and external tracks.
+* SAMI (patch 1011): the demuxer creates one stream per `<P Class=...>` class, in order of first appearance, with
+  `language` (CSS `lang`, else KRCC/ENCC/EGCC/JPCC/CNCC) and `title` (CSS `Name`, else the class name) metadata; the
+  CSS colour is applied as `<font color>`. A class without text in a `<SYNC>` ends its previous cue. The last cue
+  lasts 5 s. HTML entities are decoded, `<font size=1..7>` becomes a `\fscx/\fscy` scale and `<rt>`/`<rp>` ruby
+  text is dropped. A file that is not valid UTF-8 (and has no UTF-16 BOM) gets `charenc=CP949` on every stream.
+* Rendering runs on the display thread for every picture: `ass_render_frame` at the picture's time minus the subtitle
+  delay (external tracks: in file time, i.e. minus the container's start time). The frame size is the presenter's
+  displayed video area (`FFPPresentedInfo.video_width/height`; before the first `presented`: the video's display size)
+  and the storage size the video's coded size, so text is rasterised at screen resolution and stays sharp on resize
+  (a paused picture is redrawn when the area changes). The `ASS_Image` list is merged into at most four horizontal
+  bands of straight-alpha RGBA (`FFPOverlayLayer.rects`, canvas = the frame size); an unchanged render
+  (`detect_change == 0`) keeps the previous rectangles and generation.
+* Fonts: the library uses `ASS_FONTPROVIDER_AUTODETECT` (DirectWrite on Windows); glyphs missing from a style's font
+  fall back through the system (Hangul: Malgun Gothic). The default family is `FFPSubtitleStyle.font_family`
+  (`""` = `"Malgun Gothic"`). The open option `sub_fontsdir=<dir>` adds a fonts directory, and TTF / OTF attachments
+  of the container (Matroska) are added with `ass_add_font`; both are read when the first text track of the media is
+  opened.
+
+### Style: `ffp_set_subtitle_style`
+
+`FFPSubtitleStyle` (`struct_size = sizeof(FFPSubtitleStyle)`, else `FFP_EINVAL`) persists across opens and applies
+live (a paused picture is redrawn). The override applies to plain-text codecs (every text codec except `ass` / `ssa`);
+with `apply_to_ass = 1` also to ASS / SSA. On a track it applies to, the selective style override of libass is
+enabled with the bits of `override_flags`, on events that look like dialogue (not on positioned ones):
+
+| flag | libass | value |
+|---|---|---|
+| `FFP_SUBSTYLE_FONT` | `ASS_OVERRIDE_BIT_FONT_NAME` | `font_family` (`""` = Malgun Gothic) |
+| `FFP_SUBSTYLE_SIZE` | `ass_set_font_scale` | `font_scale` (1.0 = 100 %) |
+| `FFP_SUBSTYLE_COLORS` | `ASS_OVERRIDE_BIT_COLORS` | `primary_rgba` (primary + secondary), `outline_rgba`; `0xRRGGBBAA`, AA = 0xFF opaque |
+| `FFP_SUBSTYLE_BORDER` | `ASS_OVERRIDE_BIT_BORDER` | outline style, `outline_width` px at 1080 lines of video (scaled with the frame), no shadow |
+
+A track the override does not apply to renders with its own styles and font scale 1.0.
+
+### Delay: `ffp_set_subtitle_delay` / `ffp_get_subtitle_delay`
+
+Milliseconds, positive = subtitles later. Live; `ffp_open` resets it to 0. libass renders at `t - delay`; bitmap
+cues (embedded PGS and external `.sup`) are due at their time + delay. ARIB captions are not delayed. For embedded
+streams a negative delay can show a cue only once its packet has been read (the read-ahead of the demuxer).
+
+### Stream selection: `ffp_select_stream`
+
+`ffp_select_stream(p, type, index)` selects by media-info index, after PREPARED, synchronously on the library thread
+(never call it from inside a callback: it waits for that thread). Returns `0` (also when the stream is already
+selected), `FFP_EINVAL` when nothing is open or the index is not a stream of that type, or the open error.
+
+* `FFP_STREAM_SUBTITLE`: the caption layer. `-1` = off. An embedded subtitle stream (not an ARIB superimpose one) or
+  an external track. The previous selection is torn down first (its decoder, libass track or bitmap cues), whatever
+  its renderer was. A newly selected embedded stream gets its cues from the packets read from then on (after a seek
+  for the part already played).
+* `FFP_STREAM_AUDIO`: closes the current audio stream and opens the given one. ARIB media (media info `arib_audio`)
+  return `FFP_EINVAL`: audio 1 / audio 2 are chosen with `ffp_set_audio_preference`.
+* `FFP_STREAM_VIDEO`: closes the video stream (and its presenter open) and opens the given one.
+
+`ffp_cycle_stream` remains for video and audio; `FFP_STREAM_SUBTITLE` returns `FFP_EINVAL`.
+
+### External tracks: `ffp_add_subtitle_file`
+
+`ffp_add_subtitle_file(p, path_utf8)` (after PREPARED; synchronous like `ffp_select_stream`) reads the whole file on
+the calling thread with its own demuxer and decoders, before anything of the player is touched; there is no extra
+demux thread and seeking needs no file access. Every subtitle stream of the file becomes a track (a SAMI file with
+the 1011 demuxer: one per language class). Text tracks keep their decoded events and become a libass track on their
+first selection; `.sup` (PGS) becomes a list of cues sorted by time (a cue lasts until the next display set; cues
+beyond 256 MiB of decoded bitmaps are dropped with a warning). Returns the media-info index of the first new track, a
+negative AVERROR when the file cannot be read or has no subtitle stream, or `FFP_EINVAL` when nothing is open. The
+tracks belong to the open media; the next `ffp_open` / `ffp_stop` drops them. Adding does not select.
 
 The test-only `ffp_test_d3d11_readback_enable` and `ffp_test_d3d11_readback_last` exports can read the composed D3D11 back buffer and its video rectangle in client pixels. Readback is disabled by default and incurs a GPU-to-CPU copy on each presented frame while enabled; it is not a production snapshot API. The returned BGRA allocation belongs to the caller and must be released with `ffp_free`. On a missing presenter or a frame not yet captured, the readback API returns `FFP_EAGAIN`.
 

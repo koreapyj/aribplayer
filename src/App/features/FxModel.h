@@ -2,6 +2,7 @@
 // Pure models behind the Filters panel, the menus and the playback extras (no Win32, no UI). Tested by --logictest (FxLogicTests.cpp).
 #include <array>
 #include <functional>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -31,8 +32,9 @@ std::wstring DbLabel(double db);
 
 /// Which sub-controls of the single Deinterlace group are shown for a mode: priority + output rate + only-interlaced for On,
 /// the IVTC tuning (tff / cthresh / dupthresh / scthresh / pixel format) for IVTC, nothing for Off.
-struct DeinterlaceControls { bool priority = false, rate = false, onlyInterlaced = false, ivtcTuning = false; };
-DeinterlaceControls DeinterlaceControlsFor(wvp::DeinterlaceMode mode);
+/// `enabled` is false for progressive content: the group stays visible but unusable and the saved settings are untouched.
+struct DeinterlaceControls { bool priority = false, rate = false, onlyInterlaced = false, ivtcTuning = false, enabled = true; };
+DeinterlaceControls DeinterlaceControlsFor(wvp::DeinterlaceMode mode, bool progressiveContent);
 /// Combo labels in DeinterlaceMode order: "Off", "On", "IVTC".
 const std::vector<std::wstring>& DeinterlaceLabels();
 /// Combo labels in DeinterlacePriority order: "Efficiency", "Quality".
@@ -67,18 +69,31 @@ wvp::FilterSettings UserView(wvp::FilterSettings managerSettings);
 /// Applies user-view settings to the manager, adding the zoom crop to the custom video filter. Returns the minimal change.
 wvp::FilterChange ApplyUser(wvp::FilterManager& fm, wvp::FilterSettings user, const ZoomState& z);
 
-/// Superimpose subtitle streams are visible but are not members of ffp_cycle_stream's subtitle list.
+/// Superimpose subtitle streams are visible but cannot be selected (they follow the ARIB superimpose layer).
 bool IsCycleableSubtitle(const wvp::StreamInfo& stream);
 std::vector<wvp::StreamInfo> CycleableSubtitles(const std::vector<wvp::StreamInfo>& streams);
-/// The selected stream's zero-based index among cycleable subtitle streams, or -1 when none is selected.
-int SelectedCycleableSubtitleIndex(const std::vector<wvp::StreamInfo>& streams);
-/// Toggle the caption visibility value only when the media has an ARIB caption stream; returns whether it toggled.
-bool ToggleAribCaptionVisibility(const wvp::MediaInfo& media, bool& visible);
-/// Number of CycleStream calls needed to go from the currently selected stream to `targetIndex` among `streams`
-/// (same-type streams in ascending order). For subtitles the cycle has an extra "off" state after the last stream;
-/// targetIndex -1 = off (subtitles). Current = the stream with Selected (none selected = off for subtitles, 0 for audio).
-int CyclesNeeded(const std::vector<wvp::StreamInfo>& streams, int targetIndex, bool subtitle);
+/// Toggles the caption-layer visibility value when the media has a selectable subtitle stream; returns whether it toggled.
+bool ToggleSubtitleVisibility(const wvp::MediaInfo& media, bool& visible);
+/// The stream index SelectStream should get for the next subtitle in the cycle track 1 -> ... -> track N -> off -> track 1
+/// (no selection counts as off); -1 = off. nullopt when there is no selectable subtitle.
+std::optional<int> NextSubtitleIndex(const std::vector<wvp::StreamInfo>& streams);
+
+/// A selected track remembered across a reopen. Embedded tracks are kept by media-info index, external ones by file path
+/// and position among the streams of that file (one file may add several).
+struct TrackRef {
+    enum class Kind { None, Off, Embedded, External } kind = Kind::None;
+    int index = -1;
+    std::string path;
+    int pathOrdinal = 0;
+};
+/// The selected stream of `streams` (same-type streams); Kind::Off for subtitles without a selection, None otherwise.
+TrackRef CaptureTrackRef(const std::vector<wvp::StreamInfo>& streams, bool subtitle);
+/// The media-info index to select for `ref` in the reopened media (-1 = subtitles off); nullopt when it has no counterpart.
+std::optional<int> ResolveTrackRef(const std::vector<wvp::StreamInfo>& streams, const TrackRef& ref);
+
 std::wstring TrackName(const wvp::StreamInfo& s, int ordinalOneBased);
+/// Menu / toast label of a subtitle: TrackName for embedded tracks, "<file name> (<title or language>)" for external ones.
+std::wstring SubtitleLabel(const wvp::StreamInfo& s, int ordinalOneBased);
 /// "Audio: English (2/3)", "Subtitles: Off", "Subtitles: Forced (1/2)"; "" when there is nothing to report.
 std::wstring TrackToast(wvp::StreamType type, const std::vector<wvp::StreamInfo>& streams);
 std::wstring LanguageName(const std::string& code);

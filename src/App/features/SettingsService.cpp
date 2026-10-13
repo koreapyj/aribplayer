@@ -70,32 +70,41 @@ void EnsureTrackRestoreCancellationHooks(AppContext& ctx) {
     ctx.OnMediaError.add([&ctx](const wvp::PlayerErrorInfo&) { CancelPendingTrackRestore(ctx); });
 }
 
-void ScheduleTrackRestore(AppContext& ctx, int audioSelected, int subtitleSelected) {
+struct TrackRestore {
+    int arib = -1;                 // ARIB audio preference, or -1
+    fx::TrackRef audio, subtitle;
+};
+
+TrackRestore CaptureTrackRestore(AppContext& ctx) {
+    TrackRestore r;
+    auto* player = ctx.Player();
+    auto mi = player ? player->GetMediaInfo() : std::nullopt;
+    if (!mi) return r;
+    if (mi->AribAudio.Present) r.arib = player->AudioPreference();
+    else r.audio = fx::CaptureTrackRef(mi->Of(wvp::StreamType::Audio), false);
+    r.subtitle = fx::CaptureTrackRef(mi->Of(wvp::StreamType::Subtitle), true);
+    return r;
+}
+
+void ScheduleTrackRestore(AppContext& ctx, TrackRestore saved) {
     CancelPendingTrackRestore(ctx);
     EnsureTrackRestoreCancellationHooks(ctx);
     auto tok = std::make_shared<PreparedToken>(0);
-    *tok = ctx.OnMediaPrepared.add([&ctx, tok, audioSelected, subtitleSelected](const wvp::MediaPreparedInfo&) {
+    *tok = ctx.OnMediaPrepared.add([&ctx, tok, saved](const wvp::MediaPreparedInfo&) {
         ctx.OnMediaPrepared.remove(*tok);
         if (g_pendingRestoreContext == &ctx && g_pendingRestoreToken == *tok) {
             g_pendingRestoreContext = nullptr;
             g_pendingRestoreToken = 0;
         }
-        if (audioSelected > 0) SelectTrack(ctx, wvp::StreamType::Audio, audioSelected);
-        if (subtitleSelected >= 0) SelectTrack(ctx, wvp::StreamType::Subtitle, subtitleSelected);
+        auto* player = ctx.Player();
+        auto mi = player ? player->GetMediaInfo() : std::nullopt;
+        if (!mi) return;
+        if (saved.arib > 0) SelectTrack(ctx, wvp::StreamType::Audio, saved.arib);
+        if (auto a = fx::ResolveTrackRef(mi->Of(wvp::StreamType::Audio), saved.audio)) SelectTrack(ctx, wvp::StreamType::Audio, *a);
+        if (auto s = fx::ResolveTrackRef(mi->Of(wvp::StreamType::Subtitle), saved.subtitle)) SelectTrack(ctx, wvp::StreamType::Subtitle, *s);
     });
     g_pendingRestoreContext = &ctx;
     g_pendingRestoreToken = *tok;
-}
-
-int SelectedTrackIndex(AppContext& ctx, wvp::StreamType type) {
-    auto* player = ctx.Player();
-    auto mi = player ? player->GetMediaInfo() : std::nullopt;
-    if (!mi) return -1;
-    if (type == wvp::StreamType::Audio && mi->AribAudio.Present) return player->AudioPreference();
-    auto streams = mi->Of(type);
-    if (type == wvp::StreamType::Subtitle) return fx::SelectedCycleableSubtitleIndex(streams);
-    for (size_t i = 0; i < streams.size(); ++i) if (streams[i].Selected) return (int)i;
-    return -1;
 }
 
 std::wstring ExeDir() {
@@ -177,6 +186,7 @@ void ApplyPlayback(AppContext& ctx) {
     const wvp::AppSettings& s = ctx.Svc().settings;
     c->Player().SetSubtitleVisible(wvp::SubtitleLayer::Caption, s.showCaptions);
     c->Player().SetSubtitleVisible(wvp::SubtitleLayer::Superimpose, s.showSuperimpose);
+    c->Player().SetSubtitleStyle(s.subtitle);
     // Volume is never remembered across launches: the controller keeps its default (100, unmuted).
     c->SetShuffle(s.shuffle);
     c->SetRepeat(static_cast<wvp::RepeatMode>(std::clamp(s.repeat, 0, 2)));
@@ -197,6 +207,9 @@ void ApplyCaptionOpenOptions(wvp::PlaybackController& ctl, const wvp::AppSetting
     g_captionStyleKnown = true;
     std::string fontPath = settings.aribFont.empty() ? wvp::ToUtf8(BundledAribFontPath()) : settings.aribFont;
     ctl.SetBaseOption("arib_font", wvp::AribFontOption(fontPath));
+    std::wstring fontsDir = ExeDir() + L"\\fonts";
+    std::replace(fontsDir.begin(), fontsDir.end(), L'\\', L'/');
+    ctl.SetBaseOption("sub_fontsdir", wvp::ToUtf8(fontsDir));
     ctl.SetBaseOption("superimpose", settings.showSuperimpose ? "1" : "0");
     ctl.SetBaseOption("arib_ignore_background", style.ignoreBackground ? "1" : "0");
     ctl.SetBaseOption("arib_force_outline", style.forceOutline ? "1" : "0");
@@ -408,13 +421,13 @@ void OnSettingsChanged(AppContext& ctx) {
             c->Player().SetSubtitleVisible(wvp::SubtitleLayer::Caption, s.showCaptions);
         if (before.showSuperimpose != s.showSuperimpose)
             c->Player().SetSubtitleVisible(wvp::SubtitleLayer::Superimpose, s.showSuperimpose);
+        if (!(before.subtitle == s.subtitle)) c->Player().SetSubtitleStyle(s.subtitle);
         // live: decoder/planner changes re-open the current item at its position
-        const int aSel = SelectedTrackIndex(ctx, wvp::StreamType::Audio);
-        const int sSel = SelectedTrackIndex(ctx, wvp::StreamType::Subtitle);
+        TrackRestore saved = CaptureTrackRestore(ctx);
         EnsureTrackRestoreCancellationHooks(ctx);
         LiveApplyResult r = ApplySettingsLive(*c, svc.filters, before, s);
         g_appliedSettings = s;
-        if (r.reopened) ScheduleTrackRestore(ctx, aSel, sSel);
+        if (r.reopened) ScheduleTrackRestore(ctx, std::move(saved));
         if (!r.toast.empty()) ctx.ShowToast(r.toast);
     }
     log::ApplyDebugLogging(s.debugLogging, log::LogsDir(svc.settingsStore.Path()));

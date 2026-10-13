@@ -19,7 +19,7 @@ CommandId CommandForButton(int b) {
     case B_Next: return CommandId::SeekForward5;    // right click: Next
     case B_Open: return CommandId::OpenFiles;
     case B_Mute: return CommandId::ToggleMute;
-    case B_Subs: return CommandId::CycleSubtitles;
+    case B_Subs: return CommandId::ToggleSubtitles;
     case B_Control: return CommandId::ToggleControlPanel;
     case B_Panel: return CommandId::TogglePlaylistPanel;
     case B_Full: return CommandId::ToggleFullscreen;

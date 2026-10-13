@@ -1,0 +1,735 @@
+--- a/libavcodec/htmlsubtitles.c
++++ b/libavcodec/htmlsubtitles.c
+@@ -90,6 +90,7 @@ static void handle_open_brace(AVBPrint *
+ struct font_tag {
+     char face[128];
+     int size;
++    int scale; ///< percent set by an HTML size of 1..7, 0 if none
+     uint32_t color;
+ };
+ 
+@@ -121,6 +122,59 @@ static int scantag(const char* in, char*
+     return 0;
+ }
+ 
++/* Scale in percent for the HTML font sizes 1..7 (3 is the default). */
++static const int html_size_scale[7] = { 62, 81, 100, 112, 150, 200, 300 };
++
++static const struct { char name[7]; char text[3]; } html_entities[] = {
++    { "nbsp", "\\h" }, { "amp", "&" }, { "lt", "<" }, { "gt", ">" },
++    { "quot", { 0x22 } }, { "apos", "'" },
++};
++
++/* Decodes the entity at in (pointing to '&'); returns its length or 0. */
++static int html_entity_to_ass(AVBPrint *dst, const char *in)
++{
++    const char *end = strchr(in, ';');
++    int len;
++
++    if (!end || end - in > 10)
++        return 0;
++    len = end - in + 1;
++
++    if (in[1] == '#') {
++        const int hex = in[2] == 'x' || in[2] == 'X';
++        char *num_end;
++        unsigned long cp = strtoul(in + 2 + hex, &num_end, hex ? 16 : 10);
++        if (num_end != end || end == in + 2 + hex || !cp || cp > 0x10FFFF ||
++            (cp >= 0xD800 && cp < 0xE000))
++            return 0;
++        if (cp < 0x80) {
++            av_bprint_chars(dst, cp, 1);
++        } else if (cp < 0x800) {
++            av_bprint_chars(dst, 0xC0 | cp >> 6, 1);
++            av_bprint_chars(dst, 0x80 | (cp & 0x3F), 1);
++        } else if (cp < 0x10000) {
++            av_bprint_chars(dst, 0xE0 | cp >> 12, 1);
++            av_bprint_chars(dst, 0x80 | (cp >> 6 & 0x3F), 1);
++            av_bprint_chars(dst, 0x80 | (cp & 0x3F), 1);
++        } else {
++            av_bprint_chars(dst, 0xF0 | cp >> 18, 1);
++            av_bprint_chars(dst, 0x80 | (cp >> 12 & 0x3F), 1);
++            av_bprint_chars(dst, 0x80 | (cp >> 6 & 0x3F), 1);
++            av_bprint_chars(dst, 0x80 | (cp & 0x3F), 1);
++        }
++        return len;
++    }
++
++    for (int i = 0; i < FF_ARRAY_ELEMS(html_entities); i++) {
++        if (strlen(html_entities[i].name) == len - 2 &&
++            !strncmp(in + 1, html_entities[i].name, len - 2)) {
++            av_bprintf(dst, "%s", html_entities[i].text);
++            return len;
++        }
++    }
++    return 0;
++}
++
+ /*
+  * The general politic of the convert is to mask unsupported tags or formatting
+  * errors (but still alert the user/subtitles writer with an error/warning)
+@@ -229,6 +283,10 @@ int ff_htmlmarkup_to_ass(void *log_ctx,
+                         struct font_tag *cur_tag  = &stack[sptr--];
+                         struct font_tag *last_tag = &stack[sptr];
+ 
++                        if (cur_tag->scale != last_tag->scale) {
++                            const int pct = last_tag->scale ? last_tag->scale : 100;
++                            av_bprintf(dst, "{\\fscx%d\\fscy%d}", pct, pct);
++                        }
+                         if (cur_tag->size) {
+                             if (!last_tag->size)
+                                 av_bprintf(dst, "{\\fs}");
+@@ -256,9 +314,17 @@ int ff_htmlmarkup_to_ass(void *log_ctx,
+ 
+                         while (param) {
+                             if (!av_strncasecmp(param, "size=", 5)) {
++                                int rel, abs_size;
+                                 param += 5 + (param[5] == '"');
+-                                if (sscanf(param, "%u", &new_tag->size) == 1)
++                                if ((*param == '+' || *param == '-') && sscanf(param, "%d", &rel) == 1) {
++                                    new_tag->scale = html_size_scale[av_clip(3 + rel, 1, 7) - 1];
++                                    av_bprintf(dst, "{\\fscx%d\\fscy%d}", new_tag->scale, new_tag->scale);
++                                } else if (sscanf(param, "%d", &abs_size) == 1 && abs_size >= 1 && abs_size <= 7) {
++                                    new_tag->scale = html_size_scale[abs_size - 1];
++                                    av_bprintf(dst, "{\\fscx%d\\fscy%d}", new_tag->scale, new_tag->scale);
++                                } else if (sscanf(param, "%u", &new_tag->size) == 1) {
+                                     av_bprintf(dst, "{\\fs%u}", new_tag->size);
++                                }
+                             } else if (!av_strncasecmp(param, "color=", 6)) {
+                                 int color;
+                                 param += 6 + (param[6] == '"');
+@@ -299,6 +365,13 @@ int ff_htmlmarkup_to_ass(void *log_ctx,
+                 av_bprint_chars(dst, *in, 1);
+             }
+             break;
++        case '&':
++            len = html_entity_to_ass(dst, in);
++            if (len)
++                in += len - 1;
++            else
++                av_bprint_chars(dst, *in, 1);
++            break;
+         default:
+             av_bprint_chars(dst, *in, 1);
+             break;
+--- a/libavcodec/samidec.c
++++ b/libavcodec/samidec.c
+@@ -87,7 +87,7 @@ static int sami_paragraph_to_ass(AVCodec
+         while (av_isspace(*p))
+             p++;
+         if (!strncmp(p, "&nbsp;", 6)) {
+-            ret = -1;
++            ret = AVERROR(EAGAIN); // empty event: it only ends the previous one
+             goto end;
+         }
+ 
+@@ -97,6 +97,21 @@ static int sami_paragraph_to_ass(AVCodec
+                 if (!av_strncasecmp(p, "<P", 2) && (p[2] == '>' || av_isspace(p[2])))
+                     break;
+             }
++            if (!av_strncasecmp(p, "<RT", 3) || !av_strncasecmp(p, "<RP", 3)) {
++                // ruby annotations: keep only the base text
++                char *close = av_stristr(p, p[2] == 'T' || p[2] == 't' ? "</rt>" : "</rp>");
++                if (av_isspace(p[3]) || p[3] == '>') {
++                    p = close ? close + 5 : p + strlen(p);
++                    continue;
++                }
++            }
++            if (!av_strncasecmp(p, "<RUBY", 5) || !av_strncasecmp(p, "</RUBY", 6)) {
++                while (*p && *p != '>')
++                    p++;
++                if (*p)
++                    p++;
++                continue;
++            }
+             if (!av_strncasecmp(p, "<BR", 3)) {
+                 av_bprintf(dst, "\\N");
+                 p++;
+@@ -142,6 +157,8 @@ static int sami_decode_frame(AVCodecCont
+ 
+     if (ptr && avpkt->size > 0) {
+         int ret = sami_paragraph_to_ass(avctx, ptr);
++        if (ret == AVERROR(EAGAIN))
++            return avpkt->size;
+         if (ret < 0)
+             return ret;
+         // TODO: pass escaped sami->encoded_source.str as source
+--- a/libavformat/samidec.c
++++ b/libavformat/samidec.c
+@@ -22,6 +22,10 @@
+  * @file
+  * SAMI subtitle demuxer
+  * @see http://msdn.microsoft.com/en-us/library/ms971327.aspx
++ *
++ * One stream is created per <P Class=...> class. The language and title come
++ * from the CSS of the <STYLE> block (lang / Name), the colour is applied to the
++ * text as <font color>.
+  */
+ 
+ #include "avformat.h"
+@@ -30,44 +34,359 @@
+ #include "subtitles.h"
+ #include "libavutil/avstring.h"
+ #include "libavutil/bprint.h"
++#include "libavutil/mem.h"
+ 
+-typedef struct {
+-    FFDemuxSubtitlesQueue q;
++#define SAMI_MAX_CLASSES      32
++#define SAMI_MAX_RULES        64
++#define SAMI_DEFAULT_DURATION 5000 ///< ms, for the last cue of a stream
++
++typedef struct SAMIRule {
++    char sel[64];   ///< class name, or "p" for the paragraph defaults
++    char name[128];
++    char lang[32];
++    char color[32];
++} SAMIRule;
++
++typedef struct SAMISync {
++    int64_t pts, pos;
++    char *body;
++} SAMISync;
++
++typedef struct SAMIContext {
++    FFDemuxSubtitlesQueue *q; ///< one queue per stream, so durations are per class
++    int nb_q;
+ } SAMIContext;
+ 
+ static int sami_probe(const AVProbeData *p)
+ {
+-    char buf[6];
++    char buf[5];
++    int c, i = 0;
+     FFTextReader tr;
+     ff_text_init_buf(&tr, p->buf, p->buf_size);
++
++    while (i++ < 256 && (c = ff_text_peek_r8(&tr)) && av_isspace(c))
++        ff_text_r8(&tr);
+     ff_text_read(&tr, buf, sizeof(buf));
++    c = ff_text_peek_r8(&tr);
++
++    if (av_strncasecmp(buf, "<SAMI", 5) || !(c == '>' || av_isspace(c)))
++        return 0;
++    return AVPROBE_SCORE_MAX;
++}
++
++static char *sami_trim(char *s)
++{
++    char *e;
++    while (av_isspace(*s))
++        s++;
++    e = s + strlen(s);
++    while (e > s && av_isspace(e[-1]))
++        *--e = 0;
++    return s;
++}
++
++static int sami_valid_utf8(const char *str)
++{
++    const uint8_t *s = (const uint8_t *)str;
++    while (*s) {
++        int n = *s < 0x80 ? 0 : *s >= 0xC2 && *s < 0xE0 ? 1 :
++                *s >= 0xE0 && *s < 0xF0 ? 2 : *s >= 0xF0 && *s < 0xF5 ? 3 : -1;
++        if (n < 0)
++            return 0;
++        s++;
++        while (n--)
++            if ((*s++ & 0xC0) != 0x80)
++                return 0;
++    }
++    return 1;
++}
++
++static void sami_copy_token(char *dst, size_t size, const char *src, const char *stop)
++{
++    size_t n = strcspn(src, stop);
++    av_strlcpy(dst, src, FFMIN(size, n + 1));
++}
++
++/* Strips comments and markup from the header, leaving only the CSS rules.
++ * The "<!--" ... "-->" wrapper is one chunk of the header, so it must not be
++ * treated as a tag. */
++static void sami_clean_css(char *s)
++{
++    char *w = s;
++    while (*s) {
++        if (!strncmp(s, "/*", 2)) {
++            const char *e = strstr(s + 2, "*/");
++            s = e ? (char *)e + 2 : s + strlen(s);
++        } else if (!strncmp(s, "<!--", 4)) {
++            s += 4;
++        } else if (!strncmp(s, "-->", 3)) {
++            s += 3;
++        } else if (*s == '<') {
++            const char *e = strchr(s, '>');
++            s = e ? (char *)e + 1 : s + strlen(s);
++        } else {
++            *w++ = *s++;
++        }
++    }
++    *w = 0;
++}
++
++static void sami_parse_decls(SAMIRule *r, char *decls)
++{
++    char *save = NULL, *d;
++    for (d = av_strtok(decls, ";", &save); d; d = av_strtok(NULL, ";", &save)) {
++        char *colon = strchr(d, ':'), *key, *val;
++        if (!colon)
++            continue;
++        *colon = 0;
++        key = sami_trim(d);
++        val = sami_trim(colon + 1);
++        if (*val == '"' || *val == '\'')
++            val++;
++        if (!av_strcasecmp(key, "name")) {
++            sami_copy_token(r->name, sizeof(r->name), val, "\"'");
++        } else if (!av_strcasecmp(key, "lang")) {
++            sami_copy_token(r->lang, sizeof(r->lang), val, "\"' ");
++        } else if (!av_strcasecmp(key, "color")) {
++            size_t i, n = 0;
++            for (i = 0; val[i] && n < sizeof(r->color) - 1; i++) {
++                if (!(av_toupper(val[i]) >= 'A' && av_toupper(val[i]) <= 'Z') && !av_isdigit(val[i]) && val[i] != '#')
++                    break;
++                r->color[n++] = val[i];
++            }
++            r->color[n] = 0;
++        }
++    }
++}
++
++static const SAMIRule *sami_find_rule(const SAMIRule *rules, int nb, const char *sel)
++{
++    for (int i = 0; i < nb; i++)
++        if (!av_strcasecmp(rules[i].sel, sel))
++            return &rules[i];
++    return NULL;
++}
++
++static int sami_parse_css(const char *hdr, SAMIRule *rules)
++{
++    int nb = 0;
++    char *css = av_strdup(hdr), *p, *open;
++    if (!css)
++        return 0;
++    sami_clean_css(css);
++    for (p = css; (open = strchr(p, '{')); ) {
++        char *close = strchr(open, '}'), *save = NULL, *sel;
++        SAMIRule tmp = { { 0 } };
++        if (!close)
++            break;
++        *open = *close = 0;
++        sami_parse_decls(&tmp, open + 1);
++        for (sel = av_strtok(p, ",", &save); sel; sel = av_strtok(NULL, ",", &save)) {
++            char *key = sami_trim(sel), *dot;
++            SAMIRule *r = NULL;
++            /* the selector is the last word; earlier text is page markup leftovers */
++            for (char *sp = key + strlen(key); sp > key; sp--)
++                if (av_isspace(sp[-1])) {
++                    key = sp;
++                    break;
++                }
++            dot = strchr(key, '.');
++            if (dot)
++                key = dot + 1;
++            else if (av_strcasecmp(key, "p"))
++                continue;
++            if (!*key)
++                continue;
++            for (int i = 0; i < nb; i++)
++                if (!av_strcasecmp(rules[i].sel, key))
++                    r = &rules[i];
++            if (!r) {
++                if (nb == SAMI_MAX_RULES)
++                    continue;
++                r = &rules[nb++];
++                memset(r, 0, sizeof(*r));
++                av_strlcpy(r->sel, key, sizeof(r->sel));
++            }
++            if (tmp.name[0])  av_strlcpy(r->name,  tmp.name,  sizeof(r->name));
++            if (tmp.lang[0])  av_strlcpy(r->lang,  tmp.lang,  sizeof(r->lang));
++            if (tmp.color[0]) av_strlcpy(r->color, tmp.color, sizeof(r->color));
++        }
++        p = close + 1;
++    }
++    av_free(css);
++    return nb;
++}
++
++static const char *sami_lang_from_css(const char *lang, char *out, size_t size)
++{
++    static const struct { char a[3], b[4]; } map[] = {
++        { "ko", "kor" }, { "en", "eng" }, { "ja", "jpn" }, { "zh", "zho" },
++    };
++    size_t n = strcspn(lang, "-_");
++    for (int i = 0; i < FF_ARRAY_ELEMS(map); i++)
++        if (n == 2 && !av_strncasecmp(lang, map[i].a, 2))
++            return map[i].b;
++    av_strlcpy(out, lang, FFMIN(size, n + 1));
++    for (char *c = out; *c; c++)
++        *c = av_tolower(*c);
++    return out;
++}
++
++static const char *sami_lang_from_class(const char *cls)
++{
++    static const struct { char cls[5], lang[4]; } map[] = {
++        { "KRCC", "kor" }, { "ENCC", "eng" }, { "EGCC", "eng" },
++        { "JPCC", "jpn" }, { "CNCC", "zho" },
++    };
++    for (int i = 0; i < FF_ARRAY_ELEMS(map); i++)
++        if (!av_strcasecmp(cls, map[i].cls))
++            return map[i].lang;
++    return NULL;
++}
++
++static int sami_is_paragraph(const char *p)
++{
++    return !av_strncasecmp(p, "<P", 2) && (p[2] == '>' || av_isspace(p[2]));
++}
++
++/* Next "<P" or "<P " at or after p, or NULL. */
++static const char *sami_next_paragraph(const char *p)
++{
++    while ((p = av_stristr(p, "<P")) && !sami_is_paragraph(p))
++        p++;
++    return p;
++}
++
++static void sami_paragraph_class(const char *tag, char *cls, size_t size)
++{
++    const char *v = ff_smil_get_attr_ptr(tag, "Class");
++    cls[0] = 0;
++    if (v)
++        sami_copy_token(cls, size, v, "\"' >/");
++}
++
++static int sami_find_class(char (*classes)[64], int nb, const char *cls)
++{
++    for (int i = 0; i < nb; i++)
++        if (!av_strcasecmp(classes[i], cls))
++            return i;
++    return -1;
++}
++
++static int sami_is_visible(const char *s, const char *end)
++{
++    while (s < end) {
++        if (*s == '<') {
++            const char *e = memchr(s, '>', end - s);
++            if (!e)
++                break;
++            s = e + 1;
++        } else if (!av_strncasecmp(s, "&nbsp;", 6)) {
++            s += 6;
++        } else if (av_isspace(*s)) {
++            s++;
++        } else {
++            return 1;
++        }
++    }
++    return 0;
++}
+ 
+-    return !strncmp(buf, "<SAMI>", 6) ? AVPROBE_SCORE_MAX : 0;
++/* One packet per stream for this <SYNC>; a class without text gets "&nbsp;" so
++ * that its previous cue ends here. */
++static int sami_make_packets(AVFormatContext *s, const SAMISync *sync,
++                             char (*classes)[64], int nb_classes,
++                             const SAMIRule *rules, int nb_rules, int nb_streams)
++{
++    SAMIContext *sami = s->priv_data;
++    const SAMIRule *def = sami_find_rule(rules, nb_rules, "p");
++    AVBPrint out[SAMI_MAX_CLASSES];
++    int visible[SAMI_MAX_CLASSES] = { 0 };
++    const char *p = sami_next_paragraph(sync->body);
++    int ret = 0;
++
++    for (int i = 0; i < nb_streams; i++)
++        av_bprint_init(&out[i], 0, AV_BPRINT_SIZE_UNLIMITED);
++
++    while (p) {
++        const char *tag_end = strchr(p, '>'), *next;
++        char tag[256], cls[64];
++        int idx = 0;
++        if (!tag_end)
++            break;
++        next = sami_next_paragraph(tag_end + 1);
++        if (!next)
++            next = tag_end + 1 + strlen(tag_end + 1);
++
++        if (nb_classes) {
++            sami_copy_token(tag, sizeof(tag), p, ">");
++            sami_paragraph_class(tag, cls, sizeof(cls));
++            idx = FFMAX(sami_find_class(classes, nb_classes, cls), 0);
++        }
++        if (sami_is_visible(tag_end + 1, next)) {
++            const SAMIRule *r = nb_classes ? sami_find_rule(rules, nb_rules, classes[idx]) : NULL;
++            const char *cend = next;
++            const char *color = r && r->color[0] ? r->color : def && def->color[0] ? def->color : NULL;
++            av_bprint_append_data(&out[idx], p, tag_end + 1 - p);
++            if (color)
++                av_bprintf(&out[idx], "<font color=\"%s\">", color);
++            while (cend > tag_end + 1 && av_isspace(cend[-1]))
++                cend--;
++            av_bprint_append_data(&out[idx], tag_end + 1, cend - tag_end - 1);
++            if (color)
++                av_bprintf(&out[idx], "</font>");
++            visible[idx] = 1;
++        }
++        p = *next ? next : NULL;
++    }
++
++    for (int i = 0; i < nb_streams; i++) {
++        AVBPrint pkt_data;
++        AVPacket *pkt;
++        av_bprint_init(&pkt_data, 0, AV_BPRINT_SIZE_UNLIMITED);
++        av_bprintf(&pkt_data, "<SYNC Start=%"PRId64">", sync->pts);
++        if (visible[i])
++            av_bprintf(&pkt_data, "%s", out[i].str);
++        else if (nb_classes)
++            av_bprintf(&pkt_data, "<P Class=%s>&nbsp;", classes[i]);
++        else
++            av_bprintf(&pkt_data, "<P>&nbsp;");
++        pkt = ff_subtitles_queue_insert_bprint(&sami->q[i], &pkt_data, 0);
++        av_bprint_finalize(&pkt_data, NULL);
++        if (!pkt) {
++            ret = AVERROR(ENOMEM);
++            break;
++        }
++        pkt->pos          = sync->pos;
++        pkt->pts          = sync->pts;
++        pkt->duration     = -1;
++        pkt->stream_index = i;
++    }
++    for (int i = 0; i < nb_streams; i++)
++        av_bprint_finalize(&out[i], NULL);
++    return ret;
+ }
+ 
+ static int sami_read_header(AVFormatContext *s)
+ {
+     SAMIContext *sami = s->priv_data;
+-    AVStream *st = avformat_new_stream(s, NULL);
+     AVBPrint buf, hdr_buf;
+     char c = 0;
+-    int res = 0, got_first_sync_point = 0;
++    int res = 0, got_first_sync_point = 0, nb_syncs = 0, nb_streams;
++    int nb_rules = 0, nb_classes = 0, utf8 = 1;
++    char classes[SAMI_MAX_CLASSES][64];
++    SAMIRule rules[SAMI_MAX_RULES];
++    SAMISync *syncs = NULL;
+     FFTextReader tr;
+     ff_text_init_avio(s, &tr, s->pb);
+ 
+-    if (!st)
+-        return AVERROR(ENOMEM);
+-    avpriv_set_pts_info(st, 64, 1, 1000);
+-    st->codecpar->codec_type = AVMEDIA_TYPE_SUBTITLE;
+-    st->codecpar->codec_id   = AV_CODEC_ID_SAMI;
+-
+     av_bprint_init(&buf,     0, AV_BPRINT_SIZE_UNLIMITED);
+     av_bprint_init(&hdr_buf, 0, AV_BPRINT_SIZE_UNLIMITED);
+ 
++    /* The whole file is read first: the streams depend on every class used. */
+     while (!ff_text_eof(&tr)) {
+-        AVPacket *sub;
+         const int64_t pos = ff_text_pos(&tr) - (c != 0);
+-        int is_sync, is_body, n = ff_smil_extract_next_text_chunk(&tr, &buf, &c);
++        int is_sync, n = ff_smil_extract_next_text_chunk(&tr, &buf, &c);
+ 
+         if (n < 0) {
+             res = n;
+@@ -76,11 +395,10 @@ static int sami_read_header(AVFormatCont
+         if (n == 0)
+             break;
+ 
+-        is_body = !av_strncasecmp(buf.str, "</BODY", 6);
+-        if (is_body) {
+-             av_bprint_clear(&buf);
+-             break;
+-        }
++        utf8 = utf8 && sami_valid_utf8(buf.str);
++
++        if (!av_strncasecmp(buf.str, "</BODY", 6))
++            break;
+ 
+         is_sync = !av_strncasecmp(buf.str, "<SYNC", 5);
+         if (is_sync)
+@@ -88,40 +406,146 @@ static int sami_read_header(AVFormatCont
+ 
+         if (!got_first_sync_point) {
+             av_bprintf(&hdr_buf, "%s", buf.str);
+-        } else {
+-            sub = ff_subtitles_queue_insert_bprint(&sami->q, &buf, !is_sync);
+-            if (!sub) {
++        } else if (is_sync) {
++            SAMISync *tmp = av_realloc_array(syncs, nb_syncs + 1, sizeof(*syncs));
++            const char *v = ff_smil_get_attr_ptr(buf.str, "Start");
++            if (!tmp) {
+                 res = AVERROR(ENOMEM);
+-                av_bprint_finalize(&hdr_buf, NULL);
+                 goto end;
+             }
+-            if (is_sync) {
+-                const char *p = ff_smil_get_attr_ptr(buf.str, "Start");
+-                sub->pos      = pos;
+-                sub->pts      = p ? strtol(p, NULL, 10) : 0;
+-                if (sub->pts <= INT64_MIN/2 || sub->pts >= INT64_MAX/2) {
+-                    res = AVERROR_PATCHWELCOME;
+-                    av_bprint_finalize(&hdr_buf, NULL);
+-                    goto end;
+-                }
+-
+-                sub->duration = -1;
++            syncs = tmp;
++            syncs[nb_syncs].pos  = pos;
++            syncs[nb_syncs].pts  = v ? strtol(v, NULL, 10) : 0;
++            syncs[nb_syncs].body = av_strdup("");
++            if (!syncs[nb_syncs].body) {
++                res = AVERROR(ENOMEM);
++                goto end;
++            }
++            if (syncs[nb_syncs].pts <= INT64_MIN/2 || syncs[nb_syncs].pts >= INT64_MAX/2) {
++                av_free(syncs[nb_syncs].body);
++                res = AVERROR_PATCHWELCOME;
++                goto end;
+             }
++            nb_syncs++;
++        } else {
++            SAMISync *sy = &syncs[nb_syncs - 1];
++            char *body = av_asprintf("%s%s", sy->body, buf.str);
++            if (!body) {
++                res = AVERROR(ENOMEM);
++                goto end;
++            }
++            av_free(sy->body);
++            sy->body = body;
+         }
+         av_bprint_clear(&buf);
+     }
+ 
+-    res = ff_bprint_to_codecpar_extradata(st->codecpar, &hdr_buf);
+-    if (res < 0)
++    if (!av_bprint_is_complete(&hdr_buf)) {
++        res = AVERROR(ENOMEM);
++        goto end;
++    }
++    nb_rules = sami_parse_css(hdr_buf.str, rules);
++
++    for (int i = 0; i < nb_syncs; i++) {
++        const char *p = sami_next_paragraph(syncs[i].body);
++        for (; p; p = sami_next_paragraph(p + 1)) {
++            char tag[256], cls[64];
++            sami_copy_token(tag, sizeof(tag), p, ">");
++            sami_paragraph_class(tag, cls, sizeof(cls));
++            if (*cls && nb_classes < SAMI_MAX_CLASSES && sami_find_class(classes, nb_classes, cls) < 0)
++                av_strlcpy(classes[nb_classes++], cls, sizeof(classes[0]));
++        }
++    }
++    nb_streams = FFMAX(nb_classes, 1);
++
++    sami->q = av_calloc(nb_streams, sizeof(*sami->q));
++    if (!sami->q) {
++        res = AVERROR(ENOMEM);
+         goto end;
++    }
++    sami->nb_q = nb_streams;
+ 
+-    ff_subtitles_queue_finalize(s, &sami->q);
++    for (int i = 0; i < nb_streams; i++) {
++        AVStream *st = avformat_new_stream(s, NULL);
++        if (!st) {
++            res = AVERROR(ENOMEM);
++            goto end;
++        }
++        avpriv_set_pts_info(st, 64, 1, 1000);
++        st->codecpar->codec_type = AVMEDIA_TYPE_SUBTITLE;
++        st->codecpar->codec_id   = AV_CODEC_ID_SAMI;
++        if (nb_classes) {
++            const SAMIRule *r = sami_find_rule(rules, nb_rules, classes[i]);
++            char lang[32];
++            const char *l = r && r->lang[0] ? sami_lang_from_css(r->lang, lang, sizeof(lang))
++                                              : sami_lang_from_class(classes[i]);
++            if (l && *l)
++                av_dict_set(&st->metadata, "language", l, 0);
++            av_dict_set(&st->metadata, "title", r && r->name[0] ? r->name : classes[i], 0);
++        }
++        if (!utf8)
++            av_dict_set(&st->metadata, "charenc", "CP949", 0);
++    }
++
++    for (int i = 0; i < nb_syncs; i++) {
++        res = sami_make_packets(s, &syncs[i], classes, nb_classes, rules, nb_rules, nb_streams);
++        if (res < 0)
++            goto end;
++    }
++
++    for (int i = 0; i < nb_streams; i++) {
++        FFDemuxSubtitlesQueue *q = &sami->q[i];
++        ff_subtitles_queue_finalize(s, q);
++        if (q->nb_subs && q->subs[q->nb_subs - 1]->duration < 0)
++            q->subs[q->nb_subs - 1]->duration = SAMI_DEFAULT_DURATION;
++    }
+ 
+ end:
++    for (int i = 0; i < nb_syncs; i++)
++        av_free(syncs[i].body);
++    av_free(syncs);
++    av_bprint_finalize(&hdr_buf, NULL);
+     av_bprint_finalize(&buf, NULL);
+     return res;
+ }
+ 
++static int sami_read_packet(AVFormatContext *s, AVPacket *pkt)
++{
++    SAMIContext *sami = s->priv_data;
++    int best = -1;
++
++    for (int i = 0; i < sami->nb_q; i++) {
++        const FFDemuxSubtitlesQueue *q = &sami->q[i];
++        if (q->current_sub_idx < q->nb_subs &&
++            (best < 0 || q->subs[q->current_sub_idx]->pts <
++                         sami->q[best].subs[sami->q[best].current_sub_idx]->pts))
++            best = i;
++    }
++    if (best < 0)
++        return AVERROR_EOF;
++    return ff_subtitles_queue_read_packet(&sami->q[best], pkt);
++}
++
++static int sami_read_seek(AVFormatContext *s, int stream_index,
++                          int64_t min_ts, int64_t ts, int64_t max_ts, int flags)
++{
++    SAMIContext *sami = s->priv_data;
++    int ret = 0;
++
++    for (int i = 0; i < sami->nb_q && ret >= 0; i++)
++        ret = ff_subtitles_queue_seek(&sami->q[i], s, -1, min_ts, ts, max_ts, flags);
++    return ret;
++}
++
++static int sami_read_close(AVFormatContext *s)
++{
++    SAMIContext *sami = s->priv_data;
++    for (int i = 0; i < sami->nb_q; i++)
++        ff_subtitles_queue_clean(&sami->q[i]);
++    av_freep(&sami->q);
++    return 0;
++}
++
+ const FFInputFormat ff_sami_demuxer = {
+     .p.name         = "sami",
+     .p.long_name    = NULL_IF_CONFIG_SMALL("SAMI subtitle format"),
+@@ -130,7 +554,7 @@ const FFInputFormat ff_sami_demuxer = {
+     .flags_internal = FF_INFMT_FLAG_INIT_CLEANUP,
+     .read_probe     = sami_probe,
+     .read_header    = sami_read_header,
+-    .read_packet    = ff_subtitles_read_packet,
+-    .read_seek2     = ff_subtitles_read_seek,
+-    .read_close     = ff_subtitles_read_close,
++    .read_packet    = sami_read_packet,
++    .read_seek2     = sami_read_seek,
++    .read_close     = sami_read_close,
+ };

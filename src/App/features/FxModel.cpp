@@ -61,8 +61,9 @@ std::wstring DbLabel(double db) {
     return std::wstring(v > 0 ? L"+" : L"") + std::to_wstring(v) + L" dB";
 }
 
-DeinterlaceControls DeinterlaceControlsFor(wvp::DeinterlaceMode mode) {
+DeinterlaceControls DeinterlaceControlsFor(wvp::DeinterlaceMode mode, bool progressiveContent) {
     DeinterlaceControls c;
+    c.enabled = !progressiveContent;
     c.priority = c.rate = c.onlyInterlaced = mode == wvp::DeinterlaceMode::On;
     c.ivtcTuning = mode == wvp::DeinterlaceMode::Ivtc;
     return c;
@@ -159,33 +160,55 @@ std::vector<wvp::StreamInfo> CycleableSubtitles(const std::vector<wvp::StreamInf
     return cycleable;
 }
 
-int SelectedCycleableSubtitleIndex(const std::vector<wvp::StreamInfo>& streams) {
-    int index = 0;
-    for (const auto& stream : streams) {
-        if (!IsCycleableSubtitle(stream)) continue;
-        if (stream.Selected) return index;
-        ++index;
-    }
-    return -1;
-}
-
-bool ToggleAribCaptionVisibility(const wvp::MediaInfo& media, bool& visible) {
-    const bool hasCaption = std::any_of(media.Streams.begin(), media.Streams.end(), [](const wvp::StreamInfo& stream) {
-        return stream.Type == wvp::StreamType::Subtitle && stream.AribType == "caption";
-    });
-    if (!hasCaption) return false;
+bool ToggleSubtitleVisibility(const wvp::MediaInfo& media, bool& visible) {
+    if (!std::any_of(media.Streams.begin(), media.Streams.end(), IsCycleableSubtitle)) return false;
     visible = !visible;
     return true;
 }
 
-int CyclesNeeded(const std::vector<wvp::StreamInfo>& streams, int target, bool subtitle) {
-    int n = (int)streams.size();
-    if (n == 0) return 0;
-    int states = subtitle ? n + 1 : n;
-    int cur = subtitle ? n : 0;
-    for (int i = 0; i < n; i++) if (streams[(size_t)i].Selected) { cur = i; break; }
-    int tgt = target < 0 ? (subtitle ? n : 0) : std::min(target, n - 1);
-    return ((tgt - cur) % states + states) % states;
+std::optional<int> NextSubtitleIndex(const std::vector<wvp::StreamInfo>& streams) {
+    const auto subs = CycleableSubtitles(streams);
+    if (subs.empty()) return std::nullopt;
+    size_t cur = subs.size();
+    for (size_t i = 0; i < subs.size(); i++) if (subs[i].Selected) { cur = i; break; }
+    if (cur == subs.size()) return subs.front().Index;
+    return cur + 1 < subs.size() ? subs[cur + 1].Index : -1;
+}
+
+TrackRef CaptureTrackRef(const std::vector<wvp::StreamInfo>& streams, bool subtitle) {
+    TrackRef ref;
+    int pathOrdinal = 0;
+    std::string lastPath;
+    for (const auto& s : streams) {
+        if (s.external) {
+            if (s.path != lastPath) { lastPath = s.path; pathOrdinal = 0; } else pathOrdinal++;
+        }
+        if (!s.Selected) continue;
+        ref.index = s.Index;
+        if (s.external) { ref.kind = TrackRef::Kind::External; ref.path = s.path; ref.pathOrdinal = pathOrdinal; }
+        else ref.kind = TrackRef::Kind::Embedded;
+        return ref;
+    }
+    if (subtitle) ref.kind = TrackRef::Kind::Off;
+    return ref;
+}
+
+std::optional<int> ResolveTrackRef(const std::vector<wvp::StreamInfo>& streams, const TrackRef& ref) {
+    switch (ref.kind) {
+    case TrackRef::Kind::Off: return -1;
+    case TrackRef::Kind::Embedded:
+        for (const auto& s : streams) if (!s.external && s.Index == ref.index) return s.Index;
+        return std::nullopt;
+    case TrackRef::Kind::External: {
+        int ordinal = 0;
+        for (const auto& s : streams) {
+            if (!s.external || s.path != ref.path) continue;
+            if (ordinal++ == ref.pathOrdinal) return s.Index;
+        }
+        return std::nullopt;
+    }
+    default: return std::nullopt;
+    }
 }
 
 std::wstring LanguageName(const std::string& c) {
@@ -212,6 +235,15 @@ std::wstring TrackName(const wvp::StreamInfo& s, int ordinal) {
     return Tr(L"Track ", L"트랙 ") + std::to_wstring(ordinal);
 }
 
+std::wstring SubtitleLabel(const wvp::StreamInfo& s, int ordinal) {
+    if (!s.external) return TrackName(s, ordinal);
+    std::wstring leaf = wvp::ToWide(s.path);
+    if (size_t slash = leaf.find_last_of(L"\\/"); slash != std::wstring::npos) leaf.erase(0, slash + 1);
+    if (leaf.empty()) return TrackName(s, ordinal);
+    std::wstring info = !s.Title.empty() ? wvp::ToWide(s.Title) : LanguageName(s.Language);
+    return info.empty() ? leaf : leaf + L" (" + info + L")";
+}
+
 void AribAudioNames(const wvp::StreamInfo& audio1, bool has1, const wvp::StreamInfo& audio2, bool has2,
                     std::wstring& name1, std::wstring& name2) {
     name1 = TrackName(has1 ? audio1 : wvp::StreamInfo{}, 1);
@@ -228,7 +260,7 @@ std::wstring TrackToast(wvp::StreamType type, const std::vector<wvp::StreamInfo>
     std::wstring head = sub ? Tr(L"Subtitles: ", L"자막: ") : Tr(L"Audio: ", L"소리: ");
     for (size_t i = 0; i < streams.size(); i++) {
         if (streams[i].Selected)
-            return head + TrackName(streams[i], (int)i + 1) + L" (" + std::to_wstring(i + 1) + L"/" + std::to_wstring(streams.size()) + L")";
+            return head + (sub ? SubtitleLabel(streams[i], (int)i + 1) : TrackName(streams[i], (int)i + 1)) + L" (" + std::to_wstring(i + 1) + L"/" + std::to_wstring(streams.size()) + L")";
     }
     return sub ? head + Tr(L"Off", L"끄기") : L"";
 }

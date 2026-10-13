@@ -21,24 +21,36 @@ std::vector<MenuItemDesc> BuildSubtitleItems(const MenuState& s, std::function<v
     auto cmd = [run](Cmd c, double v = 0, int i = 0, bool f = false) {
         return [run, c, v, i, f] { if (run) run(MenuCmd{c, v, i, f}); };
     };
+    auto exec = [&](CommandId c) { return cmd(Cmd::Execute, 0, (int)c); };
     std::vector<MenuItemDesc> sub;
-    if (s.subs.empty()) return sub;
-    // superimpose is listed for visibility but cannot be selected through ffp_cycle_stream.
+    if (!s.hasMedia) return sub;
+    // superimpose is listed for visibility but follows its own layer and cannot be selected.
     const auto cycleable = fx::CycleableSubtitles(s.subs);
     bool any = false;
     for (const auto& x : cycleable) any = any || x.Selected;
     MenuItemDesc off = MenuItemDesc::Radio(Tr(L"Off", L"끄기"), !any, cmd(Cmd::SelectSubtitle, 0, -1));
     if (cycleable.empty()) off.Disabled();
     sub.push_back(std::move(off));
-    int cycleIndex = 0;
     for (size_t i = 0; i < s.subs.size(); i++) {
         const auto& stream = s.subs[i];
         if (!fx::IsCycleableSubtitle(stream)) {
             sub.push_back(MenuItemDesc::Item(fx::TrackName(stream, (int)i + 1) + Tr(L" (superimpose)", L" (슈퍼임포즈)"), {}).Disabled());
             continue;
         }
-        sub.push_back(MenuItemDesc::Radio(fx::TrackName(stream, (int)i + 1), stream.Selected, cmd(Cmd::SelectSubtitle, 0, cycleIndex++)));
+        sub.push_back(MenuItemDesc::Radio(fx::SubtitleLabel(stream, (int)i + 1), stream.Selected, cmd(Cmd::SelectSubtitle, 0, stream.Index)));
     }
+    sub.push_back(MenuItemDesc::Separator());
+    sub.push_back(MenuItemDesc::Item(Tr(L"Load subtitle file…", L"자막 파일 불러오기…"), exec(CommandId::LoadSubtitleFile), ShortcutText(CommandId::LoadSubtitleFile)));
+    MenuItemDesc show = MenuItemDesc::Check(Tr(L"Show subtitles", L"자막 표시"), s.subVisible,
+                                            [run](bool v) { if (run) run(MenuCmd{Cmd::SetSubtitleVisible, 0, 0, v}); },
+                                            ShortcutText(CommandId::ToggleSubtitles));
+    if (cycleable.empty()) show.Disabled();
+    sub.push_back(std::move(show));
+    std::vector<MenuItemDesc> sync;
+    sync.push_back(MenuItemDesc::Item(Tr(L"Slower (+0.5 s)", L"느리게 (+0.5초)"), exec(CommandId::SubtitleDelayLater), ShortcutText(CommandId::SubtitleDelayLater)));
+    sync.push_back(MenuItemDesc::Item(Tr(L"Faster (-0.5 s)", L"빠르게 (-0.5초)"), exec(CommandId::SubtitleDelayEarlier), ShortcutText(CommandId::SubtitleDelayEarlier)));
+    sync.push_back(MenuItemDesc::Item(Tr(L"Default", L"기본값"), exec(CommandId::SubtitleDelayReset), ShortcutText(CommandId::SubtitleDelayReset)));
+    sub.push_back(MenuItemDesc::Sub(Tr(L"Sync", L"싱크"), std::move(sync)));
     return sub;
 }
 
@@ -114,7 +126,7 @@ std::vector<MenuItemDesc> BuildMenu(const MenuState& s, std::function<void(const
     } else {
         std::vector<MenuItemDesc> sub;
         for (size_t i = 0; i < s.audio.size(); i++)
-            sub.push_back(MenuItemDesc::Radio(fx::TrackName(s.audio[i], (int)i + 1), s.audio[i].Selected, cmd(Cmd::SelectAudio, 0, (int)i)));
+            sub.push_back(MenuItemDesc::Radio(fx::TrackName(s.audio[i], (int)i + 1), s.audio[i].Selected, cmd(Cmd::SelectAudio, 0, s.audio[i].Index)));
         m.push_back(MenuItemDesc::Sub(Tr(L"Audio track", L"소리"), std::move(sub), G::Volume));
     }
 
@@ -185,6 +197,7 @@ MenuState CaptureMenuState(AppContext& ctx) {
     }
     const auto& f = ctx.Svc().filters.Settings();
     s.speed = f.speed;
+    s.subVisible = ctx.Svc().settings.showCaptions;
     s.zoom = IsZoomToFill();
     return s;
 }
@@ -210,7 +223,14 @@ void Run(AppContext& ctx, const menus::MenuCmd& c) {
     case Cmd::SelectAribAudio:
         if (auto* p = ctx.Player()) p->SetAudioPreference(c.index);   // no toast: audio 2 falls back to audio 1 by itself
         break;
-    case Cmd::SelectSubtitle: SelectTrack(ctx, wvp::StreamType::Subtitle, c.index); break;
+    case Cmd::SelectSubtitle:
+        if (c.index >= 0) ShowSubtitles(ctx);
+        SelectTrack(ctx, wvp::StreamType::Subtitle, c.index);
+        break;
+    case Cmd::SetSubtitleVisible:
+        ctx.Svc().settings.showCaptions = c.flag;
+        OnSettingsChanged(ctx);
+        break;
     }
 }
 

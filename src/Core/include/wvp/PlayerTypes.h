@@ -71,8 +71,25 @@ struct StreamInfo {
     double Fps = 0;
     std::string PixFmt;
     std::string FourCC;                   // 4 chars from libffplay (container tag or RIFF tag); empty when none
+    std::string FieldOrder;               // video: "progressive" | "tt" | "bb" | "tb" | "bt" | "unknown"
     std::string ColorTransfer;            // video: av_color_transfer_name ("smpte2084", "arib-std-b67", "bt709" ...)
     int SampleRate = 0, Channels = 0;
+    bool external = false;                // subtitle added from a file (AddSubtitleFile)
+    std::string path;                     // external subtitle: UTF-8 file path
+    bool isText = false;                  // subtitle rendered by libass (everything but bitmap PGS and ARIB)
+};
+
+/// Subtitle appearance applied by libffplay's libass renderer (mirrors FFPSubtitleStyle). Colours are 0xRRGGBBAA.
+/// The override flags choose which groups replace the track's own styling; applyToAss extends them to ASS/SSA tracks.
+struct SubtitleStyle {
+    std::string font = "Malgun Gothic";
+    double fontScale = 1.0;
+    std::uint32_t primaryRgba = 0xFFFFFFFFu;
+    std::uint32_t outlineRgba = 0x000000FFu;
+    double outlineWidth = 2.0;            // px at 1080 video lines
+    bool overrideFont = false, overrideSize = false, overrideColors = false, overrideBorder = false;
+    bool applyToAss = false;
+    bool operator==(const SubtitleStyle&) const = default;
 };
 
 // ARIB transport stream: the audio roles of the video's program (media info "arib_audio"). Audio 1 and audio 2 are decoded

@@ -351,7 +351,6 @@ struct BarModel {
     int repeat = 0;             // 0 off, 1 all, 2 one (context menu)
     int volume = 100;
     bool muted = false;
-    int subCount = 0;
     bool fullscreen = false, mini = false;
     bool panelOpen = false;         // playlist panel wanted (setting)
     bool panelAvailable = false;    // the toggle works: windowed player view

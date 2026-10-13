@@ -37,9 +37,13 @@ std::optional<MediaInfo> MediaInfo::Parse(const std::string& jsonText) {
             si.Fps = s.Dbl("fps");
             si.PixFmt = s.Str("pix_fmt");
             si.FourCC = s.Str("fourcc");
+            si.FieldOrder = s.Str("field_order");
             si.ColorTransfer = s.Str("color_transfer");
             si.SampleRate = s.Int("sample_rate");
             si.Channels = s.Int("channels");
+            si.external = s.Bool("external");
+            si.path = s.Str("path");
+            si.isText = s.Bool("text");
             mi.Streams.push_back(std::move(si));
         }
     }

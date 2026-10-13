@@ -130,13 +130,14 @@ LOGIC_TEST(fx_filter_eq_presets) {
 LOGIC_TEST(fx_deinterlace_group_control_visibility_per_mode) {
     using M = wvp::DeinterlaceMode;
     LT_CHECK(FilterSettings{}.deinterlace == M::Off);
-    auto off = fx::DeinterlaceControlsFor(M::Off);
+    auto off = fx::DeinterlaceControlsFor(M::Off, false);
     LT_CHECK(!off.rate && !off.onlyInterlaced && !off.ivtcTuning);
     LT_CHECK(!off.priority);
-    auto on = fx::DeinterlaceControlsFor(M::On);
+    auto on = fx::DeinterlaceControlsFor(M::On, false);
     LT_CHECK(on.priority && on.rate && on.onlyInterlaced && !on.ivtcTuning);
-    auto iv = fx::DeinterlaceControlsFor(M::Ivtc);
+    auto iv = fx::DeinterlaceControlsFor(M::Ivtc, false);
     LT_CHECK(!iv.priority && !iv.rate && !iv.onlyInterlaced && iv.ivtcTuning);
+    LT_CHECK(on.enabled && iv.enabled && !fx::DeinterlaceControlsFor(M::On, true).enabled);
     const auto& labels = fx::DeinterlaceLabels();
     LT_CHECK_EQ(labels.size(), (size_t)3);
     LT_CHECK(labels[(int)M::Off] == L"Off" && labels[(int)M::On] == L"On" && labels[(int)M::Ivtc] == L"IVTC");
@@ -223,20 +224,7 @@ LOGIC_TEST(fx_track_cycle_math_and_toast) {
         return v;
     };
     auto a = mk({true, false, false}, false);
-    LT_CHECK_EQ(fx::CyclesNeeded(a, 0, false), 0);
-    LT_CHECK_EQ(fx::CyclesNeeded(a, 2, false), 2);
-    auto a2 = mk({false, false, true}, false);
-    LT_CHECK_EQ(fx::CyclesNeeded(a2, 0, false), 1);
-    LT_CHECK_EQ(fx::CyclesNeeded(a2, 1, false), 2);
     auto s = mk({false, false}, true);
-    LT_CHECK_EQ(fx::CyclesNeeded(s, -1, true), 0);
-    LT_CHECK_EQ(fx::CyclesNeeded(s, 0, true), 1);
-    LT_CHECK_EQ(fx::CyclesNeeded(s, 1, true), 2);
-    auto s1 = mk({false, true}, true);
-    LT_CHECK_EQ(fx::CyclesNeeded(s1, -1, true), 1);
-    LT_CHECK_EQ(fx::CyclesNeeded(s1, 0, true), 2);    // 1 -> off -> 0
-    LT_CHECK_EQ(fx::CyclesNeeded({}, 0, false), 0);
-
     a[1].Language = "eng";
     a[0].Selected = false; a[1].Selected = true;
     LT_CHECK_EQ(fx::TrackToast(wvp::StreamType::Audio, a), std::wstring(L"Audio: English (2/3)"));
@@ -251,7 +239,41 @@ LOGIC_TEST(fx_track_cycle_math_and_toast) {
     LT_CHECK_EQ(fx::LanguageName("xyz"), std::wstring(L"XYZ"));
 }
 
-LOGIC_TEST(arib_subtitle_selection_excludes_superimpose_and_cc_toggles_caption_only) {
+LOGIC_TEST(fx_next_subtitle_cycles_through_embedded_external_and_off) {
+    auto mk = [](std::initializer_list<int> selectedPos, int n) {
+        std::vector<wvp::StreamInfo> v;
+        for (int i = 0; i < n; i++) {
+            wvp::StreamInfo si;
+            si.Index = 10 + i;
+            si.Type = wvp::StreamType::Subtitle;
+            si.external = i >= n - 2;
+            si.path = si.external ? "C:\\v\\a.smi" : "";
+            for (int p : selectedPos) si.Selected = si.Selected || p == i;
+            v.push_back(si);
+        }
+        return v;
+    };
+    LT_CHECK(!fx::NextSubtitleIndex({}).has_value());
+    LT_CHECK_EQ(*fx::NextSubtitleIndex(mk({}, 4)), 10);          // off -> first
+    LT_CHECK_EQ(*fx::NextSubtitleIndex(mk({0}, 4)), 11);
+    LT_CHECK_EQ(*fx::NextSubtitleIndex(mk({2}, 4)), 13);         // embedded -> external
+    LT_CHECK_EQ(*fx::NextSubtitleIndex(mk({3}, 4)), -1);         // last external -> off
+    auto withSuperimpose = mk({}, 2);
+    withSuperimpose[0].AribType = "superimpose";
+    LT_CHECK_EQ(*fx::NextSubtitleIndex(withSuperimpose), 11);
+
+    auto streams = mk({3}, 4);
+    auto ref = fx::CaptureTrackRef(streams, true);
+    LT_CHECK(ref.kind == fx::TrackRef::Kind::External && ref.pathOrdinal == 1);
+    auto reopened = mk({}, 3);                                   // one stream fewer: indexes shift, the path keys the track
+    LT_CHECK_EQ(*fx::ResolveTrackRef(reopened, ref), 12);
+    LT_CHECK_EQ(*fx::ResolveTrackRef(mk({}, 2), ref), 11);
+    LT_CHECK(!fx::ResolveTrackRef(mk({}, 1), ref).has_value());
+    LT_CHECK_EQ(*fx::ResolveTrackRef(reopened, fx::CaptureTrackRef(mk({}, 3), true)), -1);   // nothing selected = off
+    LT_CHECK_EQ(*fx::ResolveTrackRef(reopened, fx::CaptureTrackRef(mk({1}, 3), true)), 11);
+}
+
+LOGIC_TEST(subtitle_selection_excludes_superimpose_and_toggle_covers_every_kind) {
     wvp::StreamInfo superimpose, caption, ordinary, caption2;
     superimpose.Type = caption.Type = ordinary.Type = caption2.Type = wvp::StreamType::Subtitle;
     superimpose.AribType = "superimpose";
@@ -263,22 +285,17 @@ LOGIC_TEST(arib_subtitle_selection_excludes_superimpose_and_cc_toggles_caption_o
 
     const auto cycleable = fx::CycleableSubtitles(streams);
     LT_CHECK_EQ(cycleable.size(), (size_t)3);
-    LT_CHECK_EQ(fx::SelectedCycleableSubtitleIndex(streams), 2);
-    const std::vector<wvp::StreamInfo> superimposeStreams{superimpose};
-    LT_CHECK_EQ(fx::SelectedCycleableSubtitleIndex(superimposeStreams), -1);
-    LT_CHECK_EQ(fx::CyclesNeeded(cycleable, 0, true), 2);
-
     wvp::MediaInfo media;
     media.Streams = streams;
     bool visible = true;
-    LT_CHECK(fx::ToggleAribCaptionVisibility(media, visible));
+    LT_CHECK(fx::ToggleSubtitleVisibility(media, visible));
     LT_CHECK(!visible);
-    LT_CHECK(fx::ToggleAribCaptionVisibility(media, visible));
+    LT_CHECK(fx::ToggleSubtitleVisibility(media, visible));
     LT_CHECK(visible);
 
     wvp::MediaInfo superimposeOnly;
     superimposeOnly.Streams = {superimpose};
-    LT_CHECK(!fx::ToggleAribCaptionVisibility(superimposeOnly, visible));
+    LT_CHECK(!fx::ToggleSubtitleVisibility(superimposeOnly, visible));
     LT_CHECK(visible);
 }
 
@@ -369,6 +386,7 @@ LOGIC_TEST(main_menu_structure_and_state) {
     s.bar.shuffle = true; s.bar.repeat = 1; s.bar.hasPrev = false; s.bar.hasNext = true;
     wvp::StreamInfo a1, a2, s1;
     a1.Type = a2.Type = wvp::StreamType::Audio; a1.Language = "eng"; a2.Language = "jpn"; a2.Selected = true;
+    a1.Index = 1; a2.Index = 2; s1.Index = 3;
     s1.Type = wvp::StreamType::Subtitle; s1.Language = "eng";
     s.audio = {a1, a2};
     s.subs = {s1};
@@ -438,14 +456,28 @@ LOGIC_TEST(main_menu_structure_and_state) {
     LT_CHECK(!at->sub[0].checked && at->sub[1].checked);
     LT_CHECK_EQ(at->sub[1].text, std::wstring(L"Japanese"));
     at->sub[0].onInvoke();
-    LT_CHECK(got.back().cmd == Cmd::SelectAudio && got.back().index == 0);
+    LT_CHECK(got.back().cmd == Cmd::SelectAudio && got.back().index == 1);
 
     auto* st = find(items, L"Subtitles");
-    LT_CHECK(st && st->sub.size() == 2);
+    LT_CHECK(st && st->sub.size() == 6);
     LT_CHECK_EQ(st->sub[0].text, std::wstring(L"Off"));
     LT_CHECK(st->sub[0].checked && !st->sub[1].checked);
     st->sub[1].onInvoke();
-    LT_CHECK(got.back().cmd == Cmd::SelectSubtitle && got.back().index == 0);
+    LT_CHECK(got.back().cmd == Cmd::SelectSubtitle && got.back().index == 3);
+    LT_CHECK(find(st->sub, L"Load subtitle file…") && find(st->sub, L"Show subtitles") && find(st->sub, L"Sync"));
+    if (auto* show = find(st->sub, L"Show subtitles")) {
+        show->onToggled(false);
+        LT_CHECK(got.back().cmd == Cmd::SetSubtitleVisible && !got.back().flag);
+    }
+    if (auto* sync = find(st->sub, L"Sync")) {
+        LT_CHECK_EQ(sync->sub.size(), (size_t)3);
+        sync->sub[0].onInvoke();
+        LT_CHECK(got.back().Command() == CommandId::SubtitleDelayLater);
+        sync->sub[1].onInvoke();
+        LT_CHECK(got.back().Command() == CommandId::SubtitleDelayEarlier);
+        sync->sub[2].onInvoke();
+        LT_CHECK(got.back().Command() == CommandId::SubtitleDelayReset);
+    }
 
     auto* vs = find(items, L"Video");
     LT_CHECK(vs && vs->kind == pui::MenuItemKind::SubMenu);
@@ -480,25 +512,30 @@ LOGIC_TEST(fx_subtitle_menu_lists_superimpose_as_nonselectable_and_maps_cycle_in
     caption.Selected = true;
     caption2.Title = "Caption 2";
     caption2.AribType = "caption";
+    superimpose.Index = 5; caption.Index = 6; caption2.Index = 7;
+    caption2.external = true;
+    caption2.path = "C:\\v\\clip.srt";
+    state.hasMedia = true;
     state.subs = {superimpose, caption, caption2};
     std::vector<MenuCmd> got;
     auto sub = BuildSubtitleItems(state, [&](const MenuCmd& c) { got.push_back(c); });
-    LT_CHECK_EQ(sub.size(), (size_t)4);
-    if (sub.size() != 4) return;
+    LT_CHECK_EQ(sub.size(), (size_t)8);
+    if (sub.size() != 8) return;
     LT_CHECK(sub[0].checked == false);
     LT_CHECK_EQ(sub[1].text, std::wstring(L"Superimpose (superimpose)"));
     LT_CHECK(sub[1].kind == pui::MenuItemKind::Item && !sub[1].enabled);
     LT_CHECK(sub[2].checked);
     sub[2].onInvoke();
-    LT_CHECK(!got.empty() && got.back().cmd == Cmd::SelectSubtitle && got.back().index == 0);
+    LT_CHECK(!got.empty() && got.back().cmd == Cmd::SelectSubtitle && got.back().index == 6);
+    LT_CHECK_EQ(sub[3].text, std::wstring(L"clip.srt (Caption 2)"));
     sub[3].onInvoke();
-    LT_CHECK(got.back().cmd == Cmd::SelectSubtitle && got.back().index == 1);
+    LT_CHECK(got.back().cmd == Cmd::SelectSubtitle && got.back().index == 7);
 
     state.subs = {superimpose};
     auto onlySuperimpose = BuildSubtitleItems(state, {});
-    LT_CHECK(onlySuperimpose.size() == 2);
-    if (onlySuperimpose.size() == 2) LT_CHECK(!onlySuperimpose[0].enabled && !onlySuperimpose[1].enabled);
-    state.subs.clear();
+    LT_CHECK(onlySuperimpose.size() == 6);
+    if (onlySuperimpose.size() == 6) LT_CHECK(!onlySuperimpose[0].enabled && !onlySuperimpose[1].enabled);
+    state.hasMedia = false;
     LT_CHECK(BuildSubtitleItems(state, {}).empty());
 }
 

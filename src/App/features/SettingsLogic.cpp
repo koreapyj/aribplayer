@@ -20,6 +20,25 @@
 
 namespace app::sl {
 
+const std::array<ColorPreset, 6>& SubtitleColorPresets() {
+    static const std::array<ColorPreset, 6> p = {{
+        {Tr(L"White", L"흰색"), 0xFFFFFFFFu}, {Tr(L"Yellow", L"노란색"), 0xFFFF00FFu}, {Tr(L"Cyan", L"하늘색"), 0x00FFFFFFu},
+        {Tr(L"Green", L"초록색"), 0x00FF00FFu}, {Tr(L"Gray", L"회색"), 0x808080FFu}, {Tr(L"Black", L"검은색"), 0x000000FFu}}};
+    return p;
+}
+int ColorPresetIndex(std::uint32_t rgba) {
+    const auto& p = SubtitleColorPresets();
+    for (size_t i = 0; i < p.size(); i++) if (p[i].rgba == rgba) return (int)i;
+    return -1;
+}
+std::wstring PercentLabel(double scale) { return std::to_wstring((int)std::lround(scale * 100)) + L"%"; }
+std::wstring PixelLabel(double px) {
+    if (px <= 0) return Tr(L"None", L"없음");
+    wchar_t buf[32];
+    swprintf_s(buf, px == std::floor(px) ? L"%.0f px" : L"%.1f px", px);
+    return buf;
+}
+
 pui::ThemeMode ToThemeMode(wvp::ThemeSetting s) {
     switch (s) {
     case wvp::ThemeSetting::Light: return pui::ThemeMode::Light;

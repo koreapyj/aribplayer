@@ -11,6 +11,7 @@
 #include "features/DialogGuard.h"
 #include "Localize.h"
 #include "features/OpenLogic.h"
+#include "features/PlaybackExtras.h"
 #include "features/TextInputDialog.h"
 #include "wvp/MediaUri.h"
 #include "wvp/Platform.h"
@@ -26,6 +27,7 @@ using Microsoft::WRL::ComPtr;
 constexpr GUID kGuidFiles = {0x6a1f0c11, 0x2b7e, 0x4c53, {0x9a, 0x01, 0x57, 0x8e, 0x21, 0x6b, 0x30, 0x01}};
 constexpr GUID kGuidFolder = {0x6a1f0c11, 0x2b7e, 0x4c53, {0x9a, 0x01, 0x57, 0x8e, 0x21, 0x6b, 0x30, 0x02}};
 constexpr GUID kGuidPlaylist = {0x6a1f0c11, 0x2b7e, 0x4c53, {0x9a, 0x01, 0x57, 0x8e, 0x21, 0x6b, 0x30, 0x03}};
+constexpr GUID kGuidSubtitle = {0x6a1f0c11, 0x2b7e, 0x4c53, {0x9a, 0x01, 0x57, 0x8e, 0x21, 0x6b, 0x30, 0x04}};
 
 // Empty result = cancelled.
 std::vector<std::wstring> PickPaths(HWND owner, const GUID& clientGuid, bool folder, bool multi, const COMDLG_FILTERSPEC* filters,
@@ -64,6 +66,12 @@ std::vector<std::wstring> PickMediaFiles(AppContext& ctx) {
     static const std::wstring media = open::MediaFilterPattern();
     const COMDLG_FILTERSPEC f[] = {{Tr(L"Media files", L"미디어 파일"), media.c_str()}, {Tr(L"All files", L"모든 파일"), L"*.*"}};
     return PickPaths(ctx.MainHwnd(), kGuidFiles, false, true, f, 2, Tr(L"Open files", L"파일 열기"));
+}
+
+std::vector<std::wstring> PickSubtitleFiles(AppContext& ctx) {
+    static const std::wstring subs = open::SubtitleFilterPattern();
+    const COMDLG_FILTERSPEC f[] = {{Tr(L"Subtitle files", L"자막 파일"), subs.c_str()}, {Tr(L"All files", L"모든 파일"), L"*.*"}};
+    return PickPaths(ctx.MainHwnd(), kGuidSubtitle, false, true, f, 2, Tr(L"Load subtitle file", L"자막 파일 불러오기"));
 }
 
 std::vector<std::wstring> ListOpenFolderFiles(const std::wstring& folder) {
@@ -471,11 +479,25 @@ void DropPathsOnVideoView(AppContext& ctx, const std::vector<std::wstring>& path
     Dispatch(ctx, pathsOrUrls, DispatchTarget::VideoView, {}, true, std::move(onDone));
 }
 
+void LoadSubtitleFile(AppContext& ctx) {
+    auto* p = ctx.Player();
+    if (!p || !p->GetMediaInfo()) return;
+    auto files = PickSubtitleFiles(ctx);
+    if (!files.empty()) AttachSubtitleFiles(ctx, files, true);
+}
+
 bool DispatchDroppedPaths(AppContext& ctx, DropRoute route, const std::vector<std::wstring>& pathsOrUrls,
                           std::function<void()> onDone) {
     if (pathsOrUrls.empty()) return false;
     switch (route) {
     case DropRoute::VideoView:
+        if (std::all_of(pathsOrUrls.begin(), pathsOrUrls.end(), [](const std::wstring& s) { return open::IsSubtitleFile(s); })) {
+            auto* p = ctx.Player();
+            if (!p || !p->GetMediaInfo()) return false;   // nothing open: a subtitle has nothing to attach to
+            AttachSubtitleFiles(ctx, pathsOrUrls, true);
+            if (onDone) onDone();
+            return true;
+        }
         DropPathsOnVideoView(ctx, pathsOrUrls, std::move(onDone));
         return true;
     case DropRoute::PlaylistPanel:   // handled by App::HandleDropAtClient (needs the panel's viewed playlist)

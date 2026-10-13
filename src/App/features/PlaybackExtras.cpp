@@ -2,12 +2,16 @@
 #include "Localize.h"
 
 #include <algorithm>
+#include <cstdio>
 
 #include "AppContext.h"
 #include "BarLogic.h"
 #include "features/FiltersPanel.h"
 #include "features/FxModel.h"
 #include "features/FxUtil.h"
+#include "features/OpenLogic.h"
+#include "features/SettingsService.h"
+#include "wvp/MediaUri.h"
 #include "wvp/win32/Utf.h"
 #include "pui/Glyphs.h"
 #include "pui/InfoBar.h"
@@ -34,44 +38,104 @@ void AnnounceTrack(AppContext& ctx, wvp::StreamType type) {
 
 }
 
-void CycleTrack(AppContext& ctx, wvp::StreamType type) {
-    auto* p = ctx.Player();
-    if (!p) return;
-    if (type == wvp::StreamType::Subtitle) {
-        auto mi = p->GetMediaInfo();
-        if (!mi || fx::CycleableSubtitles(mi->Of(wvp::StreamType::Subtitle)).empty()) {
-            ctx.ShowToast(Tr(L"No subtitles", L"자막 없음"));
-            return;
-        }
-    }
-    if (type == wvp::StreamType::Audio) {
-        auto mi = p->GetMediaInfo();
-        if (mi && mi->AribAudio.Present) {      // ARIB: the cycle key toggles audio 1 / audio 2 (the preference)
-            int pref = p->AudioPreference() ? 0 : 1;
-            p->SetAudioPreference(pref);
-            ctx.ShowToast(pref ? Tr(L"Audio 2", L"소리 2") : Tr(L"Audio 1", L"소리 1"));
-            return;
-        }
-    }
-    p->CycleStream(type);
-    AnnounceTrack(ctx, type);
-}
-
 void SelectTrack(AppContext& ctx, wvp::StreamType type, int index) {
     auto* p = ctx.Player();
     if (!p) return;
-    auto mi = p->GetMediaInfo();
-    if (!mi) return;
-    if (type == wvp::StreamType::Audio && mi->AribAudio.Present) {
-        p->SetAudioPreference(index > 0 ? 1 : 0);   // ARIB: no stream cycling, no announcement
+    if (type == wvp::StreamType::Audio) {
+        auto mi = p->GetMediaInfo();
+        if (mi && mi->AribAudio.Present) {
+            p->SetAudioPreference(index > 0 ? 1 : 0);   // ARIB: the index is the audio preference; no announcement
+            return;
+        }
+    }
+    if (p->SelectStream(type, index) == 0) AnnounceTrack(ctx, type);
+}
+
+void ShowSubtitles(AppContext& ctx) {
+    wvp::AppSettings& s = ctx.Svc().settings;
+    if (s.showCaptions) return;
+    s.showCaptions = true;
+    OnSettingsChanged(ctx);
+}
+
+void CycleSubtitleTrack(AppContext& ctx) {
+    auto* p = ctx.Player();
+    auto mi = p ? p->GetMediaInfo() : std::nullopt;
+    auto next = mi ? fx::NextSubtitleIndex(mi->Of(wvp::StreamType::Subtitle)) : std::nullopt;
+    if (!next) {
+        ctx.ShowToast(Tr(L"No subtitles", L"자막 없음"));
         return;
     }
-    auto list = mi->Of(type);
-    if (type == wvp::StreamType::Subtitle) list = fx::CycleableSubtitles(list);
-    if (list.empty()) return;
-    int n = fx::CyclesNeeded(list, index, type == wvp::StreamType::Subtitle);
-    for (int i = 0; i < n; i++) p->CycleStream(type);
-    AnnounceTrack(ctx, type);
+    if (*next >= 0) ShowSubtitles(ctx);
+    SelectTrack(ctx, wvp::StreamType::Subtitle, *next);
+}
+
+void ToggleSubtitles(AppContext& ctx) {
+    auto* p = ctx.Player();
+    auto mi = p ? p->GetMediaInfo() : std::nullopt;
+    wvp::AppSettings& s = ctx.Svc().settings;
+    if (!mi || !fx::ToggleSubtitleVisibility(*mi, s.showCaptions)) {
+        ctx.ShowToast(Tr(L"No subtitles", L"자막 없음"));
+        return;
+    }
+    OnSettingsChanged(ctx);
+    ctx.ShowToast(s.showCaptions ? Tr(L"Subtitles on", L"자막 켜짐") : Tr(L"Subtitles off", L"자막 꺼짐"));
+}
+
+void AdjustSubtitleDelay(AppContext& ctx, int deltaMs) {
+    auto* p = ctx.Player();
+    if (!p) return;
+    const std::int64_t next = deltaMs == 0 ? 0 : std::clamp<std::int64_t>(p->SubtitleDelay() + deltaMs, -3600000, 3600000);
+    if (p->SetSubtitleDelay(next) != 0) return;
+    wchar_t buf[64];
+    swprintf_s(buf, L"%+.1f", (double)next / 1000.0);
+    ctx.ShowToast(Tr(L"Subtitle sync: ", L"자막 싱크: ") + std::wstring(buf) + Tr(L" s", L" 초"));
+}
+
+int AttachSubtitleFiles(AppContext& ctx, const std::vector<std::wstring>& paths, bool select) {
+    auto* p = ctx.Player();
+    if (!p) return -1;
+    int first = -1;
+    for (const auto& path : paths) {
+        int rc = p->AddSubtitleFile(wvp::ToUtf8(path));
+        if (rc >= 0 && first < 0) first = rc;
+        if (rc < 0) ctx.ShowToast(Tr(L"Could not load the subtitle file", L"자막 파일을 불러올 수 없습니다"));
+    }
+    if (first >= 0 && select) {
+        ShowSubtitles(ctx);
+        SelectTrack(ctx, wvp::StreamType::Subtitle, first);
+    }
+    return first;
+}
+
+namespace {
+void AttachSidecars(AppContext& ctx) {
+    auto* p = ctx.Player();
+    auto* ctl = ctx.Controller();
+    const wvp::MediaItem* item = ctl ? ctl->Current() : nullptr;
+    if (!p || !item) return;
+    const auto uri = wvp::MediaUri::Parse(item->url);
+    if (!uri.IsLocal() || !uri.localPath) return;
+    const auto sidecars = open::ListSidecarSubtitles(wvp::ToWide(*uri.localPath));
+    if (sidecars.empty()) return;
+    bool any = false;
+    for (const auto& sc : sidecars) any = p->AddSubtitleFile(wvp::ToUtf8(sc.path)) >= 0 || any;
+    if (!any) return;
+    auto mi = p->GetMediaInfo();
+    if (!mi) return;
+    std::vector<open::SidecarTrack> tracks;
+    for (const auto& s : mi->Of(wvp::StreamType::Subtitle)) {
+        if (!s.external) continue;
+        std::string lang = s.Language == "und" ? std::string() : s.Language;
+        if (lang.empty()) {
+            const std::wstring wpath = wvp::ToWide(s.path);
+            for (const auto& sc : sidecars) if (_wcsicmp(sc.path.c_str(), wpath.c_str()) == 0) lang = wvp::ToUtf8(sc.langTag);
+        }
+        tracks.push_back({s.Index, lang});
+    }
+    const int pick = open::PickSidecarTrack(tracks, open::PreferredSubtitleLanguages());
+    if (pick >= 0) p->SelectStream(wvp::StreamType::Subtitle, pick);
+}
 }
 
 void ShowPlaybackError(AppContext& ctx, const wvp::PlayerErrorInfo& e) {
@@ -131,6 +195,8 @@ void InitPlaybackExtras(AppContext& ctx) {
         ctx.RequestRedraw();
     });
     ctx.OnMediaPrepared.add([&ctx](const wvp::MediaPreparedInfo& p) {
+        AttachSidecars(ctx);   // registered before any track restore, so a restore can resolve external tracks
+        if (auto* pl = ctx.Player()) pl->SetSubtitleStyle(ctx.Svc().settings.subtitle);
         g_audioOnly = !p.HasVideo && p.HasAudio;
         RefreshZoomAspect(ctx);
         ctx.RequestRedraw();

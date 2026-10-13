@@ -1,0 +1,1813 @@
+--- a/fftools/Makefile
++++ b/fftools/Makefile
+@@ -74,6 +74,9 @@ LIBFFPLAY_DLLDIR  = $(SHLIBDIR)
+ endif
+ # SDL2 (static) and its system libraries are linked into libffplay
+ LIBFFPLAY_SDL_LIBS := $(filter-out -lSDL2main -mwindows,$(EXTRALIBS-ffplay))
++# libass (static, with its font and shaping dependencies) for the subtitle renderer
++LIBFFPLAY_ASS_LIBS   := $(shell $(PKG_CONFIG) --static --libs libass)
++LIBFFPLAY_ASS_CFLAGS := $(shell $(PKG_CONFIG) --static --cflags libass)
+ 
+ define DOFFTOOL
+ OBJS-$(1) += fftools/cmdutils.o fftools/opt_common.o fftools/$(1).o $(OBJS-$(1)-yes)
+@@ -97,12 +100,12 @@ endif
+ endif
+ 
+ ifeq ($(CONFIG_FFPLAY),yes)
+-$(OBJS-libffplay): CFLAGS += $(CFLAGS-ffplay) $(LIBFFPLAY_CFLAGS) -DFFP_BUILDING_DLL
++$(OBJS-libffplay): CFLAGS += $(CFLAGS-ffplay) $(LIBFFPLAY_ASS_CFLAGS) $(LIBFFPLAY_CFLAGS) -DFFP_BUILDING_DLL
+ $(OBJS-libffplay): | fftools
+ -include $(OBJS-libffplay:.o=.d)
+ 
+ $(LIBFFPLAY_SO): $(OBJS-libffplay) $(FF_DEP_LIBS)
+-	$(LD) $(LDFLAGS) $(LIBFFPLAY_LDFLAGS) $(LD_O) $(OBJS-libffplay) $(LIBFFPLAY_SDL_LIBS) $(FF_EXTRALIBS)
++	$(LD) $(LDFLAGS) $(LIBFFPLAY_LDFLAGS) $(LD_O) $(OBJS-libffplay) $(LIBFFPLAY_SDL_LIBS) $(LIBFFPLAY_ASS_LIBS) $(FF_EXTRALIBS)
+ 
+ ifneq ($(LIBFFPLAY_IMPLIB),$(LIBFFPLAY_SO))
+ $(LIBFFPLAY_IMPLIB): $(LIBFFPLAY_SO) ;
+--- a/fftools/ffplay.c
++++ b/fftools/ffplay.c
+@@ -69,6 +69,7 @@
+ 
+ #include "ffplay.h"
+ #include "ffplay_arib_audio.h"
++#include <ass/ass.h>
+ 
+ 
+ /*
+@@ -241,6 +242,60 @@ typedef struct Decoder {
+     int subtitle_context_owned_by_thread; /* ARIB: subtitle_thread creates and frees avctx */
+ } Decoder;
+ 
++/* What draws a subtitle layer: libaribcaption, the bitmap overlay path (hdmv_pgs_subtitle and the other bitmap
++ * codecs) or libass (every text codec). The superimpose layer is ARIB only. */
++enum { FFP_LAYER_NONE, FFP_LAYER_ARIB, FFP_LAYER_BITMAP, FFP_LAYER_ASS };
++
++#define FFP_SUB_DEFAULT_FAMILY "Malgun Gothic"
++#define FFP_SUB_DEFAULT_DURATION_MS 5000      /* a cue without a known end */
++#define FFP_SUB_MAX_BITMAP_BYTES (256 << 20)  /* external bitmap tracks keep at most this much of decoded cues */
++#define FFP_ASS_MAX_BANDS 4
++#define FFP_ASS_BAND_GAP 24
++
++typedef struct FFPAssEvent {
++    int64_t start_ms, duration_ms;
++    char *line;                     /* ass_process_chunk text: ReadOrder,Layer,Style,Name,MarginL,MarginR,MarginV,Effect,Text */
++} FFPAssEvent;
++
++typedef struct FFPBitmapCue {
++    int64_t start_ms, end_ms;
++    AVSubtitle sub;
++} FFPBitmapCue;
++
++/* A subtitle stream of a file added with ffp_add_subtitle_file, decoded completely when it was added. Times are file
++ * times (0 = the start of the media). */
++typedef struct FFPExtTrack {
++    char *path;
++    enum AVCodecID codec_id;
++    char *language, *title;
++    int kind;                       /* FFP_LAYER_ASS or FFP_LAYER_BITMAP */
++    char *header;                   /* the decoder's subtitle_header (ASS script header) */
++    FFPAssEvent *events;
++    int nb_events;
++    ASS_Track *track;               /* built from header + events on the first select (FFPAss.mutex) */
++    FFPBitmapCue *cues;             /* sorted by start */
++    int nb_cues;
++    int width, height;              /* canvas of the bitmap cues */
++} FFPExtTrack;
++
++typedef struct FFPAss {
++    SDL_mutex *mutex;               /* every libass call: the subtitle thread (events), display thread and snapshots (render) */
++    ASS_Library *lib;
++    ASS_Renderer *renderer;
++    ASS_Track *embedded;            /* the events of the open embedded text stream */
++    ASS_Track *track;               /* the rendered one: embedded or an external track's */
++    int plain;                      /* the track comes from a plain-text codec: the style override applies by default */
++    int external;                   /* track times are file times, not stream times */
++    int serial;                     /* packet serial of the embedded events */
++    int64_t read_order;
++    unsigned style_gen;             /* FFPlayer.sub_style_gen last applied, 0 = none */
++    int style_plain;
++    char family[128];               /* default family given to ass_set_fonts */
++    int frame_w, frame_h;           /* frame size of the last display render, 0 = set again */
++    int storage_w, storage_h;
++    int changed;                    /* the track was swapped: re-composite at the next render */
++} FFPAss;
++
+ struct SubtitleLayer {
+     struct VideoState *is;
+     int id;
+@@ -250,7 +305,10 @@ struct SubtitleLayer {
+     AVStream *st;
+     int stream_index;
+     SDL_atomic_t routing_stream_index; /* read_thread route, independent of decoder readiness */
+-    int is_arib;
++    int kind;                       /* FFP_LAYER_* */
++    int ext_index;                  /* selected external track (VideoState.ext), -1 none; then stream_index is -1 */
++    int ext_cue;                    /* external bitmap track: the cue in `active`, -1 none */
++    int64_t ass_time_ms;            /* libass: the time of the last display render */
+     int visible;
+     AVSubtitle active;
+     int active_valid;
+@@ -353,6 +411,7 @@ typedef struct FFPOptions {
+     char *filter_hw_device;         /* "type[:device]", hw device attached to the filter graphs */
+     char *hwframes;                /* "download" | "keep": hw decoded frames enter the video graph as hw frames */
+     int start_paused;               /* open paused: present the landing frame, start audio and the clocks only on play */
++    char *sub_fontsdir;             /* libass fonts dir */
+     AVDictionary *format_opts, *codec_opts, *sws_dict, *swr_opts;
+ } FFPOptions;
+ 
+@@ -525,6 +584,11 @@ typedef struct VideoState {
+     FrameQueue pictq;
+     FrameQueue sampq;
+     SubtitleLayer subtitles[FFP_SUBTITLE_LAYER_COUNT];
++    FFPAss ass;
++    /* ffp_add_subtitle_file tracks (display thread); media-info index = ext_base + position */
++    FFPExtTrack **ext;
++    int nb_ext;
++    int ext_base;
+ 
+     Decoder auddec;
+     Decoder viddec;
+@@ -603,7 +667,7 @@ typedef struct VideoState {
+     AVFilterContext *out_audio_filter;  // the last filter in the audio chain
+     AVFilterGraph *agraph;              // audio filter graph
+ 
+-    int last_video_stream, last_audio_stream, last_subtitle_stream;
++    int last_video_stream, last_audio_stream;
+ 
+     SDL_cond *continue_read_thread;
+ 
+@@ -650,6 +714,9 @@ typedef struct VideoState {
+ #define FFP_CMD_REFRESH_CAPTION_STYLE 8 /* i: ignore_background | (force_outline << 1) */
+ #define FFP_CMD_STEP_FRAME 9 /* i: +1 next output frame, -1 previous output frame */
+ #define FFP_CMD_SEEK_KEYFRAME 10 /* i: +1 next keyframe, -1 previous keyframe */
++#define FFP_CMD_SELECT_STREAM 11 /* i: media type, d: media-info index (synchronous, result) */
++#define FFP_CMD_ADD_SUBTITLE 12  /* p: FFPExtTrack *[i] (synchronous, result; taken on success) */
++#define FFP_CMD_SUB_REFRESH 13   /* subtitle style / delay changed: redraw a paused picture */
+ 
+ #define FFP_REVERSE_STEP_NONE 0
+ #define FFP_REVERSE_STEP_SEEKING 1
+@@ -665,6 +732,8 @@ typedef struct FFPCmd {
+     int i;
+     char *s;                    /* OPEN: url */
+     FFPOptions *o;              /* OPEN: options (ownership moves to the VideoState) */
++    void *p;
++    int result;                 /* synchronous commands with a result */
+     SDL_sem *done;              /* synchronous commands */
+     VideoState *is_out;         /* DETACH/DESTROY: the detached media, to be closed by the caller */
+ } FFPCmd;
+@@ -700,6 +769,9 @@ struct FFPlayer {
+     SDL_atomic_t volume, muted;
+     SDL_atomic_t audio_pref;        /* FFP_ARIB_PREF_*, persists across opens (the host resets it) */
+     SDL_atomic_t subtitle_visible[FFP_SUBTITLE_LAYER_COUNT];
++    FFPSubtitleStyle sub_style;     /* (mutex) persists across opens */
++    unsigned sub_style_gen;         /* (mutex) bumped by every ffp_set_subtitle_style */
++    SDL_atomic_t sub_delay_ms;      /* reset by ffp_open */
+     double position, duration;      /* mirrors for ffp_get_position/duration */
+     char *media_info;
+     int state;
+@@ -748,7 +820,8 @@ struct FFPlayer {
+     int last_subtitle_width[FFP_SUBTITLE_LAYER_COUNT];
+     int last_subtitle_height[FFP_SUBTITLE_LAYER_COUNT];
+     int last_subtitle_visible[FFP_SUBTITLE_LAYER_COUNT];
+-    int last_subtitle_is_arib[FFP_SUBTITLE_LAYER_COUNT];
++    int last_subtitle_kind[FFP_SUBTITLE_LAYER_COUNT];
++    int64_t last_subtitle_ass_ms[FFP_SUBTITLE_LAYER_COUNT];
+     int last_subtitle_serial[FFP_SUBTITLE_LAYER_COUNT];
+     int last_subtitle_stream_index[FFP_SUBTITLE_LAYER_COUNT];
+     uint64_t last_subtitle_generation[FFP_SUBTITLE_LAYER_COUNT];
+@@ -805,6 +878,7 @@ static void ffp_opts_free(FFPOptions *o)
+     av_freep(&o->hwaccel);
+     av_freep(&o->filter_hw_device);
+     av_freep(&o->hwframes);
++    av_freep(&o->sub_fontsdir);
+     av_dict_free(&o->format_opts);
+     av_dict_free(&o->codec_opts);
+     av_dict_free(&o->sws_dict);
+@@ -1297,7 +1371,8 @@ static void ffp_store_snapshot(FFPlayer
+         avsubtitle_free(&ffp->last_subtitles[i]);
+         ffp->last_subtitle_width[i] = ffp->last_subtitle_height[i] = 0;
+         ffp->last_subtitle_visible[i] = i != FFP_SUBTITLE_SUPERIMPOSE || is->o->superimpose;
+-        ffp->last_subtitle_is_arib[i] = layer->is_arib;
++        ffp->last_subtitle_kind[i] = layer->kind;
++        ffp->last_subtitle_ass_ms[i] = layer->ass_time_ms;
+         ffp->last_subtitle_stream_index[i] = layer->stream_index;
+         ffp->last_subtitle_generation[i] = layer->generation;
+         SDL_LockMutex(layer->packets.mutex);
+@@ -1844,7 +1919,7 @@ static void decoder_subtitle_snapshot(De
+     if (request->expected_pts != AV_NOPTS_VALUE &&
+         d->avctx->pkt_timebase.num > 0 && d->avctx->pkt_timebase.den > 0)
+         empty_pkt.pts = av_rescale_q(request->expected_pts, AV_TIME_BASE_Q, d->avctx->pkt_timebase);
+-    if (!layer || !layer->is_arib || request->stream_index != layer->stream_index ||
++    if (!layer || layer->kind != FFP_LAYER_ARIB || request->stream_index != layer->stream_index ||
+         d->pkt_serial != request->serial ||
+         !ffp_subtitle_snapshot_state_matches(layer, request)) {
+         ret = AVERROR(EAGAIN);
+@@ -2420,6 +2495,573 @@ static int ffp_subtitle_queue_attime(Sub
+     return ret;
+ }
+ 
++/* the subtitle canvas (the ARIB canvas at an open, the libass frame): the displayed video area the presenter reported
++ * last, else the video's display size */
++static void ffp_subtitle_canvas_size(VideoState *is, int video_w, int video_h, AVRational sar,
++                                     int *canvas_w, int *canvas_h)
++{
++    FFPlayer *ffp = is->ffp;
++    int w, h;
++
++    SDL_AtomicLock(&ffp->sink_lock);
++    w = ffp->shown_width;
++    h = ffp->shown_height;
++    SDL_AtomicUnlock(&ffp->sink_lock);
++    if ((w <= 0 || h <= 0) && video_w > 0 && video_h > 0) {
++        if (sar.num <= 0 || sar.den <= 0)
++            sar = (AVRational){ 1, 1 };
++        w = video_w;
++        h = video_h;
++        if (av_cmp_q(sar, (AVRational){ 1, 1 }) > 0)
++            w = (int)av_rescale(video_w, sar.num, sar.den);
++        else
++            h = (int)av_rescale(video_h, sar.den, sar.num);
++    }
++    *canvas_w = FFMAX(w, 1);
++    *canvas_h = FFMAX(h, 1);
++}
++
++static int ffp_subtitle_kind(enum AVCodecID codec_id)
++{
++    const AVCodecDescriptor *desc = avcodec_descriptor_get(codec_id);
++
++    if (codec_id == AV_CODEC_ID_ARIB_CAPTION)
++        return FFP_LAYER_ARIB;
++    if (desc && (desc->props & AV_CODEC_PROP_BITMAP_SUB))
++        return FFP_LAYER_BITMAP;
++    return FFP_LAYER_ASS;
++}
++
++/* plain-text codecs get the style override; ASS / SSA only with FFPSubtitleStyle.apply_to_ass */
++static int ffp_subtitle_plain(enum AVCodecID codec_id)
++{
++    return codec_id != AV_CODEC_ID_ASS && codec_id != AV_CODEC_ID_SSA;
++}
++
++static int64_t ffp_subtitle_duration_ms(const AVSubtitle *sub)
++{
++    if (sub->end_display_time == UINT32_MAX || sub->end_display_time <= sub->start_display_time)
++        return FFP_SUB_DEFAULT_DURATION_MS;
++    return sub->end_display_time - sub->start_display_time;
++}
++
++static void ffp_overlay_reset(SubtitleLayer *layer);
++
++static int ffp_overlay_reserve(SubtitleLayer *layer, int n)
++{
++    FFPOverlayRect *rects;
++    uint8_t **pixels;
++
++    if (n <= layer->ov_alloc)
++        return 0;
++    rects = av_realloc_array(layer->ov_rects, n, sizeof(*rects));
++    if (!rects)
++        return AVERROR(ENOMEM);
++    layer->ov_rects = rects;
++    pixels = av_realloc_array(layer->ov_pixels, n, sizeof(*pixels));
++    if (!pixels)
++        return AVERROR(ENOMEM);
++    layer->ov_pixels = pixels;
++    layer->ov_alloc = n;
++    return 0;
++}
++
++static void ffp_ass_log(int level, const char *fmt, va_list va, void *data)
++{
++    char line[1024];
++
++    vsnprintf(line, sizeof(line), fmt, va);
++    /* libass levels 0 fatal .. 7 debug; its warnings are mostly font fallbacks (Hangul in a Latin style font) */
++    av_log(NULL, level <= 1 ? AV_LOG_ERROR : level <= 5 ? AV_LOG_VERBOSE : AV_LOG_DEBUG,
++           "libass: %s\n", line);
++}
++
++static int ffp_is_font_attachment(const AVStream *st)
++{
++    static const char *const mimetypes[] = {
++        "font/ttf", "font/otf", "font/sfnt", "font/collection", "application/x-truetype-font",
++        "application/x-font-ttf", "application/x-font-otf", "application/vnd.ms-opentype", "application/font-sfnt",
++        NULL
++    };
++    const AVDictionaryEntry *t = av_dict_get(st->metadata, "mimetype", NULL, 0);
++    int i;
++
++    if (st->codecpar->codec_type != AVMEDIA_TYPE_ATTACHMENT || st->codecpar->extradata_size <= 0)
++        return 0;
++    if (st->codecpar->codec_id == AV_CODEC_ID_TTF || st->codecpar->codec_id == AV_CODEC_ID_OTF)
++        return 1;
++    for (i = 0; t && mimetypes[i]; i++)
++        if (!av_strcasecmp(t->value, mimetypes[i]))
++            return 1;
++    return 0;
++}
++
++static uint32_t ffp_ass_color(uint32_t rgba)
++{
++    return (rgba & 0xffffff00u) | (255 - (rgba & 0xff));
++}
++
++/* FFPAss.mutex held. The library gets the fonts dir and the container's font attachments before the renderer's
++ * ass_set_fonts, which is the only point where libass reads them. */
++static int ffp_ass_init(VideoState *is)
++{
++    FFPAss *a = &is->ass;
++    const char *family;
++    int i;
++
++    if (a->renderer)
++        return 0;
++    if (!a->lib) {
++        if (!(a->lib = ass_library_init()))
++            return AVERROR(ENOMEM);
++        ass_set_message_cb(a->lib, ffp_ass_log, NULL);
++        if (is->o->sub_fontsdir && *is->o->sub_fontsdir)
++            ass_set_fonts_dir(a->lib, is->o->sub_fontsdir);
++        for (i = 0; is->ic && i < is->ic->nb_streams; i++) {
++            AVStream *st = is->ic->streams[i];
++            const AVDictionaryEntry *name = av_dict_get(st->metadata, "filename", NULL, 0);
++            if (ffp_is_font_attachment(st))
++                ass_add_font(a->lib, name ? name->value : "", (const char *)st->codecpar->extradata,
++                             st->codecpar->extradata_size);
++        }
++    }
++    if (!(a->renderer = ass_renderer_init(a->lib)))
++        return AVERROR(ENOMEM);
++    SDL_LockMutex(is->ffp->mutex);
++    family = is->ffp->sub_style.font_family[0] ? is->ffp->sub_style.font_family : FFP_SUB_DEFAULT_FAMILY;
++    av_strlcpy(a->family, family, sizeof(a->family));
++    SDL_UnlockMutex(is->ffp->mutex);
++    ass_set_fonts(a->renderer, NULL, a->family, ASS_FONTPROVIDER_AUTODETECT, NULL, 1);
++    a->style_gen = 0;
++    a->frame_w = a->frame_h = a->storage_w = a->storage_h = 0;
++    return 0;
++}
++
++/* FFPAss.mutex held, renderer present. The override ASS_Style is in PlayResY 288 units (libass rescales it to the
++ * script); it has to be complete, a zero ScaleX / ScaleY or BorderStyle renders nothing. */
++static void ffp_ass_apply_style(VideoState *is)
++{
++    FFPAss *a = &is->ass;
++    FFPSubtitleStyle s;
++    ASS_Style st = { 0 };
++    unsigned gen;
++    int applies, bits = 0;
++
++    SDL_LockMutex(is->ffp->mutex);
++    s = is->ffp->sub_style;
++    gen = is->ffp->sub_style_gen;
++    SDL_UnlockMutex(is->ffp->mutex);
++    if (gen == a->style_gen && a->plain == a->style_plain)
++        return;
++    a->style_gen = gen;
++    a->style_plain = a->plain;
++    if (strcmp(s.font_family[0] ? s.font_family : FFP_SUB_DEFAULT_FAMILY, a->family)) {
++        av_strlcpy(a->family, s.font_family[0] ? s.font_family : FFP_SUB_DEFAULT_FAMILY, sizeof(a->family));
++        ass_set_fonts(a->renderer, NULL, a->family, ASS_FONTPROVIDER_AUTODETECT, NULL, 1);
++    }
++    applies = a->plain || s.apply_to_ass;
++    if (applies) {
++        if (s.override_flags & FFP_SUBSTYLE_FONT)
++            bits |= ASS_OVERRIDE_BIT_FONT_NAME;
++        if (s.override_flags & FFP_SUBSTYLE_COLORS)
++            bits |= ASS_OVERRIDE_BIT_COLORS;
++        if (s.override_flags & FFP_SUBSTYLE_BORDER)
++            bits |= ASS_OVERRIDE_BIT_BORDER;
++    }
++    st.FontName = a->family;
++    st.FontSize = 18;
++    st.PrimaryColour = st.SecondaryColour = ffp_ass_color(s.primary_rgba);
++    st.OutlineColour = ffp_ass_color(s.outline_rgba);
++    st.BackColour = 0x00000080;
++    st.ScaleX = st.ScaleY = 1.0;
++    st.BorderStyle = 1;
++    st.Outline = FFMAX(s.outline_width, 0.0) * 288.0 / 1080.0;
++    st.Alignment = 2;
++    st.MarginL = st.MarginR = st.MarginV = 10;
++    st.Encoding = 1;
++    ass_set_selective_style_override(a->renderer, &st);
++    ass_set_selective_style_override_enabled(a->renderer, bits);
++    ass_set_font_scale(a->renderer, applies && (s.override_flags & FFP_SUBSTYLE_SIZE) && s.font_scale > 0 ?
++                                    s.font_scale : 1.0);
++}
++
++static void ffp_ass_set_size(FFPAss *a, int w, int h, int storage_w, int storage_h)
++{
++    if (w != a->frame_w || h != a->frame_h) {
++        ass_set_frame_size(a->renderer, w, h);
++        a->frame_w = w;
++        a->frame_h = h;
++    }
++    if (storage_w != a->storage_w || storage_h != a->storage_h) {
++        ass_set_storage_size(a->renderer, storage_w, storage_h);
++        a->storage_w = storage_w;
++        a->storage_h = storage_h;
++    }
++}
++
++/* FFPAss.mutex held. Every chunk gets its own ReadOrder: libass drops a chunk whose ReadOrder it has seen, and the text
++ * decoders restart theirs at every flush. */
++static void ffp_ass_chunk(FFPAss *a, ASS_Track *track, const char *line, int64_t start_ms, int64_t duration_ms)
++{
++    const char *rest = strchr(line, ',');
++    char *chunk;
++
++    if (!rest || !(chunk = av_asprintf("%"PRId64"%s", a->read_order++, rest)))
++        return;
++    ass_process_chunk(track, chunk, (int)strlen(chunk), start_ms, duration_ms);
++    av_free(chunk);
++}
++
++/* the track of an embedded text stream, before its subtitle thread starts */
++static int ffp_ass_open_embedded(VideoState *is, const AVCodecContext *avctx)
++{
++    FFPAss *a = &is->ass;
++    int ret;
++
++    SDL_LockMutex(a->mutex);
++    ret = ffp_ass_init(is);
++    if (ret >= 0 && !(a->embedded = ass_new_track(a->lib)))
++        ret = AVERROR(ENOMEM);
++    if (ret >= 0) {
++        if (avctx->subtitle_header && avctx->subtitle_header_size > 0)
++            ass_process_codec_private(a->embedded, (char *)avctx->subtitle_header, avctx->subtitle_header_size);
++        a->track = a->embedded;
++        a->plain = ffp_subtitle_plain(avctx->codec_id);
++        a->external = 0;
++        a->serial = -1;
++        a->changed = 1;
++    }
++    SDL_UnlockMutex(a->mutex);
++    return ret;
++}
++
++static void ffp_ass_close_embedded(VideoState *is)
++{
++    FFPAss *a = &is->ass;
++
++    SDL_LockMutex(a->mutex);
++    if (a->track == a->embedded)
++        a->track = NULL;
++    if (a->embedded)
++        ass_free_track(a->embedded);
++    a->embedded = NULL;
++    SDL_UnlockMutex(a->mutex);
++}
++
++/* subtitle thread: the decoded events of the embedded stream go into its track; a new packet serial (seek) starts
++ * the track over */
++static void ffp_ass_feed(SubtitleLayer *layer, const AVSubtitle *sub, int serial, int64_t pkt_pts)
++{
++    FFPAss *a = &layer->is->ass;
++    int64_t pts = sub->pts != AV_NOPTS_VALUE ? sub->pts : pkt_pts;
++    unsigned i;
++
++    if (pts == AV_NOPTS_VALUE)
++        return;
++    SDL_LockMutex(a->mutex);
++    if (a->embedded) {
++        if (a->serial != serial) {
++            ass_flush_events(a->embedded);
++            a->serial = serial;
++        }
++        for (i = 0; i < sub->num_rects; i++)
++            if (sub->rects[i] && sub->rects[i]->ass)
++                ffp_ass_chunk(a, a->embedded, sub->rects[i]->ass, pts / 1000 + sub->start_display_time,
++                              ffp_subtitle_duration_ms(sub));
++    }
++    SDL_UnlockMutex(a->mutex);
++}
++
++static void ffp_ass_blend_rgba(const ASS_Image *img, int x0, int y0, int x1, int y1,
++                               uint8_t *dst, int stride, int ox, int oy)
++{
++    unsigned r = img->color >> 24, g = (img->color >> 16) & 0xff, b = (img->color >> 8) & 0xff;
++    unsigned opacity = 255 - (img->color & 0xff);
++    int x, y;
++
++    for (y = y0; y < y1; y++) {
++        const uint8_t *src = img->bitmap + (size_t)(y - img->dst_y) * img->stride + (x0 - img->dst_x);
++        uint8_t *d = dst + (size_t)(y - oy) * stride + (size_t)(x0 - ox) * 4;
++        for (x = x0; x < x1; x++, src++, d += 4) {
++            unsigned sa = (*src * opacity + 127) / 255, da, oa;
++            if (!sa)
++                continue;
++            if (sa == 255 || !d[3]) {
++                d[0] = r; d[1] = g; d[2] = b; d[3] = sa;
++                continue;
++            }
++            /* straight-alpha "over", weights scaled by 255 */
++            da = d[3] * (255 - sa);
++            oa = sa * 255 + da;
++            d[0] = (r * sa * 255 + d[0] * da + oa / 2) / oa;
++            d[1] = (g * sa * 255 + d[1] * da + oa / 2) / oa;
++            d[2] = (b * sa * 255 + d[2] * da + oa / 2) / oa;
++            d[3] = (oa + 127) / 255;
++        }
++    }
++}
++
++typedef struct FFPBand {
++    int x0, y0, x1, y1;
++} FFPBand;
++
++static int ffp_ass_box(const ASS_Image *img, int width, int height, FFPBand *b)
++{
++    b->x0 = FFMAX(img->dst_x, 0);
++    b->y0 = FFMAX(img->dst_y, 0);
++    b->x1 = FFMIN(img->dst_x + img->w, width);
++    b->y1 = FFMIN(img->dst_y + img->h, height);
++    return b->x0 < b->x1 && b->y0 < b->y1 && (img->color & 0xff) != 0xff;
++}
++
++static void ffp_band_union(FFPBand *a, const FFPBand *b)
++{
++    a->x0 = FFMIN(a->x0, b->x0);
++    a->y0 = FFMIN(a->y0, b->y0);
++    a->x1 = FFMAX(a->x1, b->x1);
++    a->y1 = FFMAX(a->y1, b->y1);
++}
++
++/* Merges the ASS_Image list into at most FFP_ASS_MAX_BANDS horizontal bands of straight-alpha RGBA, so the presenter
++ * uploads a few textures instead of one per glyph run. */
++static int ffp_ass_composite(SubtitleLayer *layer, const ASS_Image *list, int width, int height)
++{
++    FFPBand band[FFP_ASS_MAX_BANDS + 1], b;
++    const ASS_Image *img;
++    int nb = 0, i, j;
++
++    ffp_overlay_reset(layer);
++    layer->ov_canvas_width = width;
++    layer->ov_canvas_height = height;
++    for (img = list; img; img = img->next) {
++        if (!ffp_ass_box(img, width, height, &b))
++            continue;
++        band[nb++] = b;
++        for (i = 0; i < nb; i++) {
++            for (j = i + 1; j < nb; j++) {
++                if (band[j].y0 <= band[i].y1 + FFP_ASS_BAND_GAP && band[i].y0 <= band[j].y1 + FFP_ASS_BAND_GAP) {
++                    ffp_band_union(&band[i], &band[j]);
++                    band[j] = band[--nb];
++                    i = -1;
++                    break;
++                }
++            }
++        }
++        while (nb > FFP_ASS_MAX_BANDS) {
++            int bi = 0, bj = 1, best = INT_MAX;
++            for (i = 0; i < nb; i++)
++                for (j = i + 1; j < nb; j++) {
++                    int gap = FFMAX(band[j].y0 - band[i].y1, band[i].y0 - band[j].y1);
++                    if (gap < best) {
++                        best = gap;
++                        bi = i;
++                        bj = j;
++                    }
++                }
++            ffp_band_union(&band[bi], &band[bj]);
++            band[bj] = band[--nb];
++        }
++    }
++    if (ffp_overlay_reserve(layer, nb) < 0)
++        return AVERROR(ENOMEM);
++    for (i = 0; i < nb; i++) {
++        FFPOverlayRect *o = &layer->ov_rects[i];
++        uint8_t *px = av_mallocz((size_t)(band[i].x1 - band[i].x0) * (band[i].y1 - band[i].y0) * 4);
++        if (!px) {
++            ffp_overlay_reset(layer);
++            return AVERROR(ENOMEM);
++        }
++        layer->ov_pixels[i] = px;
++        layer->ov_count++;
++        o->rgba = px;
++        o->x = band[i].x0;
++        o->y = band[i].y0;
++        o->width = band[i].x1 - band[i].x0;
++        o->height = band[i].y1 - band[i].y0;
++        o->stride = o->width * 4;
++    }
++    for (img = list; img; img = img->next) {
++        if (!ffp_ass_box(img, width, height, &b))
++            continue;
++        for (i = 0; i < nb; i++) {
++            if (band[i].x0 <= b.x0 && b.x1 <= band[i].x1 && band[i].y0 <= b.y0 && b.y1 <= band[i].y1) {
++                ffp_ass_blend_rgba(img, b.x0, b.y0, b.x1, b.y1, layer->ov_pixels[i], layer->ov_rects[i].stride,
++                                   band[i].x0, band[i].y0);
++                break;
++            }
++        }
++    }
++    return 0;
++}
++
++/* display thread: renders the libass track at the displayed picture's time into the layer's overlay */
++static void ffp_ass_update_layer(SubtitleLayer *layer, double pts)
++{
++    VideoState *is = layer->is;
++    FFPAss *a = &is->ass;
++    AVStream *vst = is->video_st;
++    ASS_Image *img;
++    int w, h, change = 0, ret;
++    int64_t t;
++
++    if (isnan(pts) || !vst || vst->codecpar->width <= 0 || vst->codecpar->height <= 0)
++        return;
++    ffp_subtitle_canvas_size(is, vst->codecpar->width, vst->codecpar->height,
++                             av_guess_sample_aspect_ratio(is->ic, vst, NULL), &w, &h);
++    if (w != layer->canvas_width || h != layer->canvas_height) {
++        SDL_LockMutex(is->dbg_mutex);
++        layer->canvas_width = w;
++        layer->canvas_height = h;
++        SDL_UnlockMutex(is->dbg_mutex);
++    }
++    t = llrint(pts * 1000) - SDL_AtomicGet(&is->ffp->sub_delay_ms);
++    SDL_LockMutex(a->mutex);
++    if (!a->renderer || !a->track) {
++        if (layer->ov_count) {
++            ffp_overlay_reset(layer);
++            layer->generation++;
++            layer->ov_generation = layer->generation;
++        }
++        SDL_UnlockMutex(a->mutex);
++        return;
++    }
++    if (a->external)
++        t -= llrint(is->start_off_s * 1000);
++    ffp_ass_apply_style(is);
++    ffp_ass_set_size(a, w, h, vst->codecpar->width, vst->codecpar->height);
++    img = ass_render_frame(a->renderer, a->track, t, &change);
++    layer->ass_time_ms = t;
++    if (change || a->changed) {
++        a->changed = 0;
++        ret = ffp_ass_composite(layer, img, w, h);
++        if (ret < 0) {
++            av_log(NULL, AV_LOG_WARNING, "could not composite the subtitles: %s\n", av_err2str(ret));
++            a->changed = 1;
++        }
++        layer->generation++;
++        layer->ov_generation = layer->generation;
++        if (layer->ov_count)
++            SDL_AtomicAdd(&layer->cues_uploaded, 1);
++    }
++    SDL_UnlockMutex(a->mutex);
++}
++
++/* snapshot thread, the media kept alive by snap_mutex: renders the track at the snapshot size into the opaque BGRA */
++static void ffp_ass_snapshot(VideoState *is, int64_t t, uint8_t *bgra, int width, int height, int stride)
++{
++    FFPAss *a = &is->ass;
++    ASS_Image *img;
++    FFPBand b;
++    int change, x, y;
++
++    SDL_LockMutex(a->mutex);
++    if (a->renderer && a->track && a->storage_w > 0 && a->storage_h > 0) {
++        ffp_ass_apply_style(is);
++        ffp_ass_set_size(a, width, height, a->storage_w, a->storage_h);
++        for (img = ass_render_frame(a->renderer, a->track, t, &change); img; img = img->next) {
++            unsigned r = img->color >> 24, g = (img->color >> 16) & 0xff, bl = (img->color >> 8) & 0xff;
++            unsigned opacity = 255 - (img->color & 0xff);
++            if (!ffp_ass_box(img, width, height, &b))
++                continue;
++            for (y = b.y0; y < b.y1; y++) {
++                const uint8_t *src = img->bitmap + (size_t)(y - img->dst_y) * img->stride + (b.x0 - img->dst_x);
++                uint8_t *d = bgra + (size_t)y * stride + (size_t)b.x0 * 4;
++                for (x = b.x0; x < b.x1; x++, src++, d += 4) {
++                    unsigned sa = (*src * opacity + 127) / 255, ia = 255 - sa;
++                    d[0] = (bl * sa + d[0] * ia + 127) / 255;
++                    d[1] = (g * sa + d[1] * ia + 127) / 255;
++                    d[2] = (r * sa + d[2] * ia + 127) / 255;
++                }
++            }
++        }
++        /* the next display render sets its own frame size again */
++        a->frame_w = a->frame_h = 0;
++    }
++    SDL_UnlockMutex(a->mutex);
++}
++
++/* FFPAss.mutex held */
++static int ffp_ext_track_build(FFPAss *a, FFPExtTrack *x)
++{
++    int i;
++
++    if (!(x->track = ass_new_track(a->lib)))
++        return AVERROR(ENOMEM);
++    if (x->header)
++        ass_process_codec_private(x->track, x->header, (int)strlen(x->header));
++    for (i = 0; i < x->nb_events; i++)
++        ffp_ass_chunk(a, x->track, x->events[i].line, x->events[i].start_ms, x->events[i].duration_ms);
++    return 0;
++}
++
++static void ffp_ext_track_free(FFPExtTrack **px)
++{
++    FFPExtTrack *x = *px;
++    int i;
++
++    if (!x)
++        return;
++    av_free(x->path);
++    av_free(x->language);
++    av_free(x->title);
++    av_free(x->header);
++    for (i = 0; i < x->nb_events; i++)
++        av_free(x->events[i].line);
++    av_free(x->events);
++    if (x->track)
++        ass_free_track(x->track);
++    for (i = 0; i < x->nb_cues; i++)
++        avsubtitle_free(&x->cues[i].sub);
++    av_free(x->cues);
++    av_freep(px);
++}
++
++/* the external tracks' media-info indices follow the container's streams */
++static int ffp_ext_base(VideoState *is)
++{
++    return is->nb_ext ? is->ext_base : (int)is->ic->nb_streams;
++}
++
++/* display thread: the cue of the selected external bitmap track at the displayed picture's time */
++static void ffp_ext_bitmap_update(SubtitleLayer *layer, double pts)
++{
++    VideoState *is = layer->is;
++    FFPExtTrack *x = is->ext[layer->ext_index];
++    int64_t t;
++    int lo = 0, hi = x->nb_cues - 1, idx = -1;
++
++    if (isnan(pts))
++        return;
++    t = llrint((pts - is->start_off_s) * 1000) - SDL_AtomicGet(&is->ffp->sub_delay_ms);
++    while (lo <= hi) {
++        int mid = (lo + hi) / 2;
++        if (x->cues[mid].start_ms <= t) {
++            idx = mid;
++            lo = mid + 1;
++        } else {
++            hi = mid - 1;
++        }
++    }
++    if (idx >= 0 && t >= x->cues[idx].end_ms)
++        idx = -1;
++    if (idx == layer->ext_cue)
++        return;
++    ffp_subtitle_clear_active(layer, layer->ext_cue >= 0);
++    layer->ext_cue = -1;
++    if (idx >= 0 && ffp_subtitle_copy(&layer->active, &x->cues[idx].sub) >= 0) {
++        layer->ext_cue = idx;
++        layer->generation++;
++        layer->active_valid = 1;
++        layer->active_counted_shown = 0;
++        layer->active_serial = -1;
++        layer->active_width = x->width;
++        layer->active_height = x->height;
++        layer->active_start = x->cues[idx].start_ms / 1000.0;
++        layer->active_end = x->cues[idx].end_ms / 1000.0;
++        layer->active_generation = layer->generation;
++    }
++}
++
+ static void ffp_subtitle_update_layer(SubtitleLayer *layer, double pts, int serial)
+ {
+     Frame *sp;
+@@ -2431,13 +3073,27 @@ static void ffp_subtitle_update_layer(Su
+     int attime_valid, attime_serial = 0, attime_width = 0, attime_height = 0;
+     int packet_serial;
+ 
++    if (layer->kind == FFP_LAYER_ASS) {
++        ffp_ass_update_layer(layer, pts);
++        ffp_subtitle_debug_sync(layer);
++        return;
++    }
++    if (layer->ext_index >= 0) {
++        ffp_ext_bitmap_update(layer, pts);
++        ffp_subtitle_debug_sync(layer);
++        return;
++    }
++    /* a bitmap cue is due at its time plus the subtitle delay */
++    if (layer->kind == FFP_LAYER_BITMAP && !isnan(pts))
++        pts -= SDL_AtomicGet(&layer->is->ffp->sub_delay_ms) / 1000.0;
++
+     /* video and subtitle packet queues have independent serial counters; serial is the video frame's */
+     SDL_LockMutex(layer->packets.mutex);
+     packet_serial = layer->packets.serial;
+     SDL_UnlockMutex(layer->packets.mutex);
+     if (layer->active_valid && layer->active_serial != layer->packets.serial)
+         ffp_subtitle_clear_active(layer, 1);
+-    if (layer->is_arib && layer->stream_index >= 0 && !isnan(pts) && serial == layer->is->videoq.serial &&
++    if (layer->kind == FFP_LAYER_ARIB && layer->stream_index >= 0 && !isnan(pts) && serial == layer->is->videoq.serial &&
+         layer->attime_requested_serial != packet_serial &&
+         ffp_subtitle_queue_attime(layer, pts, packet_serial) >= 0)
+         layer->attime_requested_serial = packet_serial;
+@@ -2600,7 +3256,7 @@ static void ffp_subtitle_check_resize(Vi
+     for (i = 0; i < FFP_SUBTITLE_LAYER_COUNT; i++) {
+         SubtitleLayer *layer = &is->subtitles[i];
+         int width, height;
+-        if (!layer->is_arib || layer->stream_index < 0 ||
++        if (layer->kind != FFP_LAYER_ARIB || layer->stream_index < 0 ||
+             layer->resize_candidate_width <= 0 || layer->resize_candidate_height <= 0 ||
+             now - layer->resize_candidate_since < 100000)
+             continue;
+@@ -3426,18 +4082,8 @@ static int ffp_overlay_build(VideoState
+     if (!layer->active_valid || layer->active.format != 0 || !layer->active.num_rects)
+         return 0;
+     n = layer->active.num_rects;
+-    if (n > layer->ov_alloc) {
+-        FFPOverlayRect *rects = av_realloc_array(layer->ov_rects, n, sizeof(*rects));
+-        uint8_t **pixels;
+-        if (!rects)
+-            goto nomem;
+-        layer->ov_rects = rects;
+-        pixels = av_realloc_array(layer->ov_pixels, n, sizeof(*pixels));
+-        if (!pixels)
+-            goto nomem;
+-        layer->ov_pixels = pixels;
+-        layer->ov_alloc = n;
+-    }
++    if (ffp_overlay_reserve(layer, n) < 0)
++        goto nomem;
+ 
+     for (i = 0; i < n; i++) {
+         AVSubtitleRect *r = layer->active.rects[i];
+@@ -3502,6 +4148,16 @@ static void ffp_overlay_layers(VideoStat
+         SubtitleLayer *layer = &is->subtitles[i];
+         int width, height, ret;
+ 
++        if (layer->kind == FFP_LAYER_ASS) {
++            /* composited by ffp_ass_update_layer at its frame size */
++            ov[i].generation = layer->generation;
++            ov[i].visible = ffp_subtitle_visible(is, i);
++            ov[i].canvas_width = FFMAX(layer->ov_canvas_width, 1);
++            ov[i].canvas_height = FFMAX(layer->ov_canvas_height, 1);
++            ov[i].rects = layer->ov_count ? layer->ov_rects : NULL;
++            ov[i].rect_count = layer->ov_count;
++            continue;
++        }
+         SDL_LockMutex(is->dbg_mutex);
+         width = layer->canvas_width;
+         height = layer->canvas_height;
+@@ -3624,6 +4280,10 @@ static void stream_component_close(Video
+         packet_queue_abort_routed(&sl->packets, &sl->routing_stream_index);
+         decoder_abort(&sl->decoder, &sl->frames);
+         decoder_destroy(&sl->decoder);
++        if (sl->kind == FFP_LAYER_ASS) {
++            ffp_ass_close_embedded(is);
++            ffp_overlay_reset(sl);
++        }
+         if (sl->startup_sem)
+             SDL_DestroySemaphore(sl->startup_sem);
+         sl->startup_sem = NULL;
+@@ -3652,7 +4312,7 @@ static void stream_component_close(Video
+         ffp_dbg_subtitle_closed(is, subtitle_layer);
+         sl->st = NULL;
+         sl->stream_index = -1;
+-        sl->is_arib = 0;
++        sl->kind = FFP_LAYER_NONE;
+     } else {
+         ffp_dbg_stream_closed(is, codecpar->codec_type);
+     }
+@@ -3707,6 +4367,15 @@ static void stream_close(VideoState *is)
+         avsubtitle_free(&is->subtitles[i].active);
+         ffp_overlay_release(&is->subtitles[i]);
+     }
++    for (int i = 0; i < is->nb_ext; i++)
++        ffp_ext_track_free(&is->ext[i]);
++    av_freep(&is->ext);
++    if (is->ass.renderer)
++        ass_renderer_done(is->ass.renderer);
++    if (is->ass.lib)
++        ass_library_done(is->ass.lib);
++    if (is->ass.mutex)
++        SDL_DestroyMutex(is->ass.mutex);
+     SDL_DestroyCond(is->continue_read_thread);
+     sws_freeContext(is->subtitle_rgba_ctx);
+     av_free(is->filename);
+@@ -6602,10 +7271,17 @@ static int subtitle_thread(void *arg)
+ 
+         if ((got_subtitle = decoder_decode_frame(dec, NULL, &sp->sub)) < 0)
+             break;
+-        if (layer->is_arib)
++        if (layer->kind == FFP_LAYER_ARIB)
+             ffp_subtitle_history_stats(layer);
+ 
+-        if (got_subtitle && sp->sub.format == 0) {
++        if (got_subtitle && layer->kind == FFP_LAYER_ASS) {
++            ffp_ass_feed(layer, &sp->sub, dec->pkt_serial, dec->subtitle_packet_pts);
++            avsubtitle_free(&sp->sub);
++            memset(&sp->sub, 0, sizeof(sp->sub));
++            /* a paused picture is only redrawn on request: show an event that arrives after it */
++            if (is->paused)
++                is->force_refresh = 1;
++        } else if (got_subtitle && sp->sub.format == 0) {
+             pts = sp->sub.pts != AV_NOPTS_VALUE ? sp->sub.pts / (double)AV_TIME_BASE :
+                   dec->subtitle_packet_pts != AV_NOPTS_VALUE ? dec->subtitle_packet_pts / (double)AV_TIME_BASE : 0.0;
+             sp->pts = pts;
+@@ -7222,31 +7898,6 @@ static void ffp_history_key(AVFormatCont
+     snprintf(key, size, "%s|%"PRId64"|%"PRId64"|%d|%d", url, file_size, (int64_t)st.st_mtime, stream_index, layer);
+ }
+ 
+-/* the ARIB canvas at an open: the displayed video area the presenter reported last, else the video's display size */
+-static void ffp_subtitle_canvas_size(VideoState *is, int video_w, int video_h, AVRational sar,
+-                                     int *canvas_w, int *canvas_h)
+-{
+-    FFPlayer *ffp = is->ffp;
+-    int w, h;
+-
+-    SDL_AtomicLock(&ffp->sink_lock);
+-    w = ffp->shown_width;
+-    h = ffp->shown_height;
+-    SDL_AtomicUnlock(&ffp->sink_lock);
+-    if ((w <= 0 || h <= 0) && video_w > 0 && video_h > 0) {
+-        if (sar.num <= 0 || sar.den <= 0)
+-            sar = (AVRational){ 1, 1 };
+-        w = video_w;
+-        h = video_h;
+-        if (av_cmp_q(sar, (AVRational){ 1, 1 }) > 0)
+-            w = (int)av_rescale(video_w, sar.num, sar.den);
+-        else
+-            h = (int)av_rescale(video_h, sar.den, sar.num);
+-    }
+-    *canvas_w = FFMAX(w, 1);
+-    *canvas_h = FFMAX(h, 1);
+-}
+-
+ /* open a given stream. Return 0 if OK */
+ static int stream_component_open(VideoState *is, int stream_index, int subtitle_layer)
+ {
+@@ -7286,8 +7937,7 @@ static int stream_component_open(VideoSt
+ 
+     switch(codec_type){
+         case AVMEDIA_TYPE_AUDIO   : is->last_audio_stream    = stream_index; forced_codec_name =    o->audio_codec_name; break;
+-        case AVMEDIA_TYPE_SUBTITLE: if (subtitle_layer == FFP_SUBTITLE_CAPTION) is->last_subtitle_stream = stream_index;
+-                                    forced_codec_name = o->subtitle_codec_name; break;
++        case AVMEDIA_TYPE_SUBTITLE: forced_codec_name = o->subtitle_codec_name; break;
+         case AVMEDIA_TYPE_VIDEO   : is->last_video_stream    = stream_index; forced_codec_name =    o->video_codec_name; break;
+     }
+     if (forced_codec_name)
+@@ -7356,6 +8006,13 @@ static int stream_component_open(VideoSt
+         }
+     }
+ 
++    if (sl && !arib) {
++        /* legacy-encoded text (the SAMI demuxer marks CP949 streams) */
++        const AVDictionaryEntry *charenc = av_dict_get(ic->streams[stream_index]->metadata, "charenc", NULL, 0);
++        if (charenc && *charenc->value && ffp_subtitle_kind(codec_id) == FFP_LAYER_ASS)
++            av_dict_set(&opts, "sub_charenc", charenc->value, 0);
++    }
++
+     av_dict_set(&opts, "flags", "+copy_opaque", AV_DICT_MULTIKEY);
+ 
+     if (codec_type == AVMEDIA_TYPE_VIDEO) {
+@@ -7501,12 +8158,12 @@ static int stream_component_open(VideoSt
+         if (arib) {
+             sl->stream_index = -1;
+             sl->st = NULL;
+-            sl->is_arib = 0;
++            sl->kind = FFP_LAYER_NONE;
+             sl->startup_stream_index = stream_index;
+         } else {
+             sl->stream_index = stream_index;
+             sl->st = ic->streams[stream_index];
+-            sl->is_arib = 0;
++            sl->kind = ffp_subtitle_kind(codec_id);
+             sl->startup_stream_index = -1;
+         }
+         if (arib) {
+@@ -7566,7 +8223,7 @@ static int stream_component_open(VideoSt
+                 sl->startup_stream_index = -1;
+                 sl->stream_index = -1;
+                 sl->st = NULL;
+-                sl->is_arib = 0;
++                sl->kind = FFP_LAYER_NONE;
+                 ic->streams[stream_index]->discard = AVDISCARD_ALL;
+                 goto out;
+             }
+@@ -7593,7 +8250,7 @@ static int stream_component_open(VideoSt
+                 sl->startup_stream_index = -1;
+                 sl->stream_index = -1;
+                 sl->st = NULL;
+-                sl->is_arib = 0;
++                sl->kind = FFP_LAYER_NONE;
+                 goto out;
+             }
+             SDL_DestroySemaphore(sl->startup_sem);
+@@ -7603,24 +8260,35 @@ static int stream_component_open(VideoSt
+             sl->startup_stream_index = -1;
+             sl->stream_index = stream_index;
+             sl->st = ic->streams[stream_index];
+-            sl->is_arib = 1;
++            sl->kind = FFP_LAYER_ARIB;
+             SDL_SemPost(sl->startup_release_sem);
+         } else {
+             if ((ret = decoder_init(&sl->decoder, avctx, &sl->packets, is->continue_read_thread)) < 0) {
+                 ffp_dbg_subtitle_closed(is, subtitle_layer);
+                 sl->stream_index = -1;
+                 sl->st = NULL;
++                sl->kind = FFP_LAYER_NONE;
+                 goto fail;
+             }
+             sl->decoder.subtitle_layer = sl;
++            if (sl->kind == FFP_LAYER_ASS && (ret = ffp_ass_open_embedded(is, avctx)) < 0) {
++                ffp_ass_close_embedded(is);
++                ffp_dbg_subtitle_closed(is, subtitle_layer);
++                decoder_destroy(&sl->decoder);
++                sl->stream_index = -1;
++                sl->st = NULL;
++                sl->kind = FFP_LAYER_NONE;
++                goto out;
++            }
+             if ((ret = decoder_start_routed_subtitle(&sl->decoder, &sl->routing_stream_index,
+                                                      stream_index, subtitle_thread,
+                                                      "subtitle_decoder", sl)) < 0) {
++                ffp_ass_close_embedded(is);
+                 ffp_dbg_subtitle_closed(is, subtitle_layer);
+                 decoder_destroy(&sl->decoder);
+                 sl->stream_index = -1;
+                 sl->st = NULL;
+-                sl->is_arib = 0;
++                sl->kind = FFP_LAYER_NONE;
+                 ic->streams[stream_index]->discard = AVDISCARD_ALL;
+                 goto out;
+             }
+@@ -7648,7 +8316,7 @@ fail:
+         sl->startup_stream_index = -1;
+         sl->stream_index = -1;
+         sl->st = NULL;
+-        sl->is_arib = 0;
++        sl->kind = FFP_LAYER_NONE;
+         ic->streams[stream_index]->discard = AVDISCARD_ALL;
+     }
+     if (avctx)
+@@ -7787,7 +8455,9 @@ static void ffp_build_media_info(VideoSt
+     av_bprintf(bp, ",\"seekable\":%s,\"bit_rate\":%"PRId64",\"streams\":[",
+                ffp_is_seekable(is) ? "true" : "false", (int64_t)ic->bit_rate);
+ 
+-    for (i = 0; i < ic->nb_streams; i++) {
++    /* streams a growing container (MPEG-TS) adds after the first external track are not listed: their indices
++     * belong to the external tracks */
++    for (i = 0; i < FFMIN(ic->nb_streams, ffp_ext_base(is)); i++) {
+         AVStream *st = ic->streams[i];
+         AVCodecParameters *par = st->codecpar;
+         const char *type;
+@@ -7825,6 +8495,12 @@ static void ffp_build_media_info(VideoSt
+             json_string(bp, pf ? pf : "");
+             av_bprintf(bp, ",\"color_transfer\":");
+             json_string(bp, av_color_transfer_name(par->color_trc));
++            av_bprintf(bp, ",\"field_order\":\"%s\"",
++                       par->field_order == AV_FIELD_PROGRESSIVE ? "progressive" :
++                       par->field_order == AV_FIELD_TT          ? "tt" :
++                       par->field_order == AV_FIELD_BB          ? "bb" :
++                       par->field_order == AV_FIELD_TB          ? "tb" :
++                       par->field_order == AV_FIELD_BT          ? "bt" : "unknown");
+         } else if (par->codec_type == AVMEDIA_TYPE_AUDIO) {
+             av_bprintf(bp, ",\"sample_rate\":%d,\"channels\":%d",
+                        par->sample_rate, par->ch_layout.nb_channels);
+@@ -7844,6 +8520,9 @@ static void ffp_build_media_info(VideoSt
+             }
+             av_bprintf(bp, ",\"component_tag\":%ld", component_tag);
+         }
++        if (par->codec_type == AVMEDIA_TYPE_SUBTITLE)
++            av_bprintf(bp, ",\"external\":false,\"text\":%s",
++                       ffp_subtitle_kind(par->codec_id) == FFP_LAYER_ASS ? "true" : "false");
+         av_bprintf(bp, ",\"selected\":%s,\"language\":", selected ? "true" : "false");
+         t = av_dict_get(st->metadata, "language", NULL, 0);
+         json_string(bp, t && t->value[0] ? t->value : "und");
+@@ -7854,6 +8533,24 @@ static void ffp_build_media_info(VideoSt
+         }
+         av_bprintf(bp, "}");
+     }
++    for (i = 0; i < is->nb_ext; i++) {
++        const FFPExtTrack *x = is->ext[i];
++        if (!first)
++            av_bprintf(bp, ",");
++        first = 0;
++        av_bprintf(bp, "{\"index\":%d,\"type\":\"subtitle\",\"codec\":", ffp_ext_base(is) + i);
++        json_string(bp, avcodec_get_name(x->codec_id));
++        av_bprintf(bp, ",\"external\":true,\"path\":");
++        json_string(bp, x->path);
++        av_bprintf(bp, ",\"text\":%s,\"selected\":%s,\"language\":", x->kind == FFP_LAYER_ASS ? "true" : "false",
++                   is->subtitles[FFP_SUBTITLE_CAPTION].ext_index == i ? "true" : "false");
++        json_string(bp, x->language ? x->language : "und");
++        if (x->title) {
++            av_bprintf(bp, ",\"title\":");
++            json_string(bp, x->title);
++        }
++        av_bprintf(bp, "}");
++    }
+     av_bprintf(bp, "]");
+     if (is->arib) {
+         /* roles at the time of the call; audio 2 may appear later (index -1 now) */
+@@ -8903,7 +9600,6 @@ static VideoState *stream_open(FFPlayer
+     is->id = SDL_AtomicAdd(&g_ffp.next_id, 1) + 1;
+     is->last_video_stream = is->video_stream = -1;
+     is->last_audio_stream = is->audio_stream = -1;
+-    is->last_subtitle_stream = -1;
+     is->last_seek_pos = NAN;
+     is->pt_want = -1;
+     is->displayed_video_pts = NAN;
+@@ -8918,6 +9614,8 @@ static VideoState *stream_open(FFPlayer
+         is->subtitles[i].stream_index = -1;
+         SDL_AtomicSet(&is->subtitles[i].routing_stream_index, -1);
+         is->subtitles[i].startup_stream_index = -1;
++        is->subtitles[i].ext_index = -1;
++        is->subtitles[i].ext_cue = -1;
+         is->subtitles[i].active_serial = -1;
+         is->subtitles[i].active_start = is->subtitles[i].active_end = NAN;
+         is->subtitles[i].ov_generation = UINT64_MAX;
+@@ -8950,7 +9648,7 @@ static VideoState *stream_open(FFPlayer
+         av_log(NULL, AV_LOG_FATAL, "SDL_CreateCond(): %s\n", SDL_GetError());
+         goto fail;
+     }
+-    if (!(is->dbg_mutex = SDL_CreateMutex())) {
++    if (!(is->dbg_mutex = SDL_CreateMutex()) || !(is->ass.mutex = SDL_CreateMutex())) {
+         av_log(NULL, AV_LOG_FATAL, "SDL_CreateMutex(): %s\n", SDL_GetError());
+         goto fail;
+     }
+@@ -8995,8 +9693,7 @@ static void stream_cycle_channel(VideoSt
+         start_index = is->last_audio_stream;
+         old_index = is->audio_stream;
+     } else {
+-        start_index = is->last_subtitle_stream;
+-        old_index = is->subtitles[FFP_SUBTITLE_CAPTION].stream_index;
++        return;                         /* subtitles: ffp_select_stream */
+     }
+     stream_index = start_index;
+ 
+@@ -9016,12 +9713,6 @@ static void stream_cycle_channel(VideoSt
+     for (;;) {
+         if (++stream_index >= nb_streams)
+         {
+-            if (codec_type == AVMEDIA_TYPE_SUBTITLE)
+-            {
+-                stream_index = -1;
+-                is->last_subtitle_stream = -1;
+-                goto the_end;
+-            }
+             if (start_index == -1)
+                 return;
+             stream_index = 0;
+@@ -9039,10 +9730,6 @@ static void stream_cycle_channel(VideoSt
+                 break;
+             case AVMEDIA_TYPE_VIDEO:
+                 goto the_end;
+-            case AVMEDIA_TYPE_SUBTITLE:
+-                if (!ffp_arib_is_superimpose(st))
+-                    goto the_end;
+-                break;
+             default:
+                 break;
+             }
+@@ -9056,8 +9743,117 @@ static void stream_cycle_channel(VideoSt
+            old_index,
+            stream_index);
+ 
+-    stream_component_close(is, old_index, codec_type == AVMEDIA_TYPE_SUBTITLE ? FFP_SUBTITLE_CAPTION : -1);
+-    stream_component_open(is, stream_index, codec_type == AVMEDIA_TYPE_SUBTITLE ? FFP_SUBTITLE_CAPTION : -1);
++    stream_component_close(is, old_index, -1);
++    stream_component_open(is, stream_index, -1);
++}
++
++static void ffp_ext_deselect(VideoState *is)
++{
++    SubtitleLayer *sl = &is->subtitles[FFP_SUBTITLE_CAPTION];
++
++    if (sl->ext_index < 0)
++        return;
++    SDL_LockMutex(is->ass.mutex);
++    if (is->ass.track && is->ass.track == is->ext[sl->ext_index]->track)
++        is->ass.track = NULL;
++    SDL_UnlockMutex(is->ass.mutex);
++    ffp_subtitle_clear_active(sl, 0);
++    ffp_overlay_reset(sl);
++    sl->generation++;
++    sl->ext_index = -1;
++    sl->ext_cue = -1;
++    sl->kind = FFP_LAYER_NONE;
++    ffp_dbg_subtitle_closed(is, FFP_SUBTITLE_CAPTION);
++}
++
++static int ffp_ext_select(VideoState *is, int k)
++{
++    SubtitleLayer *sl = &is->subtitles[FFP_SUBTITLE_CAPTION];
++    FFPExtTrack *x = is->ext[k];
++    FFPDebugSubtitle *s;
++    int ret = 0;
++
++    if (x->kind == FFP_LAYER_ASS) {
++        SDL_LockMutex(is->ass.mutex);
++        ret = ffp_ass_init(is);
++        if (ret >= 0 && !x->track)
++            ret = ffp_ext_track_build(&is->ass, x);
++        if (ret >= 0) {
++            is->ass.track = x->track;
++            is->ass.plain = ffp_subtitle_plain(x->codec_id);
++            is->ass.external = 1;
++            is->ass.changed = 1;
++        }
++        SDL_UnlockMutex(is->ass.mutex);
++        if (ret < 0)
++            return ret;
++    }
++    if ((x->width <= 0 || x->height <= 0) && is->video_st) {
++        x->width = is->video_st->codecpar->width;
++        x->height = is->video_st->codecpar->height;
++    }
++    sl->is = is;
++    sl->id = FFP_SUBTITLE_CAPTION;
++    sl->kind = x->kind;
++    sl->ext_index = k;
++    sl->ext_cue = -1;
++    sl->generation++;
++    SDL_LockMutex(is->dbg_mutex);
++    s = &is->dbg.subtitles[FFP_SUBTITLE_CAPTION];
++    memset(s, 0, sizeof(*s));
++    s->open = 1;
++    s->stream_index = ffp_ext_base(is) + k;
++    s->time_base = (AVRational){ 1, 1000 };
++    s->stream_start = s->active_start = s->active_end = NAN;
++    ffp_dbg_set_str(s->codec, sizeof(s->codec), avcodec_get_name(x->codec_id));
++    ffp_dbg_set_str(s->decoder, sizeof(s->decoder), "external");
++    ffp_dbg_set_str(s->caption_type, sizeof(s->caption_type), "caption");
++    SDL_UnlockMutex(is->dbg_mutex);
++    return 0;
++}
++
++/* display thread. FFP_STREAM_SUBTITLE: the caption layer, -1 off; an embedded stream or an external track. */
++static int ffp_select_stream_index(VideoState *is, int type, int index)
++{
++    AVFormatContext *ic = is->ic;
++    SubtitleLayer *sl = &is->subtitles[FFP_SUBTITLE_CAPTION];
++    int base = ffp_ext_base(is), old, ret;
++
++    if (type == FFP_STREAM_SUBTITLE) {
++        if (index < -1 || index >= base + is->nb_ext)
++            return FFP_EINVAL;
++        if (index >= 0 && index < base &&
++            (index >= ic->nb_streams || ic->streams[index]->codecpar->codec_type != AVMEDIA_TYPE_SUBTITLE ||
++             ffp_arib_is_superimpose(ic->streams[index])))
++            return FFP_EINVAL;
++        if (index >= 0 && (index < base ? sl->stream_index == index : sl->ext_index == index - base))
++            return 0;
++        ffp_ext_deselect(is);
++        if (sl->stream_index >= 0)
++            stream_component_close(is, sl->stream_index, FFP_SUBTITLE_CAPTION);
++        if (index < 0)
++            return 0;
++        if (index >= base)
++            return ffp_ext_select(is, index - base);
++        ret = stream_component_open(is, index, FFP_SUBTITLE_CAPTION);
++        return ret < 0 ? ret : 0;
++    }
++    if (type != FFP_STREAM_AUDIO && type != FFP_STREAM_VIDEO)
++        return FFP_EINVAL;
++    /* ARIB: audio 1 / audio 2 are a preference (ffp_set_audio_preference) */
++    if (type == FFP_STREAM_AUDIO && is->arib)
++        return FFP_EINVAL;
++    if (index < 0 || index >= ic->nb_streams || ic->streams[index]->codecpar->codec_type != type ||
++        (type == FFP_STREAM_AUDIO && (!ic->streams[index]->codecpar->sample_rate ||
++                                      !ic->streams[index]->codecpar->ch_layout.nb_channels)))
++        return FFP_EINVAL;
++    old = type == FFP_STREAM_AUDIO ? is->audio_stream : is->video_stream;
++    if (old == index)
++        return 0;
++    if (old >= 0)
++        stream_component_close(is, old, -1);
++    ret = stream_component_open(is, index, -1);
++    return ret < 0 ? ret : 0;
+ }
+ 
+ 
+@@ -9477,7 +10273,7 @@ static void ffp_cmd_refresh_caption_styl
+     is->o->arib_ignore_background = !!(flags & 1);
+     is->o->arib_force_outline = !!(flags & 2);
+     layer = &is->subtitles[FFP_SUBTITLE_CAPTION];
+-    if (!is->ic || layer->stream_index < 0 || !layer->is_arib)
++    if (!is->ic || layer->stream_index < 0 || layer->kind != FFP_LAYER_ARIB)
+         return;
+     stream_index = layer->stream_index;
+     stream_component_close(is, stream_index, FFP_SUBTITLE_CAPTION);
+@@ -9488,6 +10284,28 @@ static void ffp_cmd_refresh_caption_styl
+     is->force_refresh = 1;
+ }
+ 
++/* takes the tracks on success; returns the media-info index of the first */
++static int ffp_cmd_add_subtitle(VideoState *is, FFPExtTrack **tracks, int n)
++{
++    FFPExtTrack **ext;
++    int first, i;
++
++    if (!is->ic || !SDL_AtomicGet(&is->prepared))
++        return FFP_EINVAL;
++    ext = av_realloc_array(is->ext, is->nb_ext + n, sizeof(*ext));
++    if (!ext)
++        return AVERROR(ENOMEM);
++    is->ext = ext;
++    if (!is->nb_ext)
++        is->ext_base = is->ic->nb_streams;
++    first = is->ext_base + is->nb_ext;
++    for (i = 0; i < n; i++)
++        is->ext[is->nb_ext++] = tracks[i];
++    av_free(tracks);
++    ffp_update_media_info(is);
++    return first;
++}
++
+ /* returns 1 if the instance was destroyed (and must not be touched anymore) */
+ static int ffp_exec_cmd(FFPlayer *ffp, FFPCmd *c)
+ {
+@@ -9542,6 +10360,23 @@ static int ffp_exec_cmd(FFPlayer *ffp, F
+     case FFP_CMD_REFRESH_CAPTION_STYLE:
+         ffp_cmd_refresh_caption_style(ffp, c->i);
+         break;
++    case FFP_CMD_SELECT_STREAM:
++        c->result = FFP_EINVAL;
++        if (is && is->ic && SDL_AtomicGet(&is->prepared)) {
++            c->result = ffp_select_stream_index(is, c->i, (int)c->d);
++            is->force_refresh = 1;
++            ffp_update_media_info(is);
++        }
++        break;
++    case FFP_CMD_ADD_SUBTITLE:
++        c->result = is ? ffp_cmd_add_subtitle(is, c->p, c->i) : FFP_EINVAL;
++        if (c->result >= 0)
++            c->p = NULL;
++        break;
++    case FFP_CMD_SUB_REFRESH:
++        if (is)
++            is->force_refresh = 1;
++        break;
+     }
+     return destroyed;
+ }
+@@ -9668,6 +10503,17 @@ static void ffp_tick(FFPlayer *ffp, doub
+         if (pending)
+             is->force_refresh = 1;
+     }
++    if (is->paused && is->video_st && is->subtitles[FFP_SUBTITLE_CAPTION].kind == FFP_LAYER_ASS) {
++        /* the libass frame follows the displayed video area: redraw a paused picture at the new size */
++        int w, h, stale;
++        ffp_subtitle_canvas_size(is, is->video_st->codecpar->width, is->video_st->codecpar->height,
++                                 av_guess_sample_aspect_ratio(is->ic, is->video_st, NULL), &w, &h);
++        SDL_LockMutex(is->ass.mutex);
++        stale = is->ass.track && (w != is->ass.frame_w || h != is->ass.frame_h);
++        SDL_UnlockMutex(is->ass.mutex);
++        if (stale)
++            is->force_refresh = 1;
++    }
+     if (SDL_AtomicGet(&is->prepared) && !is->video_st && !is->cleared_audio_only) {
+         is->cleared_audio_only = 1;
+         ffp_pres_clear(ffp);
+@@ -10057,6 +10903,12 @@ FFP_API FFPlayer *FFP_CALL ffp_create(co
+     SDL_AtomicSet(&ffp->muted, 0);
+     SDL_AtomicSet(&ffp->subtitle_visible[FFP_SUBTITLE_CAPTION], 1);
+     SDL_AtomicSet(&ffp->subtitle_visible[FFP_SUBTITLE_SUPERIMPOSE], 1);
++    ffp->sub_style.struct_size = sizeof(ffp->sub_style);
++    ffp->sub_style.font_scale = 1.0;
++    ffp->sub_style.primary_rgba = 0xffffffffu;
++    ffp->sub_style.outline_rgba = 0x000000ffu;
++    ffp->sub_style.outline_width = 3.0;
++    ffp->sub_style_gen = 1;
+ 
+ #if CONFIG_AVDEVICE
+     avdevice_register_all();
+@@ -10180,6 +11032,7 @@ static const FFPOptDef ffp_optdefs[] = {
+     { "filter_hw_device", OT_STRING, OO(filter_hw_device) },
+     { "hwframes",         OT_STRING, OO(hwframes) },
+     { "start_paused",     OT_BOOL,   OO(start_paused) },
++    { "sub_fontsdir",     OT_STRING, OO(sub_fontsdir) },
+     { NULL }
+ };
+ 
+@@ -10392,6 +11245,7 @@ FFP_API int FFP_CALL ffp_open(FFPlayer *
+     c->o = o;
+ 
+     ffp_close_media(ffp);
++    SDL_AtomicSet(&ffp->sub_delay_ms, 0);
+ 
+     SDL_LockMutex(ffp->mutex);
+     if (ov.has_vf) {
+@@ -10556,7 +11410,7 @@ FFP_API char *FFP_CALL ffp_get_media_inf
+ 
+ FFP_API int FFP_CALL ffp_cycle_stream(FFPlayer *ffp, int type)
+ {
+-    if (!ffp || (type != FFP_STREAM_VIDEO && type != FFP_STREAM_AUDIO && type != FFP_STREAM_SUBTITLE))
++    if (!ffp || (type != FFP_STREAM_VIDEO && type != FFP_STREAM_AUDIO))
+         return FFP_EINVAL;
+     return ffp_post_simple(ffp, FFP_CMD_CYCLE, 0, type);
+ }
+@@ -10900,7 +11754,8 @@ FFP_API int FFP_CALL ffp_snapshot_ex(FFP
+     int canvas_w[FFP_SUBTITLE_LAYER_COUNT] = { 0, 0 };
+     int canvas_h[FFP_SUBTITLE_LAYER_COUNT] = { 0, 0 };
+     int visible[FFP_SUBTITLE_LAYER_COUNT] = { 0, 0 };
+-    int is_arib[FFP_SUBTITLE_LAYER_COUNT] = { 0, 0 };
++    int kind[FFP_SUBTITLE_LAYER_COUNT] = { 0, 0 };
++    int64_t ass_ms[FFP_SUBTITLE_LAYER_COUNT] = { 0, 0 };
+     int serial[FFP_SUBTITLE_LAYER_COUNT] = { 0, 0 };
+     int stream_index[FFP_SUBTITLE_LAYER_COUNT] = { -1, -1 };
+     uint64_t generation[FFP_SUBTITLE_LAYER_COUNT] = { 0, 0 };
+@@ -10919,7 +11774,8 @@ FFP_API int FFP_CALL ffp_snapshot_ex(FFP
+         visible[i] = SDL_AtomicGet(&ffp->subtitle_visible[i]) && ffp->last_subtitle_visible[i];
+         canvas_w[i] = ffp->last_subtitle_width[i];
+         canvas_h[i] = ffp->last_subtitle_height[i];
+-        is_arib[i] = ffp->last_subtitle_is_arib[i];
++        kind[i] = ffp->last_subtitle_kind[i];
++        ass_ms[i] = ffp->last_subtitle_ass_ms[i];
+         serial[i] = ffp->last_subtitle_serial[i];
+         stream_index[i] = ffp->last_subtitle_stream_index[i];
+         generation[i] = ffp->last_subtitle_generation[i];
+@@ -10944,8 +11800,14 @@ FFP_API int FFP_CALL ffp_snapshot_ex(FFP
+         goto end;
+     }
+     for (i = 0; i < FFP_SUBTITLE_LAYER_COUNT; i++) {
+-        if (visible[i] && subtitles[i].num_rects) {
+-            if (is_arib[i] && stream_index[i] >= 0 &&
++        if (visible[i] && kind[i] == FFP_LAYER_ASS) {
++            /* libass renders the track again at the snapshot size, the time the snapshot frame was shown at */
++            SDL_LockMutex(ffp->snap_mutex);
++            if (ffp->snap_is && ffp->last_subtitle_kind[i] == FFP_LAYER_ASS)
++                ffp_ass_snapshot(ffp->snap_is, ass_ms[i], composite, *width, *height, *stride);
++            SDL_UnlockMutex(ffp->snap_mutex);
++        } else if (visible[i] && subtitles[i].num_rects) {
++            if (kind[i] == FFP_LAYER_ARIB && stream_index[i] >= 0 &&
+                 (canvas_w[i] != *width || canvas_h[i] != *height)) {
+                 AVSubtitle rerendered = { 0 };
+                 int rerender_ret = AVERROR(EAGAIN);
+@@ -10953,7 +11815,7 @@ FFP_API int FFP_CALL ffp_snapshot_ex(FFP
+                 /* Keep the video frame and its cue snapshot paired. The mutex also prevents the media
+                  * from being destroyed while the request is queued and serviced by its decoder thread. */
+                 SDL_LockMutex(ffp->snap_mutex);
+-                if (ffp->snap_is && ffp->last_subtitle_is_arib[i] &&
++                if (ffp->snap_is && ffp->last_subtitle_kind[i] == FFP_LAYER_ARIB &&
+                     ffp->last_subtitle_stream_index[i] == stream_index[i] &&
+                     ffp->last_subtitle_serial[i] == serial[i] &&
+                     ffp->last_subtitle_generation[i] == generation[i] &&
+@@ -11779,3 +12641,274 @@ FFP_API void FFP_CALL ffp_set_log_callba
+     SDL_AtomicUnlock(&g_ffp_log.lock);
+     av_log_set_callback(cb ? ffp_log_trampoline : av_log_default_callback);
+ }
++
++static int ffp_post_sync(FFPlayer *ffp, FFPCmd *c)
++{
++    c->result = FFP_EINVAL;
++    if (!(c->done = SDL_CreateSemaphore(0)))
++        return AVERROR(ENOMEM);
++    ffp_post(ffp, c);
++    SDL_SemWait(c->done);
++    SDL_DestroySemaphore(c->done);
++    return c->result;
++}
++
++FFP_API int FFP_CALL ffp_select_stream(FFPlayer *ffp, int type, int index)
++{
++    FFPCmd c;
++
++    if (!ffp || (type != FFP_STREAM_VIDEO && type != FFP_STREAM_AUDIO && type != FFP_STREAM_SUBTITLE))
++        return FFP_EINVAL;
++    memset(&c, 0, sizeof(c));
++    c.type = FFP_CMD_SELECT_STREAM;
++    c.i = type;
++    c.d = index;
++    return ffp_post_sync(ffp, &c);
++}
++
++static int ffp_ext_add_event(FFPExtTrack *x, const char *line, int64_t start_ms, int64_t duration_ms)
++{
++    FFPAssEvent *ev = av_realloc_array(x->events, x->nb_events + 1, sizeof(*ev));
++
++    if (!ev)
++        return AVERROR(ENOMEM);
++    x->events = ev;
++    ev = &x->events[x->nb_events];
++    if (!(ev->line = av_strdup(line)))
++        return AVERROR(ENOMEM);
++    ev->start_ms = start_ms;
++    ev->duration_ms = duration_ms;
++    x->nb_events++;
++    return 0;
++}
++
++static int ffp_bitmap_cue_cmp(const void *a, const void *b)
++{
++    const FFPBitmapCue *x = a, *y = b;
++    return (x->start_ms > y->start_ms) - (x->start_ms < y->start_ms);
++}
++
++/* A bitmap cue holds until the next decoded subtitle (an empty one only clears) or its own end; the empty ones are
++ * dropped afterwards. */
++static void ffp_ext_finish_cues(FFPExtTrack *x)
++{
++    int i, n = 0;
++
++    qsort(x->cues, x->nb_cues, sizeof(*x->cues), ffp_bitmap_cue_cmp);
++    for (i = 0; i + 1 < x->nb_cues; i++)
++        if (x->cues[i + 1].start_ms < x->cues[i].end_ms)
++            x->cues[i].end_ms = x->cues[i + 1].start_ms;
++    for (i = 0; i < x->nb_cues; i++) {
++        if (!x->cues[i].sub.num_rects || x->cues[i].end_ms <= x->cues[i].start_ms) {
++            avsubtitle_free(&x->cues[i].sub);
++            continue;
++        }
++        x->cues[n++] = x->cues[i];
++    }
++    x->nb_cues = n;
++}
++
++static int ffp_ext_add_cue(FFPExtTrack *x, AVSubtitle *sub)
++{
++    FFPBitmapCue *cues = av_realloc_array(x->cues, x->nb_cues + 1, sizeof(*cues));
++
++    if (!cues)
++        return AVERROR(ENOMEM);
++    x->cues = cues;
++    cues[x->nb_cues].start_ms = sub->pts / 1000 + sub->start_display_time;
++    cues[x->nb_cues].end_ms = sub->end_display_time == UINT32_MAX || sub->end_display_time <= sub->start_display_time ?
++                              INT64_MAX : sub->pts / 1000 + sub->end_display_time;
++    cues[x->nb_cues].sub = *sub;
++    memset(sub, 0, sizeof(*sub));
++    x->nb_cues++;
++    return 0;
++}
++
++/* Decodes every subtitle stream of the file completely; runs on the caller's thread and touches no player state. */
++static int ffp_ext_load(const char *path, FFPExtTrack ***out, int *nb_out)
++{
++    AVFormatContext *ic = NULL;
++    AVCodecContext **dec = NULL;
++    FFPExtTrack **tracks = NULL;
++    int *slot = NULL;
++    AVPacket *pkt = av_packet_alloc();
++    int64_t bitmap_bytes = 0;
++    int nb = 0, ret, i, capped = 0;
++
++    *out = NULL;
++    *nb_out = 0;
++    if (!pkt)
++        return AVERROR(ENOMEM);
++    if ((ret = avformat_open_input(&ic, path, NULL, NULL)) < 0)
++        goto end;
++    if (!(dec = av_calloc(ic->nb_streams, sizeof(*dec))) || !(slot = av_malloc_array(ic->nb_streams, sizeof(*slot))) ||
++        !(tracks = av_calloc(ic->nb_streams, sizeof(*tracks)))) {
++        ret = AVERROR(ENOMEM);
++        goto end;
++    }
++    for (i = 0; i < ic->nb_streams; i++) {
++        AVStream *st = ic->streams[i];
++        const AVCodec *codec = avcodec_find_decoder(st->codecpar->codec_id);
++        const AVDictionaryEntry *t;
++        AVDictionary *opts = NULL;
++        FFPExtTrack *x;
++        int kind = ffp_subtitle_kind(st->codecpar->codec_id);
++
++        slot[i] = -1;
++        st->discard = AVDISCARD_ALL;
++        if (st->codecpar->codec_type != AVMEDIA_TYPE_SUBTITLE || kind == FFP_LAYER_ARIB || !codec)
++            continue;
++        if (!(dec[i] = avcodec_alloc_context3(codec)) || !(x = av_mallocz(sizeof(*x)))) {
++            ret = AVERROR(ENOMEM);
++            goto end;
++        }
++        tracks[nb] = x;
++        slot[i] = nb++;
++        x->kind = kind;
++        x->codec_id = st->codecpar->codec_id;
++        if (!(x->path = av_strdup(path))) {
++            ret = AVERROR(ENOMEM);
++            goto end;
++        }
++        if ((t = av_dict_get(st->metadata, "language", NULL, 0)) && *t->value)
++            x->language = av_strdup(t->value);
++        if ((t = av_dict_get(st->metadata, "title", NULL, 0)) && *t->value)
++            x->title = av_strdup(t->value);
++        if ((ret = avcodec_parameters_to_context(dec[i], st->codecpar)) < 0)
++            goto end;
++        dec[i]->pkt_timebase = st->time_base;
++        if (kind == FFP_LAYER_ASS && (t = av_dict_get(st->metadata, "charenc", NULL, 0)) && *t->value)
++            av_dict_set(&opts, "sub_charenc", t->value, 0);
++        ret = avcodec_open2(dec[i], codec, &opts);
++        av_dict_free(&opts);
++        if (ret < 0)
++            goto end;
++        if (kind == FFP_LAYER_ASS && dec[i]->subtitle_header && dec[i]->subtitle_header_size > 0 &&
++            !(x->header = av_strndup((const char *)dec[i]->subtitle_header, dec[i]->subtitle_header_size))) {
++            ret = AVERROR(ENOMEM);
++            goto end;
++        }
++        st->discard = AVDISCARD_DEFAULT;
++    }
++    if (!nb) {
++        ret = AVERROR_STREAM_NOT_FOUND;
++        goto end;
++    }
++    while ((ret = av_read_frame(ic, pkt)) >= 0) {
++        int k = pkt->stream_index < ic->nb_streams ? slot[pkt->stream_index] : -1;
++        AVCodecContext *avctx = k >= 0 ? dec[pkt->stream_index] : NULL;
++        FFPExtTrack *x = k >= 0 ? tracks[k] : NULL;
++        AVSubtitle sub;
++        int got = 0;
++        unsigned r;
++
++        if (!avctx || avcodec_decode_subtitle2(avctx, &sub, &got, pkt) < 0 || !got) {
++            av_packet_unref(pkt);
++            continue;
++        }
++        if (sub.pts == AV_NOPTS_VALUE && pkt->pts != AV_NOPTS_VALUE)
++            sub.pts = av_rescale_q(pkt->pts, ic->streams[pkt->stream_index]->time_base, AV_TIME_BASE_Q);
++        av_packet_unref(pkt);
++        if (sub.pts == AV_NOPTS_VALUE) {
++            avsubtitle_free(&sub);
++            continue;
++        }
++        if (x->kind == FFP_LAYER_ASS) {
++            for (r = 0, ret = 0; r < sub.num_rects && ret >= 0; r++)
++                if (sub.rects[r] && sub.rects[r]->ass)
++                    ret = ffp_ext_add_event(x, sub.rects[r]->ass, sub.pts / 1000 + sub.start_display_time,
++                                            ffp_subtitle_duration_ms(&sub));
++            avsubtitle_free(&sub);
++            if (ret < 0)
++                goto end;
++            continue;
++        }
++        for (r = 0; r < sub.num_rects; r++)
++            if (sub.rects[r])
++                bitmap_bytes += (int64_t)sub.rects[r]->linesize[0] * sub.rects[r]->h + AVPALETTE_SIZE;
++        if (sub.format != 0 || bitmap_bytes > FFP_SUB_MAX_BITMAP_BYTES) {
++            capped |= bitmap_bytes > FFP_SUB_MAX_BITMAP_BYTES;
++            avsubtitle_free(&sub);
++            continue;
++        }
++        if ((ret = ffp_ext_add_cue(x, &sub)) < 0) {
++            avsubtitle_free(&sub);
++            goto end;
++        }
++        x->width = avctx->width;
++        x->height = avctx->height;
++    }
++    if (ret != AVERROR_EOF)
++        av_log(NULL, AV_LOG_WARNING, "%s: subtitle read stopped early: %s\n", path, av_err2str(ret));
++    if (capped)
++        av_log(NULL, AV_LOG_WARNING, "%s: bitmap subtitles beyond %d MiB dropped\n", path, FFP_SUB_MAX_BITMAP_BYTES >> 20);
++    for (i = 0; i < nb; i++)
++        if (tracks[i]->kind == FFP_LAYER_BITMAP)
++            ffp_ext_finish_cues(tracks[i]);
++    *out = tracks;
++    *nb_out = nb;
++    tracks = NULL;
++    ret = 0;
++end:
++    for (i = 0; tracks && i < nb; i++)
++        ffp_ext_track_free(&tracks[i]);
++    av_free(tracks);
++    for (i = 0; dec && i < ic->nb_streams; i++)
++        avcodec_free_context(&dec[i]);
++    av_free(dec);
++    av_free(slot);
++    av_packet_free(&pkt);
++    avformat_close_input(&ic);
++    return ret;
++}
++
++FFP_API int FFP_CALL ffp_add_subtitle_file(FFPlayer *ffp, const char *path_utf8)
++{
++    FFPExtTrack **tracks;
++    FFPCmd c;
++    int nb, ret, i;
++
++    if (!ffp || !path_utf8 || !*path_utf8)
++        return FFP_EINVAL;
++    if ((ret = ffp_ext_load(path_utf8, &tracks, &nb)) < 0) {
++        av_log(NULL, AV_LOG_ERROR, "%s: %s\n", path_utf8, av_err2str(ret));
++        return ret;
++    }
++    memset(&c, 0, sizeof(c));
++    c.type = FFP_CMD_ADD_SUBTITLE;
++    c.p = tracks;
++    c.i = nb;
++    ret = ffp_post_sync(ffp, &c);
++    if (c.p) {
++        for (i = 0; i < nb; i++)
++            ffp_ext_track_free(&tracks[i]);
++        av_free(tracks);
++    }
++    return ret;
++}
++
++FFP_API int FFP_CALL ffp_set_subtitle_style(FFPlayer *ffp, const FFPSubtitleStyle *style)
++{
++    if (!ffp || !style || style->struct_size != sizeof(*style))
++        return FFP_EINVAL;
++    SDL_LockMutex(ffp->mutex);
++    ffp->sub_style = *style;
++    ffp->sub_style.font_family[sizeof(ffp->sub_style.font_family) - 1] = 0;
++    if (!++ffp->sub_style_gen)
++        ffp->sub_style_gen = 1;
++    SDL_UnlockMutex(ffp->mutex);
++    return ffp_post_simple(ffp, FFP_CMD_SUB_REFRESH, 0, 0);
++}
++
++FFP_API int FFP_CALL ffp_set_subtitle_delay(FFPlayer *ffp, int64_t delay_ms)
++{
++    if (!ffp)
++        return FFP_EINVAL;
++    SDL_AtomicSet(&ffp->sub_delay_ms, (int)av_clip64(delay_ms, -(INT_MAX / 2), INT_MAX / 2));
++    return ffp_post_simple(ffp, FFP_CMD_SUB_REFRESH, 0, 0);
++}
++
++FFP_API int64_t FFP_CALL ffp_get_subtitle_delay(FFPlayer *ffp)
++{
++    return ffp ? SDL_AtomicGet(&ffp->sub_delay_ms) : 0;
++}
+--- a/fftools/ffplay.h
++++ b/fftools/ffplay.h
+@@ -79,13 +79,14 @@ enum {
+ 
+ enum { FFP_SEEK_ABSOLUTE = 0, FFP_SEEK_RELATIVE = 1 };
+ 
+-/* ffp_cycle_stream types (same values as AVMediaType) */
++/* ffp_cycle_stream / ffp_select_stream types (same values as AVMediaType) */
+ enum { FFP_STREAM_VIDEO = 0, FFP_STREAM_AUDIO = 1, FFP_STREAM_SUBTITLE = 3 };
+ 
+ enum { FFP_SUBTITLE_CAPTION = 0, FFP_SUBTITLE_SUPERIMPOSE = 1, FFP_SUBTITLE_LAYER_COUNT = 2 };
+ 
+-/* Bitmap caption / superimpose overlays. RGBA is straight alpha, top-to-bottom, four bytes per pixel; x/y are in the
+- * layer's canvas pixels. The canvas covers the displayed video area (FFPPresentedInfo.video_width/height). Layers are
++/* Caption / superimpose overlays. RGBA is straight alpha, top-to-bottom, four bytes per pixel; x/y are in the
++ * layer's canvas pixels. The canvas covers the displayed video area (FFPPresentedInfo.video_width/height for ARIB
++ * captions and libass-rendered text, the subtitle's own canvas for bitmap subtitles such as PGS). Layers are
+  * drawn in index order (caption first, superimpose above it). The same generation with the same canvas size always has
+  * the same pixels, so a presenter may keep its upload and skip the copy. */
+ enum {
+@@ -298,7 +299,8 @@ FFP_API int         FFP_CALL ffp_set_out
+  * "filter_hw_device" = "type" (the device chosen like hwaccel's) or "type:device" (av_hwdevice_ctx_create with that
+  * device string) for the video graph (like ffmpeg's -filter_hw_device). The device is attached lazily when the graph is
+  * first built; if that fails FFP_EVENT_FILTER_ERROR is raised and the previous filter string is restored.
+- * "arib_font" = the libaribcaption "font" option value, passed as is. */
++ * "arib_font" = the libaribcaption "font" option value, passed as is.
++ * "sub_fontsdir" = a directory of extra fonts for the libass subtitle renderer (ass_set_fonts_dir). */
+ FFP_API int         FFP_CALL ffp_open(FFPlayer *p, const char *url, const char *options_kv);
+ FFP_API int         FFP_CALL ffp_stop(FFPlayer *p);               /* closes media; the presenter is cleared to black */
+ 
+@@ -361,7 +363,44 @@ FFP_API double      FFP_CALL ffp_get_pos
+ FFP_API double      FFP_CALL ffp_get_duration(FFPlayer *p);       /* seconds; <= 0 if unknown/live */
+ FFP_API char       *FFP_CALL ffp_get_media_info(FFPlayer *p);     /* JSON (see below) or NULL; ffp_free */
+ 
++/* Video / audio only; FFP_STREAM_SUBTITLE returns FFP_EINVAL (use ffp_select_stream). */
+ FFP_API int         FFP_CALL ffp_cycle_stream(FFPlayer *p, int type);
++/* Selects a stream by its media-info index, after FFP_EVENT_PREPARED. FFP_STREAM_SUBTITLE: the caption layer; index -1
++ * = off, an external track (ffp_add_subtitle_file) is selected by its index as well. FFP_STREAM_AUDIO is FFP_EINVAL for
++ * ARIB media (ffp_set_audio_preference). Synchronous (waits for the library thread): never call it from inside a
++ * callback. 0, FFP_EINVAL (no such stream of that type, nothing open) or a negative AVERROR. See docs/libffplay-api.md. */
++FFP_API int         FFP_CALL ffp_select_stream(FFPlayer *p, int type, int index);
++/* After FFP_EVENT_PREPARED. Preloads the whole subtitle file (srt / smi / sami / ass / ssa / vtt / sup) on the calling
++ * thread and adds its streams to the media info (indices after the container's; SAMI: one per language class). Does
++ * not select. The tracks belong to the current media (gone with the next ffp_open / ffp_stop). Synchronous like
++ * ffp_select_stream: never from inside a callback. Returns the first new media-info stream index (>= 0) or a negative
++ * AVERROR. */
++FFP_API int         FFP_CALL ffp_add_subtitle_file(FFPlayer *p, const char *path_utf8);
++
++/* Subtitle style of the libass renderer (every subtitle codec except ARIB and hdmv_pgs_subtitle). */
++enum {
++    FFP_SUBSTYLE_FONT   = 1 << 0,   /* override font family */
++    FFP_SUBSTYLE_SIZE   = 1 << 1,   /* apply font_scale */
++    FFP_SUBSTYLE_COLORS = 1 << 2,   /* override primary + outline colour */
++    FFP_SUBSTYLE_BORDER = 1 << 3,   /* override outline width */
++};
++
++typedef struct FFPSubtitleStyle {
++    int      struct_size;           /* sizeof(FFPSubtitleStyle) */
++    char     font_family[128];      /* UTF-8; also the libass default family; "" = "Malgun Gothic" */
++    double   font_scale;            /* 1.0 = 100 % */
++    uint32_t primary_rgba;          /* 0xRRGGBBAA, AA = 0xFF opaque */
++    uint32_t outline_rgba;
++    double   outline_width;         /* px at 1080 lines of video, scaled with the frame */
++    unsigned override_flags;        /* FFP_SUBSTYLE_* */
++    int      apply_to_ass;          /* 0: overrides only for plain-text codecs; 1: also ASS/SSA */
++} FFPSubtitleStyle;
++
++/* Live; persists across opens. 0 or FFP_EINVAL. */
++FFP_API int         FFP_CALL ffp_set_subtitle_style(FFPlayer *p, const FFPSubtitleStyle *style);
++/* Positive = subtitles later. Live; reset to 0 by ffp_open. */
++FFP_API int         FFP_CALL ffp_set_subtitle_delay(FFPlayer *p, int64_t delay_ms);
++FFP_API int64_t     FFP_CALL ffp_get_subtitle_delay(FFPlayer *p);
+ 
+ /* ARIB audio model. For an ARIB transport stream (media info "arib_audio" present) the video program's audio is
+  * "audio 1" (ADTS AAC with component tag 0x10 / 0x83 / 0x85, else the first untagged AAC) and "audio 2" (tag 0x11),
+@@ -408,9 +447,10 @@ FFP_API int         FFP_CALL ffp_filter_
+ FFP_API int         FFP_CALL ffp_snapshot(FFPlayer *p, uint8_t **out_bgra, int *width,
+                                           int *height, int *stride);
+ /* ffp_snapshot_ex uses the same native-size video path. FFP_SNAPSHOT_SUBTITLES composites the
+- * currently active visible bitmap layers (caption if visible; superimpose if enabled and visible).
++ * currently active visible layers (caption if visible; superimpose if enabled and visible).
+  * ARIB layers are re-rendered at snapshot size and the live canvas is restored; a failed re-render
+- * falls back to high-quality scaling. Bit 0 is the only supported flag. */
++ * falls back to high-quality scaling. libass text is rendered again at the snapshot size; bitmap subtitles
++ * (PGS) are scaled. Bit 0 is the only supported flag. */
+ enum { FFP_SNAPSHOT_SUBTITLES = 1 };
+ FFP_API int         FFP_CALL ffp_snapshot_ex(FFPlayer *p, unsigned flags, uint8_t **out_bgra,
+                                              int *width, int *height, int *stride);

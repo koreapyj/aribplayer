@@ -301,3 +301,35 @@ TEST_CASE(ComboBox_DestroyedWhileOpenIsSafe) {
     e.h.CloseAllPopups();                                                // onClosed must not touch the dead combo
     CHECK_EQ(e.h.PopupCount(), (size_t)0);
 }
+
+TEST_CASE(ComboBox_TypeAheadLikeExplorer) {
+    std::vector<std::wstring> items{L"Arial", L"Batang", L"Gulim", L"Gungsuh", L"Malgun Gothic", L"Meiryo", L"MS Gothic"};
+    TypeAhead t;
+    uint64_t now = 10000;
+    CHECK_EQ(t.Next(L'm', now, items, 0), 4);
+    CHECK_EQ(t.Next(L'e', now += 100, items, 4), 5);                 // "me" -> Meiryo
+    CHECK_EQ(t.Next(L'g', now += 2000, items, 5), 2);                // timeout: new prefix "g"
+    CHECK_EQ(t.Next(L'g', now += 100, items, 2), 3);                 // "gg": cycle the items starting with g
+    CHECK_EQ(t.Next(L'g', now += 100, items, 3), 2);                 // ... wrapping
+    CHECK_EQ(t.Next(L'U', now += 100, items, 2), -1);                // "gggu": no longer a repeat, and no match
+    CHECK_EQ(t.Next(L'x', now += 2000, items, 2), -1);
+
+    Env e;
+    uint64_t clock = 10000;
+    e.h.SetClock([&clock] { return clock; });
+    std::vector<int> log;
+    auto* c = e.root->Add<ComboBox>();
+    c->SetItems(items);
+    c->SetBounds({100, 100, 300, 132});
+    c->onSelectionChanged = [&log](int i) { log.push_back(i); };
+    e.h.SetFocus(c, true);
+    e.h.Char(L'G');
+    CHECK_EQ(c->SelectedIndex(), 2);
+    e.h.KeyDown(key::F4, 0);
+    REQUIRE(c->IsOpen());
+    clock += 2000;
+    e.h.Char(L'm');
+    e.h.KeyDown(key::Enter, 0);
+    CHECK_EQ(c->SelectedIndex(), 4);
+    REQUIRE(log.size() == 2);
+}

@@ -1,5 +1,6 @@
 #pragma once
 // ComboBox: closed box (text + chevron) and a light-dismiss popup list opened with UiHost::OpenPopup.
+#include <cstdint>
 #include <functional>
 #include <string>
 #include <vector>
@@ -13,6 +14,18 @@ namespace pui {
 /// rectangle clamped inside the client with `margin`. selectedIndex < 0 behaves like 0.
 RectF ComputeComboPopupRect(const RectF& box, int itemCount, int selectedIndex, float itemH, float padV, float minWidth,
                             SizeF client, float margin = 4);
+
+/// Explorer-style type-ahead. Characters typed within kTimeoutMs of each other form a prefix; the first item at or after
+/// `current` starting with it (case-insensitive, wrapping) is the match. A prefix of one repeated character instead
+/// cycles through the items starting with that character. Returns -1 when nothing matches.
+class TypeAhead {
+public:
+    static constexpr uint64_t kTimeoutMs = 1000;
+    int Next(wchar_t ch, uint64_t now, const std::vector<std::wstring>& items, int current);
+private:
+    std::wstring prefix_;
+    uint64_t last_ = 0;
+};
 
 class ComboBox : public Widget {
 public:
@@ -40,6 +53,7 @@ public:
     bool OnPointerDown(const PointerEvent& e) override;
     bool OnPointerUp(const PointerEvent& e) override;
     bool OnKeyDown(int vk, unsigned mods) override;
+    bool OnChar(wchar_t ch) override;
 
     bool SupportsExpandCollapse() const override { return true; }
     bool IsExpanded() const override { return IsOpen(); }
@@ -58,6 +72,7 @@ private:
     std::vector<std::wstring> items_;
     int selected_ = -1;
     Widget* popup_ = nullptr;
+    TypeAhead typeAhead_;
 };
 
 }

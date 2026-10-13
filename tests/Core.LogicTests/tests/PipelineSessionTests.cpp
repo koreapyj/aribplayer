@@ -62,6 +62,16 @@ TEST_CASE(PipelineSession_bit_depth_and_content) {
     CHECK(!PipelineSession::ContentOf(audioOnly).Known());
 }
 
+TEST_CASE(PipelineSession_progressive_only_for_declared_progressive) {
+    MediaInfo m = Info("h264", 1920, 1080, "yuv420p");
+    for (const char* fo : { "", "unknown", "tt", "bb", "tb", "bt" }) {
+        m.Streams.back().FieldOrder = fo;
+        CHECK(!PipelineSession::ContentOf(m).progressive);
+    }
+    m.Streams.back().FieldOrder = "progressive";
+    CHECK(PipelineSession::ContentOf(m).progressive);
+}
+
 TEST_CASE(PipelineSession_cache_and_changed_flag) {
     PipelineSession s;
     CHECK(!s.BeforeOpen("a.mp4").Known());

@@ -59,6 +59,7 @@ void App::WirePipeline() {
         // plan with what we know about this file (cached from an earlier open) before the options are built
         wvp::ContentInfo c = pipe_.BeforeOpen(url);
         svc_->filters.SetContent(c);
+        RefreshFiltersPanel(*this);
         SelectVideoGpuNow("open", false);
         ReportPlanProblem();
     };
@@ -85,12 +86,16 @@ void App::OnPipelinePrepared() {
     const std::string url = lastOpenUrl_;
     wvp::PipelineSession::Prepared pr = pipe_.OnPrepared(url, *mi);
     if (!pr.content.Known() || !svc_->filters.PlannerActive()) {
-        if (pr.content.Known()) svc_->filters.SetContent(pr.content);   // remembered for when capabilities arrive
+        if (pr.content.Known()) {
+            svc_->filters.SetContent(pr.content);   // remembered for when capabilities arrive
+            RefreshFiltersPanel(*this);
+        }
         return;
     }
     log::Event("pipeline", "content: " + pr.content.codec + " " + std::to_string(pr.content.width) + "x" + std::to_string(pr.content.height) + " " +
                                std::to_string(pr.content.bitDepth) + "-bit" + (pr.changed ? " (changed since the plan was made)" : ""));
     wvp::FilterChange ch = svc_->filters.SetContent(pr.content);
+    RefreshFiltersPanel(*this);
     if (ch.reopen) {
         if (!pipe_.ClaimContentReopen(url)) return;   // once per url chain: never loop
         if (const wvp::Plan* pl = svc_->filters.CurrentPlan()) log::Event("pipeline", "replanned for the content: " + pl->Summary() + " -> reopen");

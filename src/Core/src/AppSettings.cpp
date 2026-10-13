@@ -145,6 +145,18 @@ std::string SettingsStore::ToJson(const AppSettings& s) {
     w.Prop("debugLogging", s.debugLogging);
     w.Prop("showCaptions", s.showCaptions);
     w.Prop("showSuperimpose", s.showSuperimpose);
+    w.Key("subtitle").BeginObject();
+    w.Prop("font", s.subtitle.font);
+    w.Prop("fontScale", s.subtitle.fontScale);
+    w.Prop("primaryRgba", s.subtitle.primaryRgba);
+    w.Prop("outlineRgba", s.subtitle.outlineRgba);
+    w.Prop("outlineWidth", s.subtitle.outlineWidth);
+    w.Prop("overrideFont", s.subtitle.overrideFont);
+    w.Prop("overrideSize", s.subtitle.overrideSize);
+    w.Prop("overrideColors", s.subtitle.overrideColors);
+    w.Prop("overrideBorder", s.subtitle.overrideBorder);
+    w.Prop("overrideAss", s.subtitle.applyToAss);
+    w.EndObject();
     w.Prop("aribFont", s.aribFont);
     w.Prop("currentPlaylist", s.currentPlaylist);
     w.EndObject();
@@ -198,6 +210,26 @@ bool SettingsStore::FromJson(const std::string& utf8, AppSettings& out) {
     GetBool(r, "debugLogging", out.debugLogging);
     GetBool(r, "showCaptions", out.showCaptions);
     GetBool(r, "showSuperimpose", out.showSuperimpose);
+    if (auto* sub = Member(r, "subtitle", Value::Kind::Object)) {
+        SubtitleStyle& st = out.subtitle;
+        GetStr(*sub, "font", st.font);
+        if (st.font.empty() || st.font.size() > 127) st.font = SubtitleStyle{}.font;
+        GetNum(*sub, "fontScale", st.fontScale);
+        st.fontScale = std::clamp(st.fontScale, 0.25, 4.0);
+        GetNum(*sub, "outlineWidth", st.outlineWidth);
+        st.outlineWidth = std::clamp(st.outlineWidth, 0.0, 20.0);
+        auto rgba = [&](const char* k, std::uint32_t& dst) {
+            if (auto* v = Member(*sub, k, Value::Kind::Number))
+                if (std::isfinite(v->n)) dst = (std::uint32_t)std::clamp(v->n, 0.0, 4294967295.0);
+        };
+        rgba("primaryRgba", st.primaryRgba);
+        rgba("outlineRgba", st.outlineRgba);
+        GetBool(*sub, "overrideFont", st.overrideFont);
+        GetBool(*sub, "overrideSize", st.overrideSize);
+        GetBool(*sub, "overrideColors", st.overrideColors);
+        GetBool(*sub, "overrideBorder", st.overrideBorder);
+        GetBool(*sub, "overrideAss", st.applyToAss);
+    }
     GetStr(r, "aribFont", out.aribFont);
     GetStr(r, "currentPlaylist", out.currentPlaylist);
     return true;

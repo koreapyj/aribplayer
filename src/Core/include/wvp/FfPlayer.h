@@ -86,6 +86,11 @@ public:
     // Asynchronous timed skip to the closest key packet; completion is KeyframeSeekDone. Same slot as SeekKeyframe.
     int Skip(double seconds) override;
     int CycleStream(StreamType type) override;
+    int SelectStream(StreamType type, int index) override;
+    int AddSubtitleFile(const std::string& utf8Path) override;
+    int SetSubtitleDelay(std::int64_t ms) override;
+    std::int64_t SubtitleDelay() const override;
+    int SetSubtitleStyle(const SubtitleStyle& style) override;
     int SetAudioPreference(int pref) override;
     int AudioPreference() const override { return audioPref_.load(); }
     int SetSubtitleVisible(SubtitleLayer layer, bool on) override;

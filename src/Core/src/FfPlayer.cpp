@@ -1,6 +1,7 @@
 #include "wvp/FfPlayer.h"
 
 #include <cmath>
+#include <cstdio>
 #include <unordered_map>
 #include <vector>
 
@@ -338,6 +339,46 @@ int FfPlayer::CycleStream(StreamType type) {
     default: return FFP_EINVAL;
     }
     return ffp_cycle_stream(p_, t);
+}
+
+int FfPlayer::SelectStream(StreamType type, int index) {
+    if (!p_) return FFP_EINVAL;
+    int t;
+    switch (type) {
+    case StreamType::Video: t = FFP_STREAM_VIDEO; break;
+    case StreamType::Audio: t = FFP_STREAM_AUDIO; break;
+    case StreamType::Subtitle: t = FFP_STREAM_SUBTITLE; break;
+    default: return FFP_EINVAL;
+    }
+    return ffp_select_stream(p_, t, index);
+}
+
+int FfPlayer::AddSubtitleFile(const std::string& utf8Path) {
+    if (!p_ || utf8Path.empty()) return FFP_EINVAL;
+    return ffp_add_subtitle_file(p_, utf8Path.c_str());
+}
+
+int FfPlayer::SetSubtitleDelay(std::int64_t ms) {
+    return p_ ? ffp_set_subtitle_delay(p_, ms) : FFP_EINVAL;
+}
+
+std::int64_t FfPlayer::SubtitleDelay() const {
+    return p_ ? ffp_get_subtitle_delay(p_) : 0;
+}
+
+int FfPlayer::SetSubtitleStyle(const SubtitleStyle& style) {
+    if (!p_) return FFP_EINVAL;
+    FFPSubtitleStyle s{};
+    s.struct_size = (int)sizeof(s);
+    std::snprintf(s.font_family, sizeof(s.font_family), "%s", style.font.c_str());
+    s.font_scale = style.fontScale;
+    s.primary_rgba = style.primaryRgba;
+    s.outline_rgba = style.outlineRgba;
+    s.outline_width = style.outlineWidth;
+    s.override_flags = (style.overrideFont ? FFP_SUBSTYLE_FONT : 0u) | (style.overrideSize ? FFP_SUBSTYLE_SIZE : 0u)
+                     | (style.overrideColors ? FFP_SUBSTYLE_COLORS : 0u) | (style.overrideBorder ? FFP_SUBSTYLE_BORDER : 0u);
+    s.apply_to_ass = style.applyToAss ? 1 : 0;
+    return ffp_set_subtitle_style(p_, &s);
 }
 
 int FfPlayer::SetAudioPreference(int pref) {
