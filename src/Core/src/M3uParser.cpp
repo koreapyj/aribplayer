@@ -3,7 +3,12 @@
 #include "wvp/Platform.h"
 #include "wvp/Utf8.h"
 
+// Apple's libc++ provides floating-point from_chars only from macOS 26.
+#ifdef __APPLE__
+#include <fast_float/fast_float.h>
+#else
 #include <charconv>
+#endif
 #include <cmath>
 
 namespace wvp {
@@ -134,7 +139,11 @@ void ParseExtInf(std::string_view s, std::optional<double>& duration, std::strin
         const char* first = num.data() + (num[0] == '+' ? 1 : 0);
         const char* last = num.data() + num.size();
         double d = 0;
+#ifdef __APPLE__
+        auto [end, ec] = fast_float::from_chars(first, last, d);
+#else
         auto [end, ec] = std::from_chars(first, last, d);
+#endif
         if (ec == std::errc() && end == last && std::isfinite(d) && d > 0) duration = d;
     }
     bool inQ = false;
