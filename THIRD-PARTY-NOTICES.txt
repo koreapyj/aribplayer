@@ -27,6 +27,9 @@ Libraries included in ARIB Player
 - curl (libcurl) 8.22.0 - curl License, Copyright (c) 1996 - 2026, Daniel
   Stenberg, <daniel@haxx.se>, and many contributors
   https://curl.se/
+- fast_float 8.3.2 - BSL-1.0, Copyright (c) 2021 The fast_float authors
+  Used on macOS for M3U duration parsing.
+  https://github.com/fastfloat/fast_float/releases/tag/v8.3.2
 
 
 Libraries included in the FFmpeg and libffplay DLLs (libass and its dependencies render subtitles in libffplay)

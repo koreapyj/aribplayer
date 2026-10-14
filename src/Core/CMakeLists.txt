@@ -13,6 +13,9 @@ file(GLOB PLAYER_CORE_LOGIC_HEADERS CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DI
 list(REMOVE_ITEM PLAYER_CORE_LOGIC_HEADERS "${CMAKE_CURRENT_SOURCE_DIR}/include/wvp/FfPlayer.h")
 
 add_library(PlayerCoreLogic STATIC ${PLAYER_CORE_LOGIC_SOURCES} ${PLAYER_CORE_LOGIC_HEADERS})
+if(APPLE)
+    target_include_directories(PlayerCoreLogic SYSTEM PRIVATE "${WVP_ROOT}/third_party")
+endif()
 wvp_output_dirs(PlayerCoreLogic)
 # A static library has no link step, so its compiler PDB is the one that ships next to the .lib.
 set_target_properties(PlayerCoreLogic PROPERTIES

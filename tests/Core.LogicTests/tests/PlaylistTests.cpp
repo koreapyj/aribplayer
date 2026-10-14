@@ -2,6 +2,8 @@
 
 #include <cstdint>
 #include <functional>
+#include <limits>
+#include <locale>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -252,6 +254,56 @@ TEST_CASE(M3u_ParsesExtinfTitleAndDurationAndSkipsOtherComments) {
     CHECK_EQ(pl.items[1].url, std::string("http://h/x.ts"));
     CHECK_EQ(pl.items[2].url, std::string("http://h/lists/plain.mp4"));
     CHECK(pl.items[2].title.empty());
+}
+
+TEST_CASE(M3u_ExtInfParsesPositiveDurations) {
+    struct { const char* text; double duration; } cases[] = {
+        { "123", 123.0 }, { "123.5", 123.5 }, { "+123.5", 123.5 },
+        { "1.25e2", 125.0 }, { "+1E-2", 0.01 }, { ".5", 0.5 }, { "1.", 1.0 },
+        { "1e-310", 1e-310 }, { "5e-324", std::numeric_limits<double>::denorm_min() },
+        { "2.2250738585072013e-308", std::numeric_limits<double>::min() },
+        { "995099695728527255600758247104066505033869613739299874415889206266."
+          "879463863002444896015951673680700954524031837595747283233435790300850", 0x1.2e5e81f350442p+219 },
+    };
+    for (const auto& c : cases) {
+        auto pl = M3uParser::Parse(std::string("#EXTINF:") + c.text + ",Title\nhttp://h/a.ts\n");
+        REQUIRE(pl.items.size() == 1);
+        REQUIRE_MSG(pl.items[0].duration.has_value(), c.text);
+        CHECK_EQ(*pl.items[0].duration, c.duration);
+        CHECK_EQ(pl.items[0].title, "Title");
+    }
+}
+
+TEST_CASE(M3u_ExtInfLeavesInvalidDurationsUnset) {
+    for (const char* text : { "", "-1", "0", "-0", "+0", "garbage", "1junk", "1e", "1e+", ".",
+                             "inf", "+inf", "nan", "0x1", "0x1p0", "++1", "+ 1", "+\v1",
+                             "1e309", "1e-400" }) {
+        auto pl = M3uParser::Parse(std::string("#EXTINF:5,Previous\n#EXTINF:") + text + ",Title\nhttp://h/a.ts\n");
+        REQUIRE(pl.items.size() == 1);
+        CHECK_MSG(!pl.items[0].duration.has_value(), text);
+        CHECK_EQ(pl.items[0].title, "Title");
+    }
+}
+
+TEST_CASE(M3u_ExtInfIgnoresGlobalDecimalSeparator) {
+    struct CommaPunct : std::numpunct<char> {
+        char do_decimal_point() const override { return ','; }
+        char do_thousands_sep() const override { return '.'; }
+        std::string do_grouping() const override { return "\3"; }
+    };
+    struct RestoreLocale {
+        std::locale previous = std::locale();
+        ~RestoreLocale() { std::locale::global(previous); }
+    } restore;
+    std::locale::global(std::locale(std::locale::classic(), new CommaPunct));
+    CHECK_EQ(std::use_facet<std::numpunct<char>>(std::locale()).decimal_point(), ',');
+
+    auto pl = M3uParser::Parse("#EXTINF:123.5,Decimal\nhttp://h/a.ts\n#EXTINF:+1.25e2,Exponent\nhttp://h/b.ts\n#EXTINF:1,5,Title\nhttp://h/c.ts\n");
+    REQUIRE(pl.items.size() == 3);
+    CHECK(pl.items[0].duration.has_value() && *pl.items[0].duration == 123.5);
+    CHECK(pl.items[1].duration.has_value() && *pl.items[1].duration == 125.0);
+    CHECK(pl.items[2].duration.has_value() && *pl.items[2].duration == 1.0);
+    CHECK_EQ(pl.items[2].title, "5,Title");
 }
 
 TEST_CASE(M3u_ResolvesAgainstHttpBase) {
