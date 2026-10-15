@@ -156,6 +156,7 @@ typedef struct OverlayRectGeom { int x, y, width, height; } OverlayRectGeom;
     unsigned gate_gen;              /* bumped by a staleness reset: older tickets no longer count */
     int64_t last_retire_us;
     dispatch_queue_t view_change_queue;
+    atomic_int view_change_retry_pending;   /* a skipped view-change redraw is scheduled again */
 
     /* per open */
     int is_open;
@@ -195,7 +196,7 @@ typedef struct OverlayRectGeom { int x, y, width, height; } OverlayRectGeom;
     atomic_int inflight_cbs;        /* display command buffers whose completed handler has not finished */
     atomic_uint_fast64_t frames_presented, frames_direct, frames_uploaded, copies_total;
     atomic_uint_fast64_t skipped_timeout, skipped_gpu, skipped_display, gate_resets;
-    atomic_uint_fast64_t dropped_no_drawable, dropped_hidden, redraws, view_change_redraws;
+    atomic_uint_fast64_t dropped_no_drawable, dropped_hidden, redraws, view_change_redraws, view_change_retries;
     atomic_uint_fast64_t render_encoders, blit_encoders;
     atomic_uint_fast64_t zero_copy_verified, zero_copy_mismatch;
     atomic_uint_fast64_t frames_completed, gpu_us_total, present_wait_us_max, present_wait_us_total;
@@ -1355,6 +1356,23 @@ fail:
     last_scale = layer.contentsScale;
 }
 
+/* A view-change redraw that the drawable gate skipped (GPU or display behind, no drawable) runs again one refresh
+ * later, until the held picture matches the view, the media closes or nothing is held. At most one retry is queued. */
+- (void)retryViewChangeLater
+{
+    __weak FFPMetalPresenterObj *weak = self;
+    if (atomic_exchange(&view_change_retry_pending, 1))
+        return;
+    atomic_fetch_add(&view_change_retries, 1);
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, refresh_us * NSEC_PER_USEC), view_change_queue, ^{
+        FFPMetalPresenterObj *s = weak;
+        if (!s)
+            return;
+        atomic_store(&s->view_change_retry_pending, 0);
+        [s viewChanged];
+    });
+}
+
 /* a held picture follows the host's drawableSize / contentsScale after a view change */
 - (void)viewChanged
 {
@@ -1384,6 +1402,8 @@ fail:
         else if (ret < 0 && sink.failed)
             sink.failed(sink.engine, err, atomic_load(&device_lost), atomic_load(&device_lost) ? lost_reason : NULL);
         pthread_mutex_unlock(&lock);
+        if (ret == 1)
+            [self retryViewChangeLater];
     }
 }
 
@@ -1660,6 +1680,7 @@ done:
         "\"skipped_display\":%" PRIu64 ",\"gate_resets\":%" PRIu64 ",\"pending_drawables\":%d,"
         "\"dropped_no_drawable\":%" PRIu64 ","
         "\"dropped_hidden\":%" PRIu64 ",\"redraws\":%" PRIu64 ",\"view_change_redraws\":%" PRIu64 ","
+        "\"view_change_retries\":%" PRIu64 ","
         "\"presented_calls\":%" PRIu64 ",\"render_encoders\":%" PRIu64 ",\"blit_encoders\":%" PRIu64 ","
         "\"zero_copy_verified\":%" PRIu64 ",\"zero_copy_mismatch\":%" PRIu64 ","
         "\"frames_held\":%d,\"inflight_max\":%d,\"held_now\":%d,\"held_max\":%d,\"held_pts\":%s,\"held_serial\":%d,"
@@ -1679,6 +1700,7 @@ done:
         (uint64_t)atomic_load(&gate_resets), pending,
         (uint64_t)atomic_load(&dropped_no_drawable), (uint64_t)atomic_load(&dropped_hidden),
         (uint64_t)atomic_load(&redraws), (uint64_t)atomic_load(&view_change_redraws),
+        (uint64_t)atomic_load(&view_change_retries),
         (uint64_t)atomic_load(&presented_count), (uint64_t)atomic_load(&render_encoders),
         (uint64_t)atomic_load(&blit_encoders),
         (uint64_t)atomic_load(&zero_copy_verified), (uint64_t)atomic_load(&zero_copy_mismatch),
@@ -1699,7 +1721,7 @@ done:
 {
     int i;
     if (view_change_queue)
-        dispatch_sync(view_change_queue, ^{});     /* no queued view-change redraw runs after this */
+        dispatch_sync(view_change_queue, ^{});     /* queued redraws are done; a later retry finds nothing open */
     if (wake_timer) {
         dispatch_source_cancel(wake_timer);
         dispatch_sync(wake_queue, ^{});

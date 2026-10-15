@@ -1137,6 +1137,7 @@ static int test_e(void)
     Clip c;
     PlayResult r;
     int w, h, i, n, k, found;
+    int64_t retries0, retries;
     double scale0, scale1;
     FFPPresentedInfo pi;
 
@@ -1167,6 +1168,7 @@ static int test_e(void)
     NOTE("mid-play resize -> drawable %dx%d: %d of the following presented() report it", w, h, found);
     /* paused: no present() calls; the presenter redraws the held picture and reports the new size by itself */
     n = sink_count();
+    retries0 = json_int(get_stats(), "view_change_retries");
     host_set_content_size(640, 360);
     host_drawable_size(&w, &h);
     for (i = 0; i < 100 && sink_count() == n; i++)
@@ -1175,8 +1177,9 @@ static int test_e(void)
     CHECK(sink_count() > n && pi.video_width == w && pi.video_height == h,
           "paused resize to 640x360 points: presented() %dx%d after %d ms (expected %dx%d)", pi.video_width,
           pi.video_height, i * 10, w, h);
-    NOTE("paused resize -> drawable %dx%d: presented() %dx%d without a present() call (%d ms)", w, h, pi.video_width,
-         pi.video_height, i * 10);
+    NOTE("paused resize -> drawable %dx%d: presented() %dx%d without a present() call (%d ms, %" PRId64
+         " gate-skipped redraw retries)", w, h, pi.video_width, pi.video_height, i * 10,
+         json_int(get_stats(), "view_change_retries") - retries0);
     /* backing scale change while paused (simulated: contentsScale 1 <-> 2, drawableSize follows; the window may start on a
      * 1x or a Retina screen, so the scale goes to the other one) */
     scale0 = g_layer.contentsScale;
@@ -1198,6 +1201,30 @@ static int test_e(void)
     pi = sink_last();
     CHECK(pi.video_width == w && pi.video_height == h, "playing at scale %.0f: presented %dx%d", scale1, pi.video_width,
           pi.video_height);
+    /* paused resize while the GPU is behind (simulated 200 ms per command buffer; three unpaced presents take both
+     * in-flight slots): the gate skips the first redraw, a retry shows it once a slot frees */
+    ffp_metal_presenter_test_set_gpu_latency(g_pres, 200000);
+    r = play_clip(&c, 3, 0, NULL);
+    n = sink_count();
+    retries0 = json_int(get_stats(), "view_change_retries");
+    host_set_content_size(720, 405);
+    host_drawable_size(&w, &h);
+    for (i = 0; i < 100; i++) {
+        pi = sink_last();
+        if (sink_count() > n && pi.video_width == w && pi.video_height == h)
+            break;
+        av_usleep(10000);
+    }
+    pi = sink_last();
+    retries = json_int(get_stats(), "view_change_retries") - retries0;
+    ffp_metal_presenter_test_set_gpu_latency(g_pres, 0);
+    CHECK(retries > 0, "GPU behind: the gate skipped the paused redraw and it was retried (%" PRId64 " retries)", retries);
+    CHECK(sink_count() > n && pi.video_width == w && pi.video_height == h,
+          "GPU behind: paused resize to 720x405 points: presented() %dx%d after %d ms (expected %dx%d)", pi.video_width,
+          pi.video_height, i * 10, w, h);
+    NOTE("GPU behind: paused resize -> drawable %dx%d: presented() %dx%d after %" PRId64 " redraw retries (%d ms)", w, h,
+         pi.video_width, pi.video_height, retries, i * 10);
+    av_usleep(250000);
     host_set_scale(scale0);
     host_set_content_size(960, 540);
     av_usleep(150000);

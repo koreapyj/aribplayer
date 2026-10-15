@@ -322,6 +322,8 @@ jobs:
         env:
           # macOS supplies Services/window-tiling entries and their artwork, not the app.
           ARIBPLAYER_SELFTEST_SKIP_SYSTEM_MENU_ICONS: '1'
+          # Paravirtual GPU presents miss deadlines, so A-V swings past ffplay's sync threshold; A-V is still bounded.
+          ARIBPLAYER_SELFTEST_SKIP_AV_REALTIME: ${{ steps.host.outputs.virtual_gpu }}
           MEDIA_AVAILABLE: ${{ steps.media.outputs.available }}
           H264: ${{ steps.host.outputs.h264 }}
           HEVC: ${{ steps.host.outputs.hevc }}

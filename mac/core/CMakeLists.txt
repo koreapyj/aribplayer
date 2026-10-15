@@ -21,6 +21,7 @@ list(APPEND WVP_CORE_LOGIC_SOURCES "${WVP_CORE_ROOT}/src/posix/Platform.cpp")
 
 add_library(wvp_core_logic STATIC ${WVP_CORE_LOGIC_SOURCES})
 target_include_directories(wvp_core_logic PUBLIC "${WVP_CORE_ROOT}/include")
+target_include_directories(wvp_core_logic SYSTEM PRIVATE "${WVP_CORE_ROOT}/../../third_party")
 target_compile_features(wvp_core_logic PUBLIC cxx_std_20)
 target_compile_options(wvp_core_logic PRIVATE -Wall -Wextra "-include${WVP_MAC_CLOCK_CAST_HEADER}")
 set_source_files_properties("${WVP_CORE_ROOT}/src/posix/Platform.cpp" PROPERTIES OBJECT_DEPENDS "${WVP_MAC_CLOCK_CAST_HEADER}")

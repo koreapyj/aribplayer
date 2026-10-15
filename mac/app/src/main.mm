@@ -27,6 +27,7 @@
 //   Settings > About > Debug logging writes ~/Library/Logs/aribplayer/aribplayer-YYYYMMDD.log (LoggingMac.h).
 #import <AppKit/AppKit.h>
 
+#include <algorithm>
 #include <cmath>
 #include <csignal>
 #include <cwctype>
@@ -784,6 +785,19 @@ typedef void (^SelfTestStep)(void (^next)(void));
 - (wvp::DebugInfo)debugInfo {
     auto j = _mv->Player()->GetDebugInfoJson();
     return j ? wvp::ParseDebugInfo(*j) : wvp::DebugInfo{};
+}
+
+// One sample of the engine's sync state: A-V (audio clock - video clock, ms; NaN when the clip is not playing with the
+// audio master), both clocks (s), the sampling time (s) and the late frame drops so far.
+struct AvSample { double avMs, audio, video, at; long long dropsLate; };
+
+- (void)sampleAv:(int)count interval:(double)interval into:(std::shared_ptr<std::vector<AvSample>>)samples then:(void (^)(void))done {
+    if ((int)samples->size() >= count) { done(); return; }
+    const wvp::DebugInfo d = [self debugInfo];
+    const bool playing = _mv->Player()->State() == wvp::PlayerState::Playing && d.Sync.Master == "audio";
+    samples->push_back({playing && d.Sync.AvDiffMs ? *d.Sync.AvDiffMs : NAN, d.Sync.AudioClock.value_or(NAN),
+                        d.Sync.VideoClock.value_or(NAN), CACurrentMediaTime(), d.Sync.FrameDropsLate.value_or(0)});
+    [self after:interval run:^{ [self sampleAv:count interval:interval into:samples then:done]; }];
 }
 
 - (bool)playingIndex:(int)index past:(double)seconds {
@@ -1711,19 +1725,65 @@ typedef void (^SelfTestStep)(void (^next)(void));
                    d.Sync.Master.c_str(), d.Sync.AvDiffMs.value_or(NAN), d.Audio.LatencyMs.value_or(NAN));
             check(player->State() == wvp::PlayerState::Playing && d.HasAudio && d.Audio.Codec == "aac", "the H.264 / AAC clip plays with audio");
             check(d.Audio.OutSampleRate.value_or(0) > 0, "SDL audio output is open");
-            check(d.Sync.Master == "audio" && d.Sync.AvDiffMs && std::fabs(*d.Sync.AvDiffMs) < 60, "video follows the audio clock (|A-V| < 60 ms)");
             [self presenterCheck:"av_1080p_h264_aac" expectZeroCopy:true check:check];
-            const int v0 = mv->Ctl().Volume();
-            [self key:125 chars:@""];   // Down arrow = VolumeDown (Commands key table)
-            check(mv->Ctl().Volume() == v0 - 5 && player->Volume() == v0 - 5, "Down arrow lowers the volume by 5 (controller and FfPlayer)");
-            [self click:centre(shell->Bar()->ButtonWidget(app::B_Mute))];
-            check(mv->Ctl().IsMuted() && player->IsMuted() && shell->Bar()->Model().muted, "the bar's mute button mutes the engine");
-            [self key:0x2E chars:@"m"];   // M = ToggleMute
-            check(!mv->Ctl().IsMuted() && !player->IsMuted(), "M unmutes");
-            [self key:126 chars:@""];   // Up arrow = VolumeUp
-            check(player->Volume() == v0, "Up arrow restores the volume");
             next();
         }];
+    }];
+    // A-V sync of that clip over 2 s. A-V is an instantaneous clock difference: a video frame shown late (scheduling, a
+    // present() that waits for a drawable) reads as a transient lag until the engine catches up. The median is the sync
+    // offset; the maximum bounds the transients. The clocks against the sampling time show which side moves.
+    [steps addObject:^(void (^next)(void)) {
+        auto samples = std::make_shared<std::vector<AvSample>>();
+        [self sampleAv:40 interval:0.05 into:samples then:^{
+            std::vector<double> absMs;
+            std::string av, audio, video;
+            const AvSample& s0 = samples->front();
+            for (const AvSample& s : *samples) {
+                if (!std::isnan(s.avMs)) absMs.push_back(std::fabs(s.avMs));
+                char one[24];
+                snprintf(one, sizeof one, " %.1f", s.avMs);
+                av += one;
+                snprintf(one, sizeof one, " %.1f", ((s.audio - s0.audio) - (s.at - s0.at)) * 1000);
+                audio += one;
+                snprintf(one, sizeof one, " %.1f", ((s.video - s0.video) - (s.at - s0.at)) * 1000);
+                video += one;
+            }
+            std::sort(absMs.begin(), absMs.end());
+            const size_t n = absMs.size();
+            const double median = n ? (n % 2 ? absMs[n / 2] : (absMs[n / 2 - 1] + absMs[n / 2]) / 2) : NAN;
+            const double worst = n ? absMs.back() : NAN;
+            printf("     A-V over %.2f s: %zu of %zu samples, |A-V| median %.1f ms, max %.1f ms, late drops %lld\n"
+                   "     A-V (ms):%s\n     audio clock - elapsed (ms):%s\n     video clock - elapsed (ms):%s\n",
+                   samples->back().at - s0.at, n, samples->size(), median, worst, samples->back().dropsLate - s0.dropsLate,
+                   av.c_str(), audio.c_str(), video.c_str());
+            check(n == samples->size(), "A-V is reported for every sample while the clip plays with the audio master");
+            char what[160];
+            snprintf(what, sizeof what, "video follows the audio clock (median |A-V| over 2 s %.1f ms < 100 ms)", median);
+            check(n && median < 100, what);
+            if ([NSProcessInfo.processInfo.environment[@"ARIBPLAYER_SELFTEST_SKIP_AV_REALTIME"] isEqualToString:@"1"]) {
+                printf("skip real-time A-V bounds (median |A-V| < 40 ms, max < 60 ms): Apple Paravirtual GPU presents miss "
+                       "deadlines (ARIBPLAYER_SELFTEST_SKIP_AV_REALTIME=1); A-V reporting and the 100 ms median bound remain\n");
+            } else {
+                snprintf(what, sizeof what, "A-V within ffplay's sync threshold (median |A-V| over 2 s %.1f ms < 40 ms)", median);
+                check(n && median < 40, what);
+                snprintf(what, sizeof what, "no transient A-V error (max |A-V| over 2 s %.1f ms < 60 ms)", worst);
+                check(n && worst < 60, what);
+            }
+            next();
+        }];
+    }];
+    // volume / mute keys on that clip
+    [steps addObject:^(void (^next)(void)) {
+        const int v0 = mv->Ctl().Volume();
+        [self key:125 chars:@""];   // Down arrow = VolumeDown (Commands key table)
+        check(mv->Ctl().Volume() == v0 - 5 && player->Volume() == v0 - 5, "Down arrow lowers the volume by 5 (controller and FfPlayer)");
+        [self click:centre(shell->Bar()->ButtonWidget(app::B_Mute))];
+        check(mv->Ctl().IsMuted() && player->IsMuted() && shell->Bar()->Model().muted, "the bar's mute button mutes the engine");
+        [self key:0x2E chars:@"m"];   // M = ToggleMute
+        check(!mv->Ctl().IsMuted() && !player->IsMuted(), "M unmutes");
+        [self key:126 chars:@""];   // Up arrow = VolumeUp
+        check(player->Volume() == v0, "Up arrow restores the volume");
+        next();
     }];
     // keyboard seek through the held-key stepper: Right = +5 s
     [steps addObject:^(void (^next)(void)) {

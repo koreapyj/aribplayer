@@ -14,8 +14,9 @@
  *  - open / present / clear / close follow the FFPPresenter contract (never concurrent, any thread). accepts,
  *    readback, stats_json and device_lost are safe at any time, concurrently with them.
  *  - The host calls ffp_metal_presenter_view_changed() after updating drawableSize / contentsScale on the main
- *    thread: a private queue redraws the held picture at the new size and calls sink->presented() with the new size,
- *    so the engine re-renders its captions and sends a redraw present.
+ *    thread: a private queue redraws the held picture at the new size (again every refresh while the GPU or display
+ *    is behind) and calls sink->presented() with the new size, so the engine re-renders its captions and sends a
+ *    redraw present.
  *
  * Display path (one render pass, zero-copy for VideoToolbox frames): CVPixelBuffer (IOSurface, data[3]) ->
  * CVMetalTextureCacheCreateTextureFromImage per plane -> ONE MTLRenderCommandEncoder into the layer's drawable
@@ -64,8 +65,9 @@ void ffp_metal_presenter_destroy(FFPPresenter *p);
 /* The host calls this on the main thread after updating the layer's drawableSize / contentsScale (from
  * viewDidChangeBackingProperties, setFrameSize: / layout, or a display change). If a picture is held, the presenter
  * redraws it at the new size and calls presented() with the new drawable size so the engine re-renders captions.
- * Safe any time, including when nothing is open; NULL ok. Never blocks the main thread on GPU work: the redraw is
- * dispatched to the presenter's private queue. */
+ * A redraw the drawable gate skips (GPU or display behind) runs again every refresh until the held picture matches
+ * the view (stats "view_change_retries" counts the retries). Safe any time, including when nothing is open; NULL ok.
+ * Never blocks the main thread on GPU work: the redraw is dispatched to the presenter's private queue. */
 void ffp_metal_presenter_view_changed(FFPPresenter *presenter);
 
 /* --- debug / test hooks (not part of the engine contract) --- */
