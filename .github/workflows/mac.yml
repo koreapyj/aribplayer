@@ -64,7 +64,8 @@ jobs:
   mac:
     name: App and DMG (macOS, arm64)
     needs: version
-    # Shared Core's floating-point std::from_chars uses macOS 26's libc++.
+    # Builds with Xcode 26.3 for macOS 13.3 and later (mac/cmake/MacDeploymentTarget.cmake); mac-dmg-test runs the DMG on
+    # older macOS.
     runs-on: macos-26
     timeout-minutes: 90
     env:
@@ -92,31 +93,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cat > "$RUNNER_TEMP/host.m" <<'OBJC'
-          #import <Foundation/Foundation.h>
-          #import <VideoToolbox/VideoToolbox.h>
-          #import <Metal/Metal.h>
-          #import <ApplicationServices/ApplicationServices.h>
-          int main(void) {
-              @autoreleasepool {
-                  BOOL h264 = VTIsHardwareDecodeSupported(kCMVideoCodecType_H264);
-                  BOOL hevc = VTIsHardwareDecodeSupported(kCMVideoCodecType_HEVC);
-                  id<MTLDevice> device = MTLCreateSystemDefaultDevice();
-                  BOOL virtualGPU = device && [device.name containsString:@"Paravirtual"];
-                  NSDictionary *session = CFBridgingRelease(CGSessionCopyCurrentDictionary());
-                  BOOL gui = [session[(__bridge NSString *)kCGSessionOnConsoleKey] boolValue] &&
-                             [session[(__bridge NSString *)kCGSessionLoginDoneKey] boolValue];
-                  printf("VTIsHardwareDecodeSupported: H.264=%d HEVC=%d\n", h264, hevc);
-                  printf("Metal device: %s\n", device ? device.name.UTF8String : "none");
-                  printf("GUI session available: %d; %s\n", gui, session.description.UTF8String ?: "none");
-                  FILE *out = fopen(getenv("GITHUB_OUTPUT"), "a");
-                  if (!out) return 1;
-                  fprintf(out, "h264=%d\nhevc=%d\nmetal=%d\ngui=%d\nvirtual_gpu=%d\n", h264, hevc, device != nil, gui, virtualGPU);
-                  fclose(out);
-              }
-          }
-          OBJC
-          xcrun clang -fobjc-arc "$RUNNER_TEMP/host.m" -o "$RUNNER_TEMP/host" \
+          xcrun clang -fobjc-arc .github/scripts/mac-host-probe.m -o "$RUNNER_TEMP/host" \
             -framework Foundation -framework VideoToolbox -framework Metal -framework ApplicationServices
           "$RUNNER_TEMP/host"
           launchctl print "gui/$(id -u)" > "$RUNNER_TEMP/gui-session.log" 2>&1 || true
@@ -170,22 +147,11 @@ jobs:
           set -euo pipefail
           ffmpeg="$PWD/ffmpeg/dist/darwin-arm64/ffmpeg"
           "$ffmpeg" -hide_banner -encoders | tee "$RUNNER_TEMP/encoders.log"
-          # A compiled-in encoder is not evidence that the VM exposes the hardware.
-          available=1
-          for spec in 'h264_videotoolbox high nv12 1920x1080' \
-                      'hevc_videotoolbox main10 p010le 1920x1080' \
-                      'hevc_videotoolbox main10 p010le 7680x4320'; do
-            read -r codec profile format size <<< "$spec"
-            if "$ffmpeg" -hide_banner -nostdin -v warning -f lavfi \
-              -i "color=size=$size:rate=30,format=$format" -frames:v 1 \
-              -c:v "$codec" -profile:v "$profile" -allow_sw 0 -f null -; then
-              echo "Hardware encode supported: $spec"
-            else
-              echo "Hardware encode unavailable: $spec"
-              available=0
-            fi
-          done
-          echo "available=$available" >> "$GITHUB_OUTPUT"
+          if mac/app/make-testmedia.sh --check; then
+            echo 'available=1' >> "$GITHUB_OUTPUT"
+          else
+            echo 'available=0' >> "$GITHUB_OUTPUT"
+          fi
       - name: Build presenter and platform
         shell: bash
         run: |
@@ -209,6 +175,20 @@ jobs:
           path: .tmp/dist-mac/*.dmg
           if-no-files-found: error
           retention-days: 14
+      - name: Pass the FFmpeg tools to the DMG tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          # A tarball keeps the executable bits and the dylib symlinks; the tools find the dylibs through @executable_path.
+          cd ffmpeg/dist/darwin-arm64
+          tar -czf "$RUNNER_TEMP/darwin-ffmpeg-tools.tar.gz" ffmpeg ffprobe lib*.dylib
+      - name: Upload the FFmpeg tools for the DMG tests
+        uses: actions/upload-artifact@v4
+        with:
+          name: darwin-ffmpeg-tools
+          path: ${{ runner.temp }}/darwin-ffmpeg-tools.tar.gz
+          if-no-files-found: error
+          retention-days: 1
       - name: Build portable Core logic tests
         shell: bash
         run: |
@@ -287,6 +267,14 @@ jobs:
           else
             echo '::notice::SKIP make-testmedia.sh: hardware VideoToolbox H.264 / HEVC Main10 encoding (including 8K) is unavailable.'
           fi
+      - name: Upload test media for the DMG tests
+        if: steps.media.outputs.available == '1'
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-testmedia
+          path: ${{ runner.temp }}/media
+          if-no-files-found: error
+          retention-days: 1
       - name: Run presenter harness
         timeout-minutes: 10
         shell: bash
@@ -353,6 +341,149 @@ jobs:
             ${{ runner.temp }}/ffmpeg-work/build/ffbuild/config.log
             ${{ runner.temp }}/encoders.log
             ${{ runner.temp }}/gui-session.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+  mac-dmg-test:
+    name: DMG self-test (macOS ${{ matrix.macos }}, arm64)
+    needs: mac
+    # Release publishing does not wait for these jobs, as Build MSI publishes without running tests.
+    strategy:
+      fail-fast: false
+      matrix:
+        macos: ['14', '15']
+    runs-on: macos-${{ matrix.macos }}
+    timeout-minutes: 30
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install test dependencies
+        timeout-minutes: 10
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = arm64
+          sw_vers
+          xcodebuild -version
+          brew install coreutils
+      - name: Diagnose VideoToolbox, Metal and GUI session
+        id: host
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcrun clang -fobjc-arc .github/scripts/mac-host-probe.m -o "$RUNNER_TEMP/host" \
+            -framework Foundation -framework VideoToolbox -framework Metal -framework ApplicationServices
+          "$RUNNER_TEMP/host"
+      - uses: actions/download-artifact@v4
+        with:
+          name: aribplayer-dmg
+          path: ${{ runner.temp }}/dmg-artifact
+      - name: Mount the DMG and check its minimum macOS
+        id: dmg
+        shell: bash
+        run: |
+          set -euo pipefail
+          dmgs=("$RUNNER_TEMP"/dmg-artifact/ARIB-Player-*-macos-arm64.dmg)
+          test "${#dmgs[@]}" -eq 1 && test -s "${dmgs[0]}"
+          hdiutil attach -nobrowse -noautoopen -readonly -mountpoint "$RUNNER_TEMP/dmg" "${dmgs[0]}"
+          app="$RUNNER_TEMP/dmg/ARIB Player.app"
+          min="$(/usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' "$app/Contents/Info.plist")"
+          echo "LSMinimumSystemVersion: $min"
+          test "$min" = 13.3
+          version_le() {
+            awk -v a="$1" -v b="$2" 'BEGIN { split(a, x, "."); split(b, y, "."); for (i = 1; i <= 3; i++) { if (x[i] + 0 != y[i] + 0) exit !(x[i] + 0 < y[i] + 0) } }'
+          }
+          count=0
+          while IFS= read -r -d '' file; do
+            file -b "$file" | grep -q 'Mach-O' || continue
+            minos="$(xcrun vtool -show-build "$file" | awk '$1 == "minos" { print $2; exit }')"
+            echo "minos ${minos:-none}: ${file#"$app"/}"
+            test -n "$minos" && version_le "$minos" "$min"
+            count=$((count + 1))
+          done < <(find "$app" -type f -print0)
+          test "$count" -gt 0
+          echo "app=$app" >> "$GITHUB_OUTPUT"
+      - uses: actions/download-artifact@v4
+        with:
+          name: darwin-ffmpeg-tools
+          path: ${{ runner.temp }}/ffmpeg-tools
+      - name: Diagnose VideoToolbox encoders
+        id: encoders
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p ffmpeg/dist/darwin-arm64
+          tar -xzf "$RUNNER_TEMP/ffmpeg-tools/darwin-ffmpeg-tools.tar.gz" -C ffmpeg/dist/darwin-arm64
+          if mac/app/make-testmedia.sh --check; then
+            echo 'available=1' >> "$GITHUB_OUTPUT"
+          else
+            echo 'available=0' >> "$GITHUB_OUTPUT"
+          fi
+      - name: Generate test media
+        id: media
+        if: steps.encoders.outputs.available == '1'
+        timeout-minutes: 10
+        shell: bash
+        run: |
+          set -euo pipefail
+          mac/app/make-testmedia.sh "$RUNNER_TEMP/media"
+      - name: Use the build runner's test media
+        if: steps.encoders.outputs.available != '1'
+        shell: bash
+        run: echo '::notice::make-testmedia.sh cannot run here (hardware VideoToolbox H.264 / HEVC Main10 encoding, including 8K, is unavailable); using the media generated on the build runner.'
+      - uses: actions/download-artifact@v4
+        if: steps.encoders.outputs.available != '1'
+        with:
+          name: macos-testmedia
+          path: ${{ runner.temp }}/media
+      - name: Run app self-test
+        timeout-minutes: 12
+        shell: bash
+        env:
+          APP: ${{ steps.dmg.outputs.app }}
+          VIRTUAL_GPU: ${{ steps.host.outputs.virtual_gpu }}
+          H264: ${{ steps.host.outputs.h264 }}
+          HEVC: ${{ steps.host.outputs.hevc }}
+          METAL: ${{ steps.host.outputs.metal }}
+          GUI: ${{ steps.host.outputs.gui }}
+        run: |
+          set -euo pipefail
+          if [[ "$METAL" != 1 || "$GUI" != 1 ]]; then
+            echo '::notice::SKIP app self-test: requires Metal and a GUI session.'
+            exit 0
+          fi
+          if [[ "$H264" != 1 || "$HEVC" != 1 ]]; then
+            # The self-test fails if VideoToolbox does report a hardware decoder under this switch.
+            export ARIBPLAYER_SELFTEST_EXPECT_SW_DECODE=1
+            echo "::notice::SKIP VideoToolbox decode and zero-copy checks: no hardware decoder (H.264=$H264, HEVC=$HEVC); the self-test checks the software decode path (ARIBPLAYER_SELFTEST_EXPECT_SW_DECODE=1)."
+          fi
+          # macOS supplies Services/window-tiling entries and their artwork, not the app.
+          export ARIBPLAYER_SELFTEST_SKIP_SYSTEM_MENU_ICONS=1
+          echo '::notice::SKIP SF Symbol checks of macOS-owned menu items (ARIBPLAYER_SELFTEST_SKIP_SYSTEM_MENU_ICONS=1).'
+          if [[ "$VIRTUAL_GPU" = 1 ]]; then
+            # Paravirtual GPU presents miss deadlines, so A-V swings past ffplay's sync threshold; A-V is still bounded.
+            export ARIBPLAYER_SELFTEST_SKIP_AV_REALTIME=1
+            echo '::notice::SKIP real-time A-V bounds: Apple Paravirtual GPU (ARIBPLAYER_SELFTEST_SKIP_AV_REALTIME=1).'
+          fi
+          status=0
+          mac/app/selftest.sh "$APP" "$RUNNER_TEMP/media" || status=$?
+          grep -h -E '^(FAIL|skip|selftest:)' .tmp/app-tests/*.log || true
+          exit "$status"
+      - name: Detach the DMG
+        if: always()
+        shell: bash
+        run: |
+          if [[ -d "$RUNNER_TEMP/dmg" ]]; then hdiutil detach "$RUNNER_TEMP/dmg"; fi
+      - name: Preserve test logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-${{ matrix.macos }}-test-logs
+          include-hidden-files: true # Self-test logs live under .tmp/.
+          path: .tmp/app-tests/*.log
           if-no-files-found: ignore
           retention-days: 7
 

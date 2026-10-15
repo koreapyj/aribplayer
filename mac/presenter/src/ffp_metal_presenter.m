@@ -157,9 +157,11 @@ typedef struct OverlayRectGeom { int x, y, width, height; } OverlayRectGeom;
     int64_t last_retire_us;
     dispatch_queue_t view_change_queue;
     atomic_int view_change_retry_pending;   /* a skipped view-change redraw is scheduled again */
+    atomic_int skip_redraw_pending;         /* a redraw of a picture present() skipped is scheduled */
 
     /* per open */
     int is_open;
+    int latest_unshown;             /* the newest picture was skipped on a timeout and is not on screen yet (lock) */
     FFPPresenterSink sink;
     int opens;
     Slot slots[SLOT_COUNT];
@@ -197,6 +199,7 @@ typedef struct OverlayRectGeom { int x, y, width, height; } OverlayRectGeom;
     atomic_uint_fast64_t frames_presented, frames_direct, frames_uploaded, copies_total;
     atomic_uint_fast64_t skipped_timeout, skipped_gpu, skipped_display, gate_resets;
     atomic_uint_fast64_t dropped_no_drawable, dropped_hidden, redraws, view_change_redraws, view_change_retries;
+    atomic_uint_fast64_t skipped_redraws;
     atomic_uint_fast64_t render_encoders, blit_encoders;
     atomic_uint_fast64_t zero_copy_verified, zero_copy_mismatch;
     atomic_uint_fast64_t frames_completed, gpu_us_total, present_wait_us_max, present_wait_us_total;
@@ -1356,6 +1359,66 @@ fail:
     last_scale = layer.contentsScale;
 }
 
+/* The drawable gate would let a render through now (or would reset a stalled display), without waiting. */
+- (BOOL)gateWouldOpen
+{
+    int gate_max = FFMAX((int)layer.maximumDrawableCount - 2, 0);
+    BOOL open;
+    pthread_mutex_lock(&gate_lock);
+    open = inflight_tokens < INFLIGHT_MAX &&
+           (pending_drawables <= gate_max || av_gettime_relative() - last_retire_us > 1000000);
+    pthread_mutex_unlock(&gate_lock);
+    return open;
+}
+
+/* A picture that present() skipped on a timeout (GPU or display behind) is drawn once the gate opens: checked one
+ * refresh later and then every refresh, until it is on screen, a newer picture is shown or the media closes. Without
+ * it a paused seek whose landing frame is skipped leaves the previous picture up. At most one check is queued; the
+ * check never waits for the gate, so present() is not held up by it. */
+- (void)redrawSkippedLater
+{
+    __weak FFPMetalPresenterObj *weak = self;
+    if (atomic_exchange(&skip_redraw_pending, 1))
+        return;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, refresh_us * NSEC_PER_USEC), view_change_queue, ^{
+        FFPMetalPresenterObj *s = weak;
+        if (!s)
+            return;
+        atomic_store(&s->skip_redraw_pending, 0);
+        [s redrawSkipped];
+    });
+}
+
+- (void)redrawSkipped
+{
+    @autoreleasepool {
+        char err[256] = "";
+        int ret = 1, again;
+        uint64_t timeouts;
+        Slot *sl;
+
+        pthread_mutex_lock(&lock);
+        if (!is_open || !latest_unshown || !(sl = [self latestSlot])) {
+            pthread_mutex_unlock(&lock);
+            return;
+        }
+        if ([self gateWouldOpen]) {
+            timeouts = atomic_load(&skipped_timeout);
+            ret = [self renderSlot:sl redraw:1 error:err size:sizeof(err)];
+            if (ret == 0)
+                atomic_fetch_add(&skipped_redraws, 1);
+            else if (ret < 0 && sink.failed)
+                sink.failed(sink.engine, err, atomic_load(&device_lost), atomic_load(&device_lost) ? lost_reason : NULL);
+            /* only a timeout is waited out; a hidden view or a missing drawable ends the attempt */
+            latest_unshown = ret == 1 && atomic_load(&skipped_timeout) != timeouts;
+        }
+        again = latest_unshown;
+        pthread_mutex_unlock(&lock);
+        if (again)
+            [self redrawSkippedLater];
+    }
+}
+
 /* A view-change redraw that the drawable gate skipped (GPU or display behind, no drawable) runs again one refresh
  * later, until the held picture matches the view, the media closes or nothing is held. At most one retry is queued. */
 - (void)retryViewChangeLater
@@ -1397,8 +1460,10 @@ fail:
             return;
         }
         ret = [self renderSlot:sl redraw:1 error:err size:sizeof(err)];
-        if (ret == 0)
+        if (ret == 0) {
             atomic_fetch_add(&view_change_redraws, 1);
+            latest_unshown = 0;
+        }
         else if (ret < 0 && sink.failed)
             sink.failed(sink.engine, err, atomic_load(&device_lost), atomic_load(&device_lost) ? lost_reason : NULL);
         pthread_mutex_unlock(&lock);
@@ -1468,7 +1533,8 @@ static int same_picture(const Slot *sl, const AVFrame *f)
 {
     char err[256] = "";
     Slot *sl = NULL;
-    int ret, l;
+    int ret, l, skipped;
+    uint64_t timeouts;
 
     pthread_mutex_lock(&lock);
     if (!is_open || !pic || !pic->frame) {
@@ -1525,18 +1591,24 @@ static int same_picture(const Slot *sl, const AVFrame *f)
     /* the newest picture is the one a later redraw shows, presented or not */
     [self makeLatest:sl];
 
+    timeouts = atomic_load(&skipped_timeout);
     ret = [self renderSlot:sl redraw:pic->redraw error:err size:sizeof(err)];
+    latest_unshown = ret == 1 && atomic_load(&skipped_timeout) != timeouts;
+    skipped = latest_unshown;
     pthread_mutex_unlock(&lock);
     if (ret < 0) {
         av_log(NULL, AV_LOG_ERROR, "metal presenter: present failed: %s\n", err);
         return ret;
     }
+    if (skipped)
+        [self redrawSkippedLater];
     return 0;
 }
 
 - (void)clear
 {
     pthread_mutex_lock(&lock);
+    latest_unshown = 0;
     [self releaseLatest];
     [self drainSlots];
     if (dev)
@@ -1547,6 +1619,7 @@ static int same_picture(const Slot *sl, const AVFrame *f)
 - (void)closeLocked
 {
     int l;
+    latest_unshown = 0;
     [self releaseLatest];
     [self drainSlots];
     for (l = 0; l < FFP_OVERLAY_LAYER_COUNT; l++)
@@ -1680,7 +1753,7 @@ done:
         "\"skipped_display\":%" PRIu64 ",\"gate_resets\":%" PRIu64 ",\"pending_drawables\":%d,"
         "\"dropped_no_drawable\":%" PRIu64 ","
         "\"dropped_hidden\":%" PRIu64 ",\"redraws\":%" PRIu64 ",\"view_change_redraws\":%" PRIu64 ","
-        "\"view_change_retries\":%" PRIu64 ","
+        "\"view_change_retries\":%" PRIu64 ",\"skipped_redraws\":%" PRIu64 ","
         "\"presented_calls\":%" PRIu64 ",\"render_encoders\":%" PRIu64 ",\"blit_encoders\":%" PRIu64 ","
         "\"zero_copy_verified\":%" PRIu64 ",\"zero_copy_mismatch\":%" PRIu64 ","
         "\"frames_held\":%d,\"inflight_max\":%d,\"held_now\":%d,\"held_max\":%d,\"held_pts\":%s,\"held_serial\":%d,"
@@ -1700,7 +1773,7 @@ done:
         (uint64_t)atomic_load(&gate_resets), pending,
         (uint64_t)atomic_load(&dropped_no_drawable), (uint64_t)atomic_load(&dropped_hidden),
         (uint64_t)atomic_load(&redraws), (uint64_t)atomic_load(&view_change_redraws),
-        (uint64_t)atomic_load(&view_change_retries),
+        (uint64_t)atomic_load(&view_change_retries), (uint64_t)atomic_load(&skipped_redraws),
         (uint64_t)atomic_load(&presented_count), (uint64_t)atomic_load(&render_encoders),
         (uint64_t)atomic_load(&blit_encoders),
         (uint64_t)atomic_load(&zero_copy_verified), (uint64_t)atomic_load(&zero_copy_mismatch),

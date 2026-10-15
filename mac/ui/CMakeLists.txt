@@ -2,13 +2,13 @@ cmake_minimum_required(VERSION 3.21)
 # macOS build of the shared self-drawn widget toolkit "pui" (src/Ui) plus its Mac pieces (mac/ui).
 #   cmake -S mac/ui -B .tmp/build-mac-ui -G Ninja && cmake --build .tmp/build-mac-ui
 # Platform-neutral src/Ui sources are compiled as-is; the Win32-only ones are excluded (below).
+include("${CMAKE_CURRENT_LIST_DIR}/../cmake/MacDeploymentTarget.cmake")
 project(pui_mac LANGUAGES CXX OBJCXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_OBJCXX_STANDARD 20)
 set(CMAKE_OBJCXX_STANDARD_REQUIRED ON)
-set(CMAKE_OSX_DEPLOYMENT_TARGET "13.0" CACHE STRING "")
 if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE RelWithDebInfo)
 endif()

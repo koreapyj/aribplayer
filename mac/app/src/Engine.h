@@ -107,6 +107,10 @@ private:
     void OnPresenterError(const wvp::PresenterErrorInfo& e);
     bool Loaded() const;
     void ReopenHere();
+    /// The reopen for a content replan. It runs right after Prepared, possibly before the player has presented a frame at
+    /// the open's start position (`ss`, e.g. a resume): Position() is then unknown or still before it. The reopen keeps that
+    /// start position unless playback is already past it.
+    void ReopenForContent(double startAt);
 
     app::Services& svc_;
     void* view_;

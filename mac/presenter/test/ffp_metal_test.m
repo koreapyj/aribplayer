@@ -210,7 +210,7 @@ static int json_bool(const char *json, const char *key)
 typedef struct StatSnap {
     int64_t presented, direct, uploaded, copies, skipped, no_drawable, hidden, redraws, view_change, calls;
     int64_t render, blit, zc_ok, zc_bad, held_max, ov_uploads, ov_hits, ov_drawn;
-    int64_t skipped_gpu, skipped_display;
+    int64_t skipped_gpu, skipped_display, skipped_redraws;
 } StatSnap;
 
 static StatSnap snap(void)
@@ -237,6 +237,7 @@ static StatSnap snap(void)
     s.ov_drawn = json_int(j, "rects_drawn");
     s.skipped_gpu = json_int(j, "skipped_gpu");
     s.skipped_display = json_int(j, "skipped_display");
+    s.skipped_redraws = json_int(j, "skipped_redraws");
     return s;
 }
 
@@ -1040,7 +1041,7 @@ static int test_d(void)
     PlayResult r;
     StatSnap s0, s1;
     int64_t margin = 10000;
-    int before, after;
+    int before, after, i;
     double held_pts;
     BOOL skip_latency = [NSProcessInfo.processInfo.environment[@"ARIBPLAYER_PRESENTER_SKIP_PRESENT_LATENCY"] isEqualToString:@"1"];
 
@@ -1082,9 +1083,11 @@ static int test_d(void)
               g_eng.present_us_max / 1000.0, (g_refresh_us + margin) / 1000.0);
     CHECK(after - before == s1.presented - s0.presented, "presented() calls %d == frames presented %" PRId64,
           after - before, s1.presented - s0.presented);
-    CHECK((s1.presented - s0.presented) + (s1.skipped - s0.skipped) + (s1.no_drawable - s0.no_drawable) == r.presented_ok,
-          "presented + skipped + no_drawable == present() calls (%" PRId64 " + %" PRId64 " + %" PRId64 " vs %d)",
-          s1.presented - s0.presented, s1.skipped - s0.skipped, s1.no_drawable - s0.no_drawable, r.presented_ok);
+    CHECK((s1.presented - s0.presented) - (s1.skipped_redraws - s0.skipped_redraws) + (s1.skipped - s0.skipped) +
+              (s1.no_drawable - s0.no_drawable) == r.presented_ok,
+          "presented - skipped redraws + skipped + no_drawable == present() calls (%" PRId64 " - %" PRId64 " + %" PRId64
+          " + %" PRId64 " vs %d)", s1.presented - s0.presented, s1.skipped_redraws - s0.skipped_redraws,
+          s1.skipped - s0.skipped, s1.no_drawable - s0.no_drawable, r.presented_ok);
     held_pts = json_num(get_stats(), "held_pts");
     CHECK(fabs(held_pts - (r.decoded - 1) * av_q2d(av_inv_q(c.frame_rate))) < 1e-6,
           "the newest picture (pts %.4f) is the one kept for redraws (held_pts %.4f)",
@@ -1093,6 +1096,29 @@ static int test_d(void)
          "; held picture pts %.4f = last present's pts", r.presented_ok, g_eng.present_us_max / 1000.0,
          s1.presented - s0.presented, after - before, s1.skipped - s0.skipped, held_pts);
     av_usleep(200000);
+
+    /* 2b. a skipped picture with no present() after it (paused, e.g. a paused seek): drawn once the GPU catches up */
+    ffp_metal_presenter_test_set_gpu_latency(g_pres, 50000);
+    for (i = 0; i < 30; i++) {
+        int64_t skipped = snap().skipped;
+        r = play_clip(&c, 1, 0, NULL);
+        if (r.errors || snap().skipped > skipped)
+            break;
+    }
+    s0 = snap();
+    before = sink_count();
+    ffp_metal_presenter_test_set_gpu_latency(g_pres, 0);
+    CHECK(r.errors == 0 && i < 30, "a present() was skipped on the slow GPU (errors %d, presents %d)", r.errors, i + 1);
+    held_pts = json_num(get_stats(), "held_pts");
+    for (i = 0; i < 100 && snap().skipped_redraws == s0.skipped_redraws; i++)
+        av_usleep(10000);
+    s1 = snap();
+    after = sink_count();
+    CHECK(s1.skipped_redraws - s0.skipped_redraws == 1 && s1.presented - s0.presented == 1 && after - before == 1,
+          "the skipped picture is drawn once without another present() (skipped_redraws +%" PRId64 ", presented +%" PRId64
+          ", presented() calls +%d)", s1.skipped_redraws - s0.skipped_redraws, s1.presented - s0.presented, after - before);
+    CHECK(json_num(get_stats(), "held_pts") == held_pts, "it is the held picture (pts %.4f)", held_pts);
+    NOTE("skipped then paused: drawn after %d ms", i * 10);
 
     /* 3. hidden window (ordered out): drawables are not shown; present() must still return within the budget */
     g_eng.present_us_max = g_eng.present_us_total = 0;

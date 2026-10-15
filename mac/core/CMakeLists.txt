@@ -10,6 +10,7 @@
 if(TARGET wvp_core_logic)
     return()
 endif()
+include("${CMAKE_CURRENT_LIST_DIR}/../cmake/MacDeploymentTarget.cmake")
 
 set(WVP_CORE_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../src/Core")
 set(WVP_MAC_CORE_INCLUDE "${CMAKE_CURRENT_SOURCE_DIR}/include")
