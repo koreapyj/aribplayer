@@ -7,13 +7,13 @@ cmake_minimum_required(VERSION 3.21)
 # and the Metal presenter (mac/presenter: `make` there first). The engine is src/Core's FfPlayer (mac/core:
 # wvp_core_ffplay) over the Mac VideoPlatform (mac/platform: wvp_platform_mac); the UI is src/App's shell and pages on
 # pui (mac/ui: pui_mac).
+include("${CMAKE_CURRENT_LIST_DIR}/../cmake/MacDeploymentTarget.cmake")
 project(aribplayer_mac LANGUAGES C CXX OBJC OBJCXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_OBJCXX_STANDARD 20)
 set(CMAKE_OBJCXX_STANDARD_REQUIRED ON)
-set(CMAKE_OSX_DEPLOYMENT_TARGET "13.0" CACHE STRING "")
 set(CMAKE_OSX_ARCHITECTURES "arm64" CACHE STRING "")
 if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE RelWithDebInfo)

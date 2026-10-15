@@ -26,6 +26,7 @@
 //   --log-file PATH                          append the log (libffplay + app events) to PATH (also --log-file=PATH)
 //   Settings > About > Debug logging writes ~/Library/Logs/aribplayer/aribplayer-YYYYMMDD.log (LoggingMac.h).
 #import <AppKit/AppKit.h>
+#import <VideoToolbox/VideoToolbox.h>
 
 #include <algorithm>
 #include <cmath>
@@ -97,6 +98,19 @@ long long OverlayStat(const std::string& json, const char* key) {
 std::string OptionValue(const wvp::OpenOptions& o, const std::string& key) {
     for (const auto& [k, v] : o) if (k == key) return v;
     return {};
+}
+
+/// ARIBPLAYER_SELFTEST_EXPECT_SW_DECODE=1, for a machine whose VideoToolbox has no hardware H.264 / HEVC decoder (the
+/// macOS 14 CI VM): the H.264 and HEVC clips are checked on the planner's software decode path (no hwaccel, frame_path
+/// software, the S/W chip, system frames uploaded by the presenter) instead of VideoToolbox zero-copy. The startup step
+/// fails when VideoToolbox does report a hardware decoder.
+bool ExpectSoftwareDecode() {
+    return [NSProcessInfo.processInfo.environment[@"ARIBPLAYER_SELFTEST_EXPECT_SW_DECODE"] isEqualToString:@"1"];
+}
+
+/// The debug info shows software decoding: no hwaccel device and the software frame path.
+bool SoftwareDecoding(const wvp::DebugInfo& d) {
+    return (d.Video.HwaccelDevice.empty() || d.Video.HwaccelDevice == "none") && d.Video.FramePath == "software";
 }
 
 std::wstring ToW(NSString* s) { return s ? wvp::ToWide(s.UTF8String) : std::wstring(); }
@@ -189,13 +203,17 @@ pui::Widget* FindById(pui::Widget* w, const std::wstring& id) {
 /// SF Symbol image of a menu item. Every item of the menu bar has one: on macOS 26 a menu where only some items have
 /// images (AppKit gives standard actions such as performClose: or toggleFullScreen: one by itself) indents the others.
 static NSImage* MenuSymbol(NSString* name) {
-    NSImage* img = [NSImage imageWithSystemSymbolName:name accessibilityDescription:nil];
-    if (!img) fprintf(stderr, "menu bar: no SF Symbol '%s'\n", name.UTF8String);
-    // the pui menus' table turns some symbols (the pin leans like Fluent's): the same here
-    float degrees = 0;
+    // The pui menus' table: its fallback replaces a symbol the running macOS lacks (gauge.with.needle needs macOS 14),
+    // and its rotation turns some symbols (the pin leans like Fluent's), the same here.
+    const puimac::SymbolEntry* entry = nullptr;
     size_t n = 0;
     const puimac::SymbolEntry* table = puimac::SymbolTable(&n);
-    for (size_t i = 0; i < n; i++) if (strcmp(table[i].symbol, name.UTF8String) == 0) { degrees = table[i].rotation; break; }
+    for (size_t i = 0; i < n; i++) if (strcmp(table[i].symbol, name.UTF8String) == 0) { entry = &table[i]; break; }
+    NSImage* img = [NSImage imageWithSystemSymbolName:name accessibilityDescription:nil];
+    if (!img && entry && entry->fallback)
+        img = [NSImage imageWithSystemSymbolName:@(entry->fallback) accessibilityDescription:nil];
+    if (!img) fprintf(stderr, "menu bar: no SF Symbol '%s'\n", name.UTF8String);
+    const float degrees = entry ? entry->rotation : 0;
     if (!img || degrees == 0) return img;
     const NSSize natural = img.size;
     const double rad = degrees * M_PI / 180.0, c = std::fabs(std::cos(rad)), sn = std::fabs(std::sin(rad));
@@ -1281,6 +1299,12 @@ struct AvSample { double avMs, audio, video, at; long long dropsLate; };
             const auto& chips = shell->Bar()->Model().chips;
             check(chips.size() >= 2 && (chips[0].text == L"H/W" || chips[0].text == L"S/W"), "codec chips (H/W | S/W, codec) from the engine's debug info");
             [self presenterCheck:"tc_1080i_mpeg2" expectZeroCopy:false check:check];
+            if (ExpectSoftwareDecode()) {
+                printf("skip VideoToolbox decode and zero-copy checks: no hardware decoder (ARIBPLAYER_SELFTEST_EXPECT_SW_DECODE=1); "
+                       "the H.264 / HEVC clips are checked on the software decode path\n");
+                check(!VTIsHardwareDecodeSupported(kCMVideoCodecType_H264) && !VTIsHardwareDecodeSupported(kCMVideoCodecType_HEVC),
+                      "ARIBPLAYER_SELFTEST_EXPECT_SW_DECODE=1 only where VideoToolbox has no hardware H.264 / HEVC decoder");
+            }
             next();
         }];
     }];
@@ -1411,9 +1435,14 @@ struct AvSample { double avMs, audio, video, at; long long dropsLate; };
                 const wvp::DebugInfo d = [self debugInfo];
                 printf("     open options: %s\n     engine: decoder %s, hwaccel %s, fmt %s\n", mainview::Engine::FormatOptions(eng.LastOpenOptions()).c_str(),
                        d.Video.Decoder.c_str(), d.Video.HwaccelDevice.c_str(), d.Video.PixFmt.c_str());
-                check(OptionValue(eng.LastOpenOptions(), "hwaccel") == "videotoolbox" && d.Video.HwaccelDevice == "videotoolbox",
-                      "the plan's hwaccel=videotoolbox reached the decoder");
-                [self presenterCheck:"tc_1080p_hevc10" expectZeroCopy:true check:check];
+                if (ExpectSoftwareDecode()) {
+                    check(OptionValue(eng.LastOpenOptions(), "hwaccel").empty() && SoftwareDecoding(d),
+                          "without a hardware decoder the plan decodes HEVC 10-bit in software");
+                } else {
+                    check(OptionValue(eng.LastOpenOptions(), "hwaccel") == "videotoolbox" && d.Video.HwaccelDevice == "videotoolbox",
+                          "the plan's hwaccel=videotoolbox reached the decoder");
+                }
+                [self presenterCheck:"tc_1080p_hevc10" expectZeroCopy:!ExpectSoftwareDecode() check:check];
                 next();
             }];
         });
@@ -1434,11 +1463,16 @@ struct AvSample { double avMs, audio, video, at; long long dropsLate; };
             const pui::RectF ob = mv->DebugOverlayWidget()->Bounds();
             check(ob.l >= 0 && ob.t >= app::kStripDip && ob.r <= mv->host.Size().w && ob.b <= mv->host.Size().h && mv->DebugCols() >= 40,
                   "the overlay sits below the title strip inside the window (ComputeOverlayGeometry)");
+            const bool sw = ExpectSoftwareDecode();
+            const size_t hw = text.find("hwaccel   requested ");
+            const std::string hwRow = hw == std::string::npos ? std::string() : text.substr(hw, text.find('\n', hw) - hw);
             check(!d.Video.Decoder.empty() && text.find("decoder " + d.Video.Decoder) != std::string::npos &&
-                  text.find("hwaccel   requested videotoolbox -> actual videotoolbox") != std::string::npos,
-                  "overlay: the engine's decoder and hwaccel (requested -> actual videotoolbox)");
-            check(text.find("vf graph") != std::string::npos && text.find("frame_path hw_direct") != std::string::npos,
-                  "overlay: the vf graph and the frame path (hw_direct)");
+                  (sw ? hwRow.rfind("hwaccel   requested - -> actual ", 0) == 0 && hwRow.find("MISMATCH") == std::string::npos
+                      : hwRow.rfind("hwaccel   requested videotoolbox -> actual videotoolbox", 0) == 0),
+                  sw ? "overlay: the engine's decoder and hwaccel (requested - -> actual, no mismatch)"
+                     : "overlay: the engine's decoder and hwaccel (requested -> actual videotoolbox)");
+            check(text.find("vf graph") != std::string::npos && text.find(sw ? "frame_path software" : "frame_path hw_direct") != std::string::npos,
+                  sw ? "overlay: the vf graph and the frame path (software)" : "overlay: the vf graph and the frame path (hw_direct)");
             check(text.find("fps") != std::string::npos && text.find("displayed") != std::string::npos && text.find("drop") != std::string::npos,
                   "overlay: fps rows (in -> filter out -> displayed, drops)");
             const size_t m = text.find("metal     presented ");
@@ -1450,7 +1484,7 @@ struct AvSample { double avMs, audio, video, at; long long dropsLate; };
             }
             char what[200];
             snprintf(what, sizeof what, "overlay: Metal presenter stats (presented %lld, zero-copy %lld, copies %lld)", presented, zc, copies);
-            check(presented > 0 && zc > 0 && copies == 0, what);
+            check(presented > 0 && (sw || (zc > 0 && copies == 0)), what);
             check(text.find("pipeline") != std::string::npos && text.find("adapter: video GPU") != std::string::npos,
                   "overlay: the planner's pipeline section and the adapter row");
             [self key:48 chars:@"\t"];
@@ -1725,7 +1759,7 @@ struct AvSample { double avMs, audio, video, at; long long dropsLate; };
                    d.Sync.Master.c_str(), d.Sync.AvDiffMs.value_or(NAN), d.Audio.LatencyMs.value_or(NAN));
             check(player->State() == wvp::PlayerState::Playing && d.HasAudio && d.Audio.Codec == "aac", "the H.264 / AAC clip plays with audio");
             check(d.Audio.OutSampleRate.value_or(0) > 0, "SDL audio output is open");
-            [self presenterCheck:"av_1080p_h264_aac" expectZeroCopy:true check:check];
+            [self presenterCheck:"av_1080p_h264_aac" expectZeroCopy:!ExpectSoftwareDecode() check:check];
             next();
         }];
     }];
@@ -1971,8 +2005,12 @@ struct AvSample { double avMs, audio, video, at; long long dropsLate; };
     // Decoder chips show the planner's actual choice and do not accept focus or invocation.
     [steps addObject:^(void (^next)(void)) {
         const auto& chips = shell->Bar()->Model().chips;
-        check([self debugInfo].Video.HwaccelDevice == "videotoolbox" && !chips.empty() && chips[0].text == L"H/W",
-              "H.264 uses the automatic VideoToolbox plan and shows H/W");
+        if (ExpectSoftwareDecode())
+            check(SoftwareDecoding([self debugInfo]) && !chips.empty() && chips[0].text == L"S/W",
+                  "without a hardware decoder H.264 decodes in software and shows S/W");
+        else
+            check([self debugInfo].Video.HwaccelDevice == "videotoolbox" && !chips.empty() && chips[0].text == L"H/W",
+                  "H.264 uses the automatic VideoToolbox plan and shows H/W");
         for (int i = 0; i < (int)chips.size(); i++) {
             auto* chip = shell->Bar()->ChipWidget(i);
             check(chip && !chip->CanFocus() && !chip->SupportsInvoke() && !chip->HitTestVisible(),

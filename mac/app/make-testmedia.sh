@@ -1,18 +1,36 @@
 #!/bin/bash
 # Synthetic fixtures for mac/app/selftest.sh and mac/presenter's test harness.
 # Usage: mac/app/make-testmedia.sh OUT_DIR (new or empty directory)
+#        mac/app/make-testmedia.sh --check   (exit status 0 when this Mac can encode the clips; prints each probe)
 # OUT_DIR holds the five video clips; OUT_DIR/subs holds clip.ts and its subtitle fixtures.
 # Requires the darwin dist, python3 and hardware VideoToolbox H.264 / HEVC Main 10 encoding (including 8K).
 # HLG is a tagged test pattern, not calibrated HDR imagery. These clips do not replace broadcast-TS tests.
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-usage() { printf 'Usage: %s OUT_DIR\nCreates synthetic app/presenter media in a new or empty directory, with subtitles in OUT_DIR/subs.\n' "$0"; }
+usage() { printf 'Usage: %s OUT_DIR\n   or: %s --check\nCreates synthetic app/presenter media in a new or empty directory, with subtitles in OUT_DIR/subs.\n--check reports whether this Mac has the hardware encoders the clips need.\n' "$0" "$0"; }
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 if [[ "${1:-}" == --help || "${1:-}" == -h ]]; then usage; exit 0; fi
 [[ $# -eq 1 && -n "$1" ]] || { usage >&2; exit 2; }
 FFMPEG="$ROOT/ffmpeg/dist/darwin-arm64/ffmpeg"
 FFPROBE="$ROOT/ffmpeg/dist/darwin-arm64/ffprobe"
 [[ -x "$FFMPEG" && -x "$FFPROBE" ]] || die 'Build ffmpeg/darwin/build-ffplay.sh first (ffmpeg and ffprobe are required).'
+if [[ "$1" == --check ]]; then
+    # A compiled-in encoder is not evidence that the machine (or VM) exposes the hardware: encode one frame of each kind.
+    status=0
+    for spec in 'h264_videotoolbox high nv12 1920x1080' \
+                'hevc_videotoolbox main10 p010le 1920x1080' \
+                'hevc_videotoolbox main10 p010le 7680x4320'; do
+        read -r codec profile format size <<< "$spec"
+        if "$FFMPEG" -hide_banner -nostdin -v warning -f lavfi -i "color=size=$size:rate=30,format=$format" -frames:v 1 \
+            -c:v "$codec" -profile:v "$profile" -allow_sw 0 -f null -; then
+            echo "Hardware encode supported: $spec"
+        else
+            echo "Hardware encode unavailable: $spec"
+            status=1
+        fi
+    done
+    exit $status
+fi
 command -v python3 >/dev/null || die 'python3 is required.'
 mkdir -p "$1"
 OUT="$(cd "$1" && pwd)"

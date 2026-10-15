@@ -35,7 +35,8 @@
  * layer.maximumDrawableCount - 2 committed drawables are still waiting for the display (counted with
  * addPresentedHandler; nextDrawable itself blocks up to a second otherwise and that cannot be configured). On
  * timeout the frame is skipped (no presented() call), its reference is kept as the newest picture, and the next
- * present shows the next frame. The wait is woken by a DISPATCH_TIMER_STRICT timer: the kernel coalesces plain
+ * present shows the next frame. When no next frame comes (paused), the skipped picture is drawn as soon as the gate
+ * opens, checked every refresh without blocking present() (stats "skipped_redraws" counts them). The wait is woken by a DISPATCH_TIMER_STRICT timer: the kernel coalesces plain
  * timed waits by about 50 % (a 16.7 ms wait returns after 25 ms).
  */
 

@@ -5,12 +5,12 @@ cmake_minimum_required(VERSION 3.21)
 #   .tmp/build-mac-platform/wvp_platform_mac_test            # unit tests
 # Also usable with add_subdirectory(<repo>/mac/platform <bindir>); link `wvp_platform_mac`.
 if(CMAKE_CURRENT_SOURCE_DIR STREQUAL CMAKE_SOURCE_DIR)
+    include("${CMAKE_CURRENT_LIST_DIR}/../cmake/MacDeploymentTarget.cmake")
     project(wvp_platform_mac LANGUAGES CXX OBJCXX)
     set(CMAKE_CXX_STANDARD 20)
     set(CMAKE_CXX_STANDARD_REQUIRED ON)
     set(CMAKE_OBJCXX_STANDARD 20)
     set(CMAKE_OBJCXX_STANDARD_REQUIRED ON)
-    set(CMAKE_OSX_DEPLOYMENT_TARGET "13.0" CACHE STRING "")
     if(NOT CMAKE_BUILD_TYPE)
         set(CMAKE_BUILD_TYPE RelWithDebInfo)
     endif()

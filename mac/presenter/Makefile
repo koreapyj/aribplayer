@@ -25,11 +25,13 @@ CC      := xcrun -sdk macosx clang
 METAL   := xcrun -sdk macosx metal
 METALLIB:= xcrun -sdk macosx metallib
 SDK     := $(shell xcrun -sdk macosx --show-sdk-path)
+# The minimum macOS of the dylib, the harness and the embedded metallib: mac/cmake/MacDeploymentTarget.cmake's value.
+MACOS_MIN := 13.3
 
-CFLAGS  := -isysroot $(SDK) -mmacosx-version-min=13.0 -arch arm64 -O2 -g -fobjc-arc \
-           -Wall -Wextra -Wno-unused-parameter -Wno-deprecated-declarations \
+CFLAGS  := -isysroot $(SDK) -mmacosx-version-min=$(MACOS_MIN) -arch arm64 -O2 -g -fobjc-arc \
+           -Wall -Wextra -Wno-unused-parameter -Wno-deprecated-declarations -Werror=unguarded-availability-new \
            -I$(HERE)/include -I$(FFLIB) -I$(FFINC)
-LDFLAGS := -isysroot $(SDK) -mmacosx-version-min=13.0 -arch arm64 -L$(FFLIB) -Wl,-rpath,$(FFLIB)
+LDFLAGS := -isysroot $(SDK) -mmacosx-version-min=$(MACOS_MIN) -arch arm64 -L$(FFLIB) -Wl,-rpath,$(FFLIB)
 FRAMEWORKS := -framework Foundation -framework Metal -framework QuartzCore -framework CoreVideo \
               -framework CoreGraphics -framework IOSurface
 
@@ -41,9 +43,10 @@ all: $(LIB) $(TEST)
 $(BUILD):
 	mkdir -p $(BUILD)
 
-# the shaders: .metal -> .air -> .metallib, embedded into the dylib as a byte array
+# the shaders: .metal -> .air -> .metallib, embedded into the dylib as a byte array. The AIR targets MACOS_MIN; without
+# -mmacosx-version-min the metal compiler targets the SDK's macOS.
 $(BUILD)/ffp_metal_shaders.air: src/ffp_metal_shaders.metal | $(BUILD)
-	$(METAL) -c -O2 -o $@ $<
+	$(METAL) -mmacosx-version-min=$(MACOS_MIN) -c -O2 -o $@ $<
 
 $(BUILD)/ffp_metal_shaders.metallib: $(BUILD)/ffp_metal_shaders.air
 	$(METALLIB) -o $@ $<

@@ -5,7 +5,9 @@ The Mac host implements `VideoPlatform`, `FFPPresenter`, `AppContext`, the rende
 
 ## Requirements
 
-- macOS 13 or later on Apple Silicon; Xcode with the Metal Toolchain component.
+- Running: macOS 13.3 or later on Apple Silicon (Core's floating-point `std::to_chars`); every Mac target builds for 13.3
+  (`cmake/MacDeploymentTarget.cmake`, `presenter/Makefile`) with `-Werror=unguarded-availability-new`.
+- Building: Xcode with the Metal Toolchain component.
 - `brew install cmake ninja nasm pkg-config quilt autoconf automake libtool coreutils`; Python 3 for fixtures.
 - Fixture generation requires VideoToolbox H.264 and HEVC Main10 encoding, including 8K.
 - The FFmpeg dist at `ffmpeg/dist/darwin-arm64` (dylibs, `ffplay.h`, `include/`, `ffmpeg-caps.inc`).
@@ -61,7 +63,7 @@ cmake --build .tmp/build-portable
 ```
 
 Use name filters: the two tests using `LocalHttpServer` hang on macOS during server shutdown.
-CI uses macOS 26 (Core's floating-point `std::from_chars`) and presenter `--no-framedrop`; explicit skips cover those two Core cases, presenter h on Paravirtual GPUs (wall-clock timeout drops), only presenter d's `present()` latency bounds on those GPUs (`ARIBPLAYER_PRESENTER_SKIP_PRESENT_LATENCY=1`; functional assertions still run), only the self-test's real-time A-V bounds on those GPUs (`ARIBPLAYER_SELFTEST_SKIP_AV_REALTIME=1`: median |A-V| < 40 ms and max < 60 ms over 2 s; A-V reporting and a 100 ms median bound still run), macOS-owned menu icons (`ARIBPLAYER_SELFTEST_SKIP_SYSTEM_MENU_ICONS=1`), and hardware/GUI-dependent tests when runtime probes report unavailable prerequisites; local assertions remain enabled.
+CI builds on macOS 26 and runs the DMG's app self-test on macOS 14 and 15 too (fixtures from the build runner when a runner cannot encode them); it uses presenter `--no-framedrop`; explicit skips cover those two Core cases, presenter h on Paravirtual GPUs (wall-clock timeout drops), only presenter d's `present()` latency bounds on those GPUs (`ARIBPLAYER_PRESENTER_SKIP_PRESENT_LATENCY=1`; functional assertions still run), only the self-test's real-time A-V bounds on those GPUs (`ARIBPLAYER_SELFTEST_SKIP_AV_REALTIME=1`: median |A-V| < 40 ms and max < 60 ms over 2 s; A-V reporting and a 100 ms median bound still run), macOS-owned menu icons (`ARIBPLAYER_SELFTEST_SKIP_SYSTEM_MENU_ICONS=1`), the self-test's VideoToolbox decode and zero-copy checks where VideoToolbox has no hardware decoder (`ARIBPLAYER_SELFTEST_EXPECT_SW_DECODE=1`, the macOS 14 VM: the software decode path is checked instead), and hardware/GUI-dependent tests when runtime probes report unavailable prerequisites; local assertions remain enabled.
 
 ## Layout
 

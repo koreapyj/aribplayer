@@ -3,7 +3,9 @@
 #import <Foundation/Foundation.h>
 
 #include <chrono>
+#include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <optional>
 
 #include "Localize.h"
@@ -149,6 +151,13 @@ bool Engine::Loaded() const { return ctl_ && ctl_->Current() != nullptr; }
 
 void Engine::ReopenHere() {
     if (Loaded()) ctl_->ReopenCurrentHere();
+}
+
+void Engine::ReopenForContent(double startAt) {
+    if (!Loaded()) return;
+    const double p = player_->Position();
+    if (ctl_->HasPendingOpen() || (!std::isnan(p) && p >= startAt)) ctl_->ReopenCurrentHere();
+    else ctl_->ReopenCurrent(startAt, player_->State() == wvp::PlayerState::Paused);
 }
 
 // --- startup: probe, player ---------------------------------------------------------------------------------------------
@@ -435,8 +444,10 @@ void Engine::ApplyPipelineContent() {
         if (!pipe_.ClaimContentReopen(url)) return;   // once per url chain: never loop
         if (const wvp::Plan* pl = svc_.filters.CurrentPlan()) Log("pipeline", "replanned for the content: " + pl->Summary() + " -> reopen");
         const int gen = pipe_.Generation();
+        const std::string ss = OptionOf(lastOpenOpts_, "ss");
+        const double startAt = ss.empty() ? 0.0 : std::strtod(ss.c_str(), nullptr);
         auto alive = alive_;
-        post_([this, alive, gen] { if (*alive && pipe_.Generation() == gen) ReopenHere(); });
+        post_([this, alive, gen, startAt] { if (*alive && pipe_.Generation() == gen) ReopenForContent(startAt); });
     } else {
         ctl_->ApplyFilterChange(ch);   // graph rebuild only
     }

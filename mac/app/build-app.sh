@@ -7,8 +7,9 @@
 #   2. the Metal presenter (make -C mac/presenter);
 #   3. the app (CMake + Ninja, Release) into .tmp/build-mac-app-dist; its POST_BUILD step (bundle-frameworks.sh) copies
 #      the dylibs into Contents/Frameworks, fixes the rpaths and signs ad hoc;
-#   4. OUT/ARIB Player.app (default OUT = .tmp/dist-mac), checked: every Mach-O inside links only @rpath /
-#      @executable_path / @loader_path / system libraries, `codesign --verify --deep --strict` passes;
+#   4. OUT/ARIB Player.app (default OUT = .tmp/dist-mac), checked: LSMinimumSystemVersion is 13.3, every Mach-O inside
+#      has a minos at or below it and links only @rpath / @executable_path / @loader_path / system libraries,
+#      `codesign --verify --deep --strict` passes;
 #   5. OUT/ARIB-Player-<version>.dmg (hdiutil, UDZO: the app + an /Applications link + the licences).
 #
 # --version   CFBundleShortVersionString / CFBundleVersion (default: $ARIBPLAYER_VERSION or 0.0.0, as the Windows build)
@@ -31,7 +32,7 @@ while [ $# -gt 0 ]; do
         --sign) SIGN=$2; shift 2 ;;
         --out) OUT=$2; shift 2 ;;
         --no-dmg) DMG=0; shift ;;
-        -h|--help) sed -n '2,22p' "$0"; exit 0 ;;
+        -h|--help) sed -n '2,19p' "$0"; exit 0 ;;
         *) echo "unknown option $1" >&2; exit 2 ;;
     esac
 done
@@ -71,8 +72,17 @@ if [ -n "$SIGN" ]; then
     codesign --force --options runtime --timestamp --sign "$SIGN" "$APP"
 fi
 bad=0
+MIN_MACOS="$(/usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' "$APP/Contents/Info.plist")"
+[ "$MIN_MACOS" = 13.3 ] || { echo "LSMinimumSystemVersion is '$MIN_MACOS', expected 13.3 (mac/cmake/MacDeploymentTarget.cmake)" >&2; exit 1; }
+version_le() {  # major.minor[.patch] $1 <= $2
+    awk -v a="$1" -v b="$2" 'BEGIN { split(a, x, "."); split(b, y, "."); for (i = 1; i <= 3; i++) { if (x[i] + 0 != y[i] + 0) exit !(x[i] + 0 < y[i] + 0) } }'
+}
 while IFS= read -r -d '' f; do
     file -b "$f" | grep -q 'Mach-O' || continue
+    minos="$(xcrun vtool -show-build "$f" | awk '$1 == "minos" { print $2; exit }')"
+    if [ -z "$minos" ] || ! version_le "$minos" "$MIN_MACOS"; then
+        echo "  minos '${minos:-none}' above LSMinimumSystemVersion $MIN_MACOS: $f"; bad=1
+    fi
     while IFS= read -r dep; do
         case "$dep" in @rpath/*|@executable_path/*|@loader_path/*|/usr/lib/*|/System/Library/*) ;; *) echo "  NOT self-contained: $f -> $dep"; bad=1 ;; esac
     done < <(otool -L "$f" | tail -n +2 | awk '{print $1}')
@@ -80,9 +90,9 @@ while IFS= read -r -d '' f; do
         case "$rp" in @*) ;; *) echo "  absolute LC_RPATH in $f: $rp"; bad=1 ;; esac
     done < <(otool -l "$f" | awk '/cmd LC_RPATH/{getline; getline; print $2}')
 done < <(find "$APP" -type f -print0)
-[ $bad -eq 0 ] || { echo "the bundle is not self-contained" >&2; exit 1; }
+[ $bad -eq 0 ] || { echo "the bundle is not self-contained or needs a newer macOS than $MIN_MACOS" >&2; exit 1; }
 codesign --verify --deep --strict "$APP"
-echo "   self-contained: $(ls "$APP/Contents/Frameworks" | wc -l | tr -d ' ') dylibs in Contents/Frameworks; signature: $(codesign -dv "$APP" 2>&1 | awk -F= '/^Signature/{print $2}')"
+echo "   self-contained: $(ls "$APP/Contents/Frameworks" | wc -l | tr -d ' ') dylibs in Contents/Frameworks; macOS $MIN_MACOS or later; signature: $(codesign -dv "$APP" 2>&1 | awk -F= '/^Signature/{print $2}')"
 # Let Finder / "Open With" know the document types of this copy.
 /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$APP" 2>/dev/null || true
 
