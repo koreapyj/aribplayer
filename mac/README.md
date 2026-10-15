@@ -61,7 +61,7 @@ cmake --build .tmp/build-portable
 ```
 
 Use name filters: the two tests using `LocalHttpServer` hang on macOS during server shutdown.
-CI uses macOS 26 (Core's floating-point `std::from_chars`) and presenter `--no-framedrop`; explicit skips cover those two Core cases, presenter h on Paravirtual GPUs (wall-clock timeout drops), only presenter d's `present()` latency bounds on those GPUs (`ARIBPLAYER_PRESENTER_SKIP_PRESENT_LATENCY=1`; functional assertions still run), macOS-owned menu icons (`ARIBPLAYER_SELFTEST_SKIP_SYSTEM_MENU_ICONS=1`), and hardware/GUI-dependent tests when runtime probes report unavailable prerequisites; local assertions remain enabled.
+CI uses macOS 26 (Core's floating-point `std::from_chars`) and presenter `--no-framedrop`; explicit skips cover those two Core cases, presenter h on Paravirtual GPUs (wall-clock timeout drops), only presenter d's `present()` latency bounds on those GPUs (`ARIBPLAYER_PRESENTER_SKIP_PRESENT_LATENCY=1`; functional assertions still run), only the self-test's real-time A-V bounds on those GPUs (`ARIBPLAYER_SELFTEST_SKIP_AV_REALTIME=1`: median |A-V| < 40 ms and max < 60 ms over 2 s; A-V reporting and a 100 ms median bound still run), macOS-owned menu icons (`ARIBPLAYER_SELFTEST_SKIP_SYSTEM_MENU_ICONS=1`), and hardware/GUI-dependent tests when runtime probes report unavailable prerequisites; local assertions remain enabled.
 
 ## Layout
 
