@@ -6,6 +6,10 @@
 // (the host's light-dismiss hit test stops at the top popup, so the submenu answers for its parents), hovering another
 // parent item moves the highlight there and switches / closes the submenu after the hover delay, clicking a parent
 // item works, Left / Escape close one level (Escape on the root menu closes it).
+// Placement keeps every menu inside the host's menu area (MenuArea): by default the client area; the Mac app shows its
+// menus in their own windows (mac/app MenuWindowsMac) and sets the visible frame of the screen there, so a menu leaves a
+// small window like a native one and flips left / above at the screen edges.
+#include <functional>
 #include <vector>
 
 #include "pui/Menu.h"
@@ -35,6 +39,12 @@ public:
     MenuPopup* SubMenu() const;                         // the open submenu (nullptr: none)
     int SubMenuIndex() const { return sub_ ? subIndex_ : -1; }
 
+    /// Shown in a window of its own (mac/app MenuWindowsMac): the host's Paint skips it and the window paints it with
+    /// PaintInWindow. Input still goes through the host (the window forwards it in host coordinates).
+    void SetOwnWindow(bool on) { ownWindow_ = on; }
+    bool OwnWindow() const { return ownWindow_; }
+    void PaintInWindow(pui::IRenderer& r, const pui::Theme& t);
+
 private:
     int IndexAt(pui::PointF p) const;
     void SetHighlight(int i);            // keyboard: immediate, closes a submenu of another item
@@ -54,12 +64,25 @@ private:
     int subIndex_ = -1, highlight_ = -1, pendingSub_ = -1;
     bool pending_ = false;               // a hover change waits for the delay (pendingSub_ = the hovered item, may be -1)
     uint64_t pendingSince_ = 0;
+    bool ownWindow_ = false, paintingInWindow_ = false;
 };
 
-/// Opens the menu with its top-left at `at` (clamped to the client). `focusReturn` gets the focus back on close.
+/// The rectangle (host client DIPs) the menus of `host` are kept inside, for a menu placed at `near`: the function set
+/// with SetMenuArea, else the client area.
+pui::RectF MenuArea(pui::UiHost& host, pui::PointF near);
+/// Sets (or clears, with an empty function) the menu area of `host`.
+void SetMenuArea(pui::UiHost* host, std::function<pui::RectF(pui::PointF near)> area);
+/// A menu of `size` with its top-left at `p`; where it would leave `area` it opens to the left of / above `p` (a macOS
+/// context menu), then it is kept inside. Whole-DIP origin.
+pui::RectF PlaceMenuAtPoint(const pui::RectF& area, pui::PointF p, pui::SizeF size);
+/// A menu of `size` under `anchor` (above it when `preferAbove`), left-aligned; it takes the other side when its side
+/// does not fit, right-aligns with the anchor when it would leave the area on the right, then it is kept inside.
+pui::RectF PlaceMenuBeside(const pui::RectF& area, const pui::RectF& anchor, pui::SizeF size, bool preferAbove);
+
+/// Opens the menu with its top-left at `at` (PlaceMenuAtPoint in the menu area). `focusReturn` gets the focus back on close.
 MenuPopup* ShowMenu(pui::UiHost& host, std::vector<pui::MenuItemDesc> items, pui::PointF at,
                     pui::IRenderer* measurer = nullptr, pui::Widget* focusReturn = nullptr);
-/// Opens the menu below `anchor` (left-aligned), flipping above when it does not fit.
+/// Opens the menu below `anchor` (PlaceMenuBeside in the menu area).
 MenuPopup* ShowMenu(pui::UiHost& host, std::vector<pui::MenuItemDesc> items, pui::Widget* anchor,
                     pui::IRenderer* measurer = nullptr);
 

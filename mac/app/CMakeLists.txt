@@ -119,6 +119,8 @@ add_executable(aribplayer MACOSX_BUNDLE
     src/MiniPlayerMac.mm
     src/Localize.cpp
     src/NativeMenuMac.cpp
+    src/MenuWindowsMac.mm
+    src/PopupDismissMac.mm
     src/FileDialogMac.mm
     src/Win32Names.mm
     src/LoggingMac.mm

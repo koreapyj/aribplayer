@@ -567,7 +567,13 @@ NSString* PromptToNS(const std::wstring& w) {
 
 // --- TextInputDialog.h: the modal name prompt ----------------------------------------------------------------------
 
-std::optional<std::wstring> PromptText(AppContext&, const TextPromptOptions& options) {
+void RaiseDialogToOwner(void* dialogWindow, void* ownerWindow) {
+    NSWindow* dialog = (__bridge NSWindow*)dialogWindow;
+    NSWindow* owner = (__bridge NSWindow*)ownerWindow;
+    if (dialog && owner && dialog.level < owner.level) dialog.level = owner.level;
+}
+
+std::optional<std::wstring> PromptText(AppContext& ctx, const TextPromptOptions& options) {
     if (OsDialogsBlocked()) return std::nullopt;
     NSAlert* alert = [[NSAlert alloc] init];
     alert.messageText = PromptToNS(options.title);
@@ -579,6 +585,7 @@ std::optional<std::wstring> PromptText(AppContext&, const TextPromptOptions& opt
     field.placeholderString = PromptToNS(options.placeholder);
     alert.accessoryView = field;
     alert.window.initialFirstResponder = field;
+    RaiseDialogToOwner((__bridge void*)alert.window, (void*)ctx.MainHwnd());
     for (;;) {
         if ([alert runModal] != NSAlertFirstButtonReturn) return std::nullopt;
         std::wstring text = PromptToW(field.stringValue);

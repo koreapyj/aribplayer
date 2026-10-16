@@ -21,6 +21,7 @@ std::wstring ToW(NSString* s) {
     pui::UiHost* _host;               // not owned
     std::function<pui::Theme(float)> _themeMaker;
     std::function<void(NSSize)> _onResize;
+    std::function<void()> _onEscape;
     puimac::CGRenderer* _renderer;    // not owned
     NSTimer* _tick;
     NSTrackingArea* _tracking;
@@ -44,6 +45,7 @@ std::wstring ToW(NSString* s) {
 
 - (void)setThemeMaker:(std::function<pui::Theme(float)>)maker { _themeMaker = std::move(maker); [self applyTheme]; }
 - (void)setOnResize:(std::function<void(NSSize)>)onResize { _onResize = std::move(onResize); if (_onResize) _onResize(self.bounds.size); }
+- (void)setOnEscape:(std::function<void()>)onEscape { _onEscape = std::move(onEscape); }
 - (BOOL)isFlipped { return YES; }
 - (BOOL)acceptsFirstResponder { return YES; }
 - (BOOL)acceptsFirstMouse:(NSEvent*)e { (void)e; return YES; }
@@ -82,10 +84,11 @@ std::wstring ToW(NSString* s) {
     [self updateTracking];
 }
 
+/// Hover (and so tooltips) whether or not this window is key or the app active, as Win32 windows get WM_MOUSEMOVE.
 - (void)updateTracking {
     if (_tracking) [self removeTrackingArea:_tracking];
     _tracking = [[NSTrackingArea alloc] initWithRect:self.bounds
-                                             options:NSTrackingMouseMoved | NSTrackingMouseEnteredAndExited | NSTrackingActiveInKeyWindow | NSTrackingInVisibleRect
+                                             options:NSTrackingMouseMoved | NSTrackingMouseEnteredAndExited | NSTrackingActiveAlways | NSTrackingInVisibleRect
                                                owner:self userInfo:nil];
     [self addTrackingArea:_tracking];
 }
@@ -217,8 +220,9 @@ std::wstring ToW(NSString* s) {
 - (void)keyDown:(NSEvent*)e {
     int vk = [self vkFor:e];
     unsigned mods = puimac::ModsFromFlags(e.modifierFlags);
-    bool handled = vk != 0 && _host->KeyDown(vk, mods);
+    bool handled = vk != 0 && _host->KeyDown(vk, mods);   // Esc closes an open flyout / dialog first
     bool command = (e.modifierFlags & (NSEventModifierFlagCommand | NSEventModifierFlagControl)) != 0;
+    if (!handled && vk == pui::key::Escape && mods == 0 && _marked.empty() && _onEscape) { _onEscape(); return; }   // (an IME composition takes Esc itself)
     if (!handled && !command) [self.inputContext handleEvent:e];   // -> insertText: / setMarkedText: (IME)
     else if (!handled && !e.isARepeat) [super keyDown:e];
     [self afterEvent];

@@ -29,7 +29,19 @@ public:
     void Open();
     /// Saves the placement and hides the window.
     void Close();
+    /// Open, also while hidden for a minimized player.
     bool IsOpen() const;
+    // Z-order (SettingsWindow.h): Settings sits directly above the player, in its band (floating while the player is
+    // always on top or the mini player), until a mouse button goes down on the player; the player then stays in front
+    // until the next focus cycle (Settings opened, or the app activated from another app). None of these activate it,
+    // and all do nothing while it is closed or hidden for a minimized player.
+    void StartFocusCycle();
+    void OnPlayerPressed();
+    /// The player re-applied its level (ApplyWindowTopmost, deactivation): stay directly above it unless it was put in front.
+    void KeepAbove();
+    /// The player was minimized (hide this window) or restored (show it again without activating, above the player).
+    void OnPlayerMinimized(bool minimized);
+    bool PlayerInFront() const;   // a press on the player put it in front (until the next focus cycle)
     /// The app theme / accent changed.
     void ApplyTheme();
     pui::UiHost& Ui();

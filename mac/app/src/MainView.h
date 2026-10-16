@@ -48,6 +48,9 @@ public:
         std::function<void(const wvp::BgraFrame&)> copyFrame;   // Capture frame -> clipboard
         std::function<void()> quit;
         std::function<void()> layoutChanged;                    // the shell layout was recomputed (cursor rects: the splitter)
+        /// The pointer in client DIP while it is over the player window with nothing of this app (a modal dialog, Settings)
+        /// or another app in front of it there; nullopt otherwise (App::AutoHideTick's WindowFromPoint + IsWindowEnabled).
+        std::function<std::optional<pui::PointF>()> cursorAt;
     };
 
     struct Options {
@@ -84,17 +87,25 @@ public:
     void SetFullscreenState(bool on);   // the NSWindow entered / left full screen
     /// Periodic (10 Hz): position / duration of the player into the bar model.
     void Tick();
-    /// Full screen / mini player reveal: the pointer moved to a client DIP (or left the window: nullopt).
+    /// Full screen / mini player reveal: the pointer moved to a client DIP (or left the window: nullopt). Full screen:
+    /// the title strip (top kStripDip), the bar (bottom kDockDip) and the playlist panel (right kEdgeRightDip) each show
+    /// while the pointer is in its edge zone or over its rect (App::UpdateEdgeReveal).
     void PointerAt(std::optional<pui::PointF> p);
+    /// A mouse button went down on the player: pointer activity (App's WM_*BUTTONDOWN -> autoHide_.Activity).
+    void PointerPressed();
     /// Key routing like App: open popup / focused search box -> active playlist panel -> global key table (held-key
     /// stepping for frame / keyframe / timed seeks as App::RunKeyCommand).
     bool Key(int vk, unsigned mods, bool repeat = false);
     void KeyUp(int vk);
     void VideoDoubleClick() { Execute(app::CommandId::PlayPause); }
-    void VideoWheel(float notches);
+    /// App's WM_MOUSEWHEEL when no widget took the wheel (video, title strip, bar background): 1 % volume per notch
+    /// (AdjustVolume). Fractions of a notch (trackpads) add up; the mini player's bar is revealed.
+    void WheelVolume(float notches);
     void ShowMainMenu(pui::PointF at);
     void ShowMainMenu(pui::Widget* anchor);
-    /// A press landed on the shell: the playlist panel is active while the user clicks inside it.
+    /// App::NotePointerTarget: a press inside a playlist panel (docked or overlay) makes it the key target, a press on the
+    /// video / bar / title deactivates them; a press in another popup (a menu opened from the panel) leaves them alone. A
+    /// press anywhere but the search box ends text entry.
     void PressAt(pui::Widget* hit);
     bool IsTitleStripPoint(pui::PointF p) const;   // empty strip area (window drag)
     bool IsVideoPoint(pui::PointF p) const;
@@ -106,6 +117,9 @@ public:
     bool DropAt(pui::PointF dip, const std::vector<std::wstring>& paths);
     const std::wstring& Title() const { return model_.title; }
     bool PanelOpen() const { return svc_.settings.playlistPanel; }
+    /// The overlay playlist panel (App::panelPopup_): the full-screen right-edge panel or, in a window too narrow to dock
+    /// it, the toggle's light-dismiss popup over the video; nullptr while closed.
+    app::PlaylistPanel* PanelPopup() const { return panelPopup_; }
     std::uint32_t Accent() const { return accent_; }
 
     // --- AppContext ---
@@ -136,6 +150,7 @@ public:
     void ShowInfoBar(app::InfoSeverity severity, const std::wstring& title, const std::wstring& message) override;
     void ShowToast(const std::wstring& text) override;
     const std::wstring& LastToast() const { return lastToast_; }   // self-test
+    pui::RectF ToastBounds() const;                                 // self-test
     void LayoutToast();
     std::vector<wvp::VideoGpuPref> VideoGpus() const override;
     void VideoGpuSettingChanged() override;
@@ -179,12 +194,40 @@ public:
     /// Applies a panel width (relayout) and stores what the layout allowed (App::SetPanelWidth).
     void SetPanelWidth(int widthDip);
 
+    // --- App's power, cursor and auto-hide rules ---------------------------------------------------------------------
+    /// App::UpdateKeepAwake: while playing, an IOPMAssertion keeps the display awake (video) or only the system (audio);
+    /// paused, stopped or closed: none.
+    enum class KeepAwake { None, System, Display };
+    void UpdateKeepAwake();
+    KeepAwake KeepAwakeState() const { return keepAwake_; }
+    /// App::SetCursorHidden over CursorAutoHide: the cursor is hidden over the full-screen video after 2 s without a move.
+    bool CursorHidden() const { return cursorHidden_; }
+    /// The mini player's bar (App::autoHide_): 0 = shown, 1 = hidden; it slides kBarSlideDip down while it fades.
+    float MiniBarHidden() const { return miniHide_.P(host.Now()); }
+    bool MiniBarAnimating() const { return miniHide_.Animating(host.Now()); }
+    /// RefreshChips calls so far (App::ChipsTick: +0.5 s, +1.5 s after PREPARED, then every 2 s while playing).
+    int ChipRefreshes() const { return chipRefreshes_; }
+    /// MiniAspectForMedia of the last PREPARED (16:9 without video): the mini player's resize aspect.
+    double MediaAspect() const { return mediaAspect_; }
+
 private:
     class Toast;
     static constexpr int kKeyStepFrame = 0, kKeyStepKeyframe = 1, kKeyStepSkip = 100;   // App.h's step actions
     void ApplyMode();
     void SyncModel();
     void TogglePlaylistPanel();
+    void FocusPlaylistSearch();
+    /// App::OpenPanelOverlay: the playlist panel as a light-dismiss popup at the stored width (min(width, W - 16)) over
+    /// the video's right side; full screen: the full-height column at the right edge with square corners, not active.
+    void OpenPanelOverlay();
+    void ForPanels(const std::function<void(app::PlaylistPanel&)>& f);
+    /// App::SelectionPanel: the panel whose selection Play starts (the overlay one, else the docked one).
+    app::PlaylistPanel* SelectionPanel() const;
+    /// App::NonPanelPopups: user popups other than the full-screen edge panel (the Mac menus are popups of this host).
+    size_t NonPanelPopups() const;
+    /// App::PanelInteractionActive: the edge panel stays while the pointer is over it, a menu / popup is open, a
+    /// press inside it holds the capture, or the search box has the keyboard.
+    bool PanelInteractionActive() const;
     void UpdateOverlays();
     void RefreshChips();
     void TogglePause();
@@ -212,7 +255,6 @@ private:
     bool subsShown_ = false, subsDirty_ = true;
     std::uint64_t subsCheckedMs_ = 0;
     std::unique_ptr<wvp::PlaybackController> ctl_;
-    std::uint64_t chipsAt_[2] = {0, 0};   // chip refreshes after PREPARED (+0.5 s, +1.5 s; App::RefreshChips)
     app::ShellLayout layout_;
     app::ModeState modes_;
     app::BarModel model_;
@@ -231,6 +273,7 @@ private:
     pui::ThemeMode themeMode_ = pui::ThemeMode::System;
     std::uint32_t accent_ = 0;
     std::optional<pui::PointF> pointer_;
+    app::PlaylistPanel* panelPopup_ = nullptr;   // owned by the host's popup stack
     std::set<int> heldKeys_;
     wvp::FrameStepController frameStep_{MakeFrameStepHooks()};
     Toast* toast_ = nullptr;
@@ -250,6 +293,35 @@ private:
     pui::Widget* infoBar_ = nullptr;
     std::uint64_t infoBarUntil_ = 0;
     bool started_ = false;
+
+    // App's power, cursor and auto-hide rules (MainView.mm, "keep awake, cursor, mini bar")
+    class MiniBarFade;
+    void ReleaseKeepAwake();
+    void SetCursorHidden(bool hide);
+    void CursorTick(std::uint64_t now);
+    bool SpaceIsPlayPause() const;
+    void ApplyAutoHideMode();
+    void MiniBarActivity();
+    void MiniAutoHideTick(std::uint64_t now);
+    void StartMiniBarAnim(app::AutoHide::Action a);
+    void PlaceMiniBar();
+    bool MiniBarInteractionActive() const;
+    void ApplyMiniAspect();
+    void ChipsTick(std::uint64_t now);
+    bool WindowZoomedOrMinimized() const;
+    KeepAwake keepAwake_ = KeepAwake::None;
+    std::uint32_t keepAwakeId_ = 0;                // IOPMAssertionID
+    app::CursorAutoHide cursorIdle_;
+    bool cursorHidden_ = false;
+    std::optional<pui::PointF> cursorLast_;
+    app::AutoHide miniHide_;
+    std::optional<app::ShellMode> autoHideMode_;   // the mode ApplyAutoHideMode last applied
+    bool keyInput_ = false;                        // App::keyInput_: inside a key-down
+    MiniBarFade* miniFadeBegin_ = nullptr;
+    float wheelRemainder_ = 0;
+    int chipsStage_ = 0, chipRefreshes_ = 0;
+    std::uint64_t chipsPreparedMs_ = 0, chipsNextMs_ = 0;
+    double mediaAspect_ = 16.0 / 9.0;
     std::shared_ptr<bool> alive_ = std::make_shared<bool>(true);
 };
 

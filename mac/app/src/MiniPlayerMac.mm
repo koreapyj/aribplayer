@@ -3,7 +3,7 @@
 // MiniMakePlacement / MiniMinSizePx), in screen points (scale 1: 1 DIP = 1 point) with a top-left origin; the shell
 // side (ComputeMiniShellLayout, the MiniBar) is MainView's. The window keeps its (transparent) title bar so it stays
 // resizable and rounded; the traffic lights are hidden, the level floats above other windows, the aspect is locked to
-// the media (MiniAspectForMedia) like the Windows WM_SIZING handler.
+// the media (MainView::MediaAspect = MiniAspectForMedia of the last PREPARED) like the Windows WM_SIZING handler.
 #import <AppKit/AppKit.h>
 
 #include "features/MiniPlayer.h"
@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "AppContext.h"
+#include "MainView.h"
 #include "features/MiniLogic.h"
 
 namespace app {
@@ -49,7 +50,11 @@ void EnterMiniPlayer(AppContext& ctx) {
     SetTrafficLightsHidden(w, true);
     w.level = NSFloatingWindowLevel;
     [w setFrame:FromPx(target) display:YES animate:NO];
-    const double aspect = target.h() > 0 ? (double)target.w() / target.h() : 16.0 / 9.0;
+    [w orderFront:nil];   // SetWindowPos(HWND_TOPMOST, SWP_NOACTIVATE): the top of the floating band, not activated
+    // App's WM_SIZING (MiniConstrainSizing with mediaAspect_): resizing keeps the playing media's aspect; MainView
+    // re-applies it when another item is prepared while the mini player is up.
+    const auto* mv = dynamic_cast<const mainview::MainView*>(&ctx);
+    const double aspect = mv ? mv->MediaAspect() : 16.0 / 9.0;
     w.contentAspectRatio = NSMakeSize(aspect * 1000, 1000);
 }
 
