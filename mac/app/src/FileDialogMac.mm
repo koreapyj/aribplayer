@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "shobjidl.h"
+#include "OpenFlowsMac.h"
 
 const CLSID CLSID_FileOpenDialog = {0xdc1c5a9c, 0xe88a, 0x4dde, {0xa5, 0xa1, 0x60, 0xf8, 0x2a, 0x20, 0xae, 0xf7}};
 
@@ -96,7 +97,7 @@ public:
         }
         return S_OK;
     }
-    HRESULT Show(HWND) override {
+    HRESULT Show(HWND owner) override {
         @autoreleasepool {
             NSOpenPanel* panel = [NSOpenPanel openPanel];
             const bool folders = (options_ & FOS_PICKFOLDERS) != 0;
@@ -115,6 +116,7 @@ public:
             if (haveGuid_)
                 if (NSString* dir = [defaults stringForKey:GuidKey(guid_)]) panel.directoryURL = [NSURL fileURLWithPath:dir isDirectory:YES];
             NSWindow* key = NSApp.keyWindow;
+            app::RaiseDialogToOwner((__bridge void*)panel, owner ? (void*)owner : (__bridge void*)key);
             const NSModalResponse r = [panel runModal];
             [key makeKeyAndOrderFront:nil];
             if (r != NSModalResponseOK || panel.URLs.count == 0) return (HRESULT)0x800704C7;   // HRESULT_FROM_WIN32(ERROR_CANCELLED)

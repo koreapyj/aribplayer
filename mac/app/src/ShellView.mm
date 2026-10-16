@@ -88,10 +88,13 @@ std::wstring ToW(NSString* s) {
     [self updateTracking];
 }
 
+/// Moves / enters / exits arrive whether or not the player is the key window or this app is active (Win32 sends
+/// WM_MOUSEMOVE to inactive windows): hovering a floating mini player over another app shows its bar, the full-screen
+/// edges reveal and tooltips show without a click first.
 - (void)updateTracking {
     if (_tracking) [self removeTrackingArea:_tracking];
     _tracking = [[NSTrackingArea alloc] initWithRect:self.bounds
-                                             options:NSTrackingMouseMoved | NSTrackingMouseEnteredAndExited | NSTrackingActiveInKeyWindow | NSTrackingInVisibleRect
+                                             options:NSTrackingMouseMoved | NSTrackingMouseEnteredAndExited | NSTrackingActiveAlways | NSTrackingInVisibleRect
                                                owner:self userInfo:nil];
     [self addTrackingArea:_tracking];
 }
@@ -157,6 +160,7 @@ std::wstring ToW(NSString* s) {
 
 - (void)mouseDown:(NSEvent*)e {
     [self.window makeFirstResponder:self];
+    _mv->PointerPressed();
     bool ctrlClick = (e.modifierFlags & NSEventModifierFlagControl) != 0;
     pui::PointerEvent pe = [self pointerEvent:e button:ctrlClick ? pui::PointerButton::Right : pui::PointerButton::Left];
     pui::UiHost& host = _mv->host;
@@ -193,7 +197,9 @@ std::wstring ToW(NSString* s) {
         [self afterEvent];
         return;
     }
-    _mv->host.PointerMove([self pointerEvent:e button:pui::PointerButton::Left]);
+    pui::PointerEvent pe = [self pointerEvent:e button:pui::PointerButton::Left];
+    _mv->host.PointerMove(pe);
+    _mv->PointerAt(pe.pt);   // the full-screen reveal follows a drag too (the capture keeps what it started on)
     [self afterEvent];
 }
 
@@ -211,8 +217,10 @@ std::wstring ToW(NSString* s) {
 
 - (void)rightMouseDown:(NSEvent*)e {
     [self.window makeFirstResponder:self];
+    _mv->PointerPressed();
     pui::PointerEvent pe = [self pointerEvent:e button:pui::PointerButton::Right];
     pui::Widget* hit = _mv->host.HitTest(pe.pt);
+    _mv->PressAt(hit);   // App's WM_RBUTTONDOWN -> NotePointerTarget: a right press in the playlist makes it the key target
     if (!_mv->UserPopupOpen() && (hit == nullptr || hit == _mv->shell) && _mv->IsVideoPoint(pe.pt)) {
         _mv->ShowMainMenu(pe.pt);   // the main menu is the video's context menu
         [self afterEvent];
@@ -249,9 +257,13 @@ std::wstring ToW(NSString* s) {
 - (void)scrollWheel:(NSEvent*)e {
     pui::PointerEvent pe = [self pointerEvent:e button:pui::PointerButton::None];
     CGFloat dy = e.scrollingDeltaY;
-    pe.wheelDelta = (float)(e.hasPreciseScrollingDeltas ? dy / 48.0 : dy);
+    pe.wheelDelta = (float)(e.hasPreciseScrollingDeltas ? dy / 48.0 : dy);   // a notch = 48 DIP of trackpad travel
     if (pe.wheelDelta == 0) return;
-    if (!_mv->host.PointerWheel(pe) && _mv->IsVideoPoint(pe.pt)) _mv->VideoWheel(pe.wheelDelta);   // wheel over the video = volume
+    // App's WM_MOUSEWHEEL: a widget takes it first (the playlist, a popup); anywhere else (the video, the title strip, the
+    // bar's background) it is the volume, by the device's direction (wheel away / fingers up = louder) whatever the
+    // natural-scrolling setting. A trackpad's momentum after the fingers lift does not change the volume.
+    if (!_mv->host.PointerWheel(pe) && e.momentumPhase == NSEventPhaseNone)
+        _mv->WheelVolume(e.isDirectionInvertedFromDevice ? -pe.wheelDelta : pe.wheelDelta);
     [self afterEvent];
 }
 

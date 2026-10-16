@@ -1,6 +1,7 @@
 #include "MainView.h"
 
 #import <AppKit/AppKit.h>
+#include <IOKit/pwr_mgt/IOPMLib.h>
 
 #include <algorithm>
 #include <cmath>
@@ -13,6 +14,7 @@
 #include "LoggingMac.h"
 #include "Engine.h"
 #include "NativeMenuMac.h"
+#include "WindowSizing.h"
 #include "features/BadgeLogic.h"
 #include "features/Logging.h"
 #include "features/LoggingFormat.h"
@@ -31,6 +33,7 @@
 #include "pui/InfoBar.h"
 #include "pui/TextBox.h"
 #include "pui/ToolTipStyle.h"
+#include "shell/PlaylistPanel.h"
 #include "puimac/CGRenderer.h"
 #include "puimac/MacTheme.h"
 #include "wvp/DebugInfo.h"
@@ -58,15 +61,15 @@ public:
         Invalidate();
         if (pui::UiHost* h = Host()) h->StartAnimating(this);
     }
-    void Paint(pui::IRenderer& r, const pui::Theme& t) override {
+    void Paint(pui::IRenderer& r, const pui::Theme& t) override {   // AppRender.cpp NoticeWidget (toast)
         const pui::RectF b = Bounds();
-        r.FillRoundRect(b, 16, t.flyoutSurface);
-        r.StrokeRoundRect(b.Deflate(0.5f, 0.5f, 0.5f, 0.5f), 16, t.flyoutStroke, 1);
-        r.Text(text_, b.Deflate(12, 0, 12, 0), Style(), t.textPrimary);
+        r.FillRoundRect(b, t.overlayRadius, t.flyoutSurface);
+        r.StrokeRoundRect(b.Deflate(0.5f, 0.5f, 0.5f, 0.5f), t.overlayRadius, t.flyoutStroke, 1);
+        r.Text(text_, b.Deflate(16, 0, 16, 0), Style(), t.textPrimary);
     }
     static pui::TextStyle Style() {
         pui::TextStyle ts;
-        ts.size = 13;
+        ts.size = 14;
         ts.align = pui::TextAlign::Center;
         ts.ellipsis = true;
         return ts;
@@ -82,6 +85,21 @@ private:
     uint64_t until_ = 0;
 };
 
+/// The mini player's bar fades between a begin marker (PushOpacity) and an end marker (PopOpacity), the shell children
+/// right before and after the MiniBar (App's bar layer opacity). The begin marker also drives the slide / fade animation.
+class MainView::MiniBarFade final : public pui::Widget {
+public:
+    MiniBarFade(bool begin, std::function<bool(std::uint64_t)> tick) : pui::Widget(pui::Role::Custom), begin_(begin), tick_(std::move(tick)) {
+        SetHitTestVisible(false);
+    }
+    float opacity = 1;
+    void Paint(pui::IRenderer& r, const pui::Theme&) override { if (begin_) r.PushOpacity(opacity); else r.PopOpacity(); }
+    bool OnTick(std::uint64_t now) override { return tick_ && tick_(now); }
+private:
+    bool begin_;
+    std::function<bool(std::uint64_t)> tick_;
+};
+
 namespace {
 constexpr float kTrafficInsetDip = 80;   // 12 + 3 x 14 + 2 x 6 + 12: the native traffic lights sit in the strip's left part
 
@@ -90,7 +108,10 @@ constexpr float kTrafficInsetDip = 80;   // 12 + 3 x 14 + 2 x 6 + 12: the native
 class MacShellRoot final : public app::ShellRoot {
 public:
     using app::ShellRoot::ShellRoot;
+    std::function<bool()> miniBarHittable;   // App::ChromeHittableAt: a hiding / hidden mini bar lets presses through
     pui::Widget* HitTest(pui::PointF p) override {
+        if (miniBarHittable && Mini()->Visible() && Mini()->Bounds().Contains(p) && !miniBarHittable())
+            return Bounds().Contains(p) ? this : nullptr;
         pui::Widget* w = app::ShellRoot::HitTest(p);
         if (w && w != this) return w;
         app::TitleBar* t = Title();
@@ -131,13 +152,24 @@ MainView::MainView(puimac::CGRenderer* measurer, void* videoView, const std::str
     engine_->onPipelineContentChanged = [this] { app::RefreshFiltersPanel(*this); };
 
     auto root = std::make_unique<MacShellRoot>(*this);
+    root->miniBarHittable = [this] { return miniHide_.Hittable(host.Now()); };
     shell = root.get();
     host.SetRoot(std::move(root));
+    {   // the mini player's bar fades between these two markers (its slide is its bounds)
+        const int at = shell->Mini()->IndexInParent();
+        auto begin = std::make_unique<MiniBarFade>(true, [this](std::uint64_t now) { PlaceMiniBar(); return miniHide_.Animating(now); });
+        miniFadeBegin_ = begin.get();
+        shell->AddChild(std::move(begin), at);
+        shell->AddChild(std::make_unique<MiniBarFade>(false, nullptr), at + 2);
+    }
     toast_ = shell->Add<Toast>();
     debug_ = shell->Add<DebugOverlay>();   // above the shell widgets, below popups (Layer::DebugOverlay)
     app::nativemenu::SetMacHost(&host, measurer_);
-    // Player views hold no widget focus except the playlist search box; popups (menus, dialogs) focus normally.
+    // App::AllowsFocus: player views hold no widget focus except the playlist search box (of the docked or the overlay
+    // panel); other popups (menus, dialogs) focus normally.
     host.focusFilter = [this](const pui::Widget* w) {
+        for (const pui::Widget* p = w; p; p = p->Parent())
+            if (auto* panel = dynamic_cast<const app::PlaylistPanel*>(p)) return w == panel->Search();
         const pui::Widget* top = w;
         while (top && top->Parent()) top = top->Parent();
         return top != shell || dynamic_cast<const pui::TextBox*>(w) != nullptr;
@@ -219,7 +251,7 @@ MainView::MainView(puimac::CGRenderer* measurer, void* videoView, const std::str
         }
         shell->Title()->SetTitle(model_.title);
         OnMediaOpened.raise(it);
-        shell->Panel()->OnCurrentChanged();
+        ForPanels([](app::PlaylistPanel& p) { p.OnCurrentChanged(); });
         SyncModel();
     });
     ctl_->QueueChanged.add([this] {
@@ -227,7 +259,7 @@ MainView::MainView(puimac::CGRenderer* measurer, void* videoView, const std::str
         if (!suppressPlaylistPersistence_ && !PersistCurrentPlaylist())
             ShowInfoBar(app::InfoSeverity::Error, app::Tr(L"Could not save the current playlist", L"현재 재생목록을 저장할 수 없습니다"),
                         currentPlaylist_.empty() ? app::Tr(L"Unnamed playlist", L"이름 없는 재생목록") : wvp::ToWide(currentPlaylist_));
-        shell->Panel()->OnQueueChanged();
+        ForPanels([](app::PlaylistPanel& p) { p.OnQueueChanged(); });
         SyncModel();
     });
     ctl_->ModeChanged.add([this] { SyncModel(); });
@@ -238,16 +270,21 @@ MainView::MainView(puimac::CGRenderer* measurer, void* videoView, const std::str
         prepared_ = p;
         if (!p.Title.empty()) { model_.title = wvp::ToWide(p.Title); shell->Title()->SetTitle(model_.title); }
         subsDirty_ = true;
+        UpdateKeepAwake();
+        chipsStage_ = 0;   // App::ChipsTick: the presenter / decoder settle after PREPARED: +0.5 s, +1.5 s, then every 2 s
+        chipsPreparedMs_ = NowMs();
+        chipsNextMs_ = chipsPreparedMs_ + 500;
         RefreshChips();
-        const std::uint64_t now = NowMs();   // the presenter / decoder settle after PREPARED: refresh at +0.5 s and +1.5 s
-        chipsAt_[0] = now + 500;
-        chipsAt_[1] = now + 1500;
+        mediaAspect_ = p.HasVideo ? app::MiniAspectForMedia(p.DisplayWidth(), p.DisplayHeight()) : 16.0 / 9.0;
+        ApplyMiniAspect();
         OnMediaPrepared.raise(p);
         SyncModel();
-        // Like Windows' Prepared handler: 100%, once per opened URL, only in the windowed player view.
+        // Like Windows' Prepared handler: 100%, once per opened URL, only in the windowed player view of a window that is
+        // neither zoomed (maximized) nor minimized.
         const wvp::MediaItem* it = ctl_->Current();
         if (p.HasVideo && it && sizedForUrl_ != it->url && modes_.Mode() == app::ShellMode::NowPlaying &&
-            !modes_.mini && !modes_.fullscreen && hooks.sizeWindowToVideo && hooks.sizeWindowToVideo(p, app::WindowScale(CommandId::WindowSize100)))
+            !modes_.mini && !modes_.fullscreen && !WindowZoomedOrMinimized() && hooks.sizeWindowToVideo &&
+            hooks.sizeWindowToVideo(p, app::WindowScale(CommandId::WindowSize100)))
             sizedForUrl_ = it->url;
     });
     player_->FrameStepDone.add([this](int, bool moved) { frameStep_.StepDone(moved); });
@@ -258,6 +295,12 @@ MainView::MainView(puimac::CGRenderer* measurer, void* videoView, const std::str
         state_ = s;
         model_.playing = s == wvp::PlayerState::Playing;
         ApplyWindowTopmost();   // "Enable when playing" follows the state
+        UpdateKeepAwake();
+        // App: Ended / Error always bring the mini bar back; a keyboard pause / stop / next leaves a hidden bar hidden.
+        if (s == wvp::PlayerState::Ended ? app::RestoreVideoControlsOnCompletion(Loaded()) : s != wvp::PlayerState::Playing) {
+            const bool forced = s == wvp::PlayerState::Ended || s == wvp::PlayerState::Error;
+            StartMiniBarAnim(forced ? miniHide_.Enter(host.Now()) : miniHide_.Reveal(host.Now()));
+        }
         SyncModel();
         if (s == wvp::PlayerState::Paused) SavePlaybackHistory(true);
     });
@@ -280,6 +323,8 @@ MainView::MainView(puimac::CGRenderer* measurer, void* videoView, const std::str
 
 MainView::~MainView() {
     *alive_ = false;
+    ReleaseKeepAwake();
+    SetCursorHidden(false);
     app::StopSystemCaptionSettingsWatch();
     app::nativemenu::SetMacHost(nullptr, nullptr);
     ctl_->Dispose();
@@ -344,6 +389,7 @@ void MainView::RefreshChips() {
             next = app::badge::BuildChips(debug, *mi);
         }
     }
+    chipRefreshes_++;
     if (next == model_.chips) return;
     model_.chips = std::move(next);
     SyncModel();
@@ -396,6 +442,7 @@ void MainView::ApplyMode() {
         shell->Title()->MaximizeButton()->SetVisible(false);
         shell->Title()->CloseButton()->SetVisible(false);
     }
+    ApplyAutoHideMode();
     LayoutToast();
     if (hooks.videoRect) hooks.videoRect(layout_.video);
     UpdateOverlays();
@@ -438,29 +485,53 @@ void MainView::SetMiniPlayer(bool on) {
     OnModeChanged.raise(modes_.Mode());
 }
 
-/// Full screen: the title strip and the bar appear only while the cursor is in their edge zone / on them (App's edge
-/// mode: snap, no slide). Mini player: the reduced bar shows while the pointer is over the window. Windowed: both are
-/// docked and always shown.
+/// Full screen (App::UpdateEdgeReveal): the title strip, the bar and the playlist panel appear only while the cursor is
+/// in their edge zone / on their rect (App's edge mode: snap, no slide); a popup / menu, a seek drag (and for the panel
+/// its search box) keeps them. Mini player: the reduced bar auto-hides (MiniAutoHideTick). Windowed: both are docked
+/// and always shown.
 void MainView::UpdateOverlays() {
-    const bool interacting = UserPopupOpen() || shell->Bar()->SeekDragging();
-    if (modes_.mini) {
-        app::MiniBar* mini = shell->Mini();
-        mini->SetVisible(pointer_.has_value() || interacting || state_ != wvp::PlayerState::Playing);
+    if (modes_.mini) {   // MiniAutoHideTick / StartMiniBarAnim (App's AutoHide) decide
+        PlaceMiniBar();
         return;
     }
     if (!modes_.fullscreen) return;
+    const bool interacting = NonPanelPopups() > 0 || shell->Bar()->SeekDragging();
     const pui::SizeF s = host.Size();
     bool top = false, bottom = false;
+    app::EdgeZones z;
     if (pointer_) {
-        app::EdgeZones z = app::EdgeZonesAt(pointer_->x, pointer_->y, s.w, s.h);
+        z = app::EdgeZonesAt(pointer_->x, pointer_->y, s.w, s.h);
         top = z.top || (shell->Title()->Visible() && shell->Title()->Bounds().Contains(*pointer_));
         bottom = z.bottom || (shell->Bar()->Visible() && shell->Bar()->Bounds().Contains(*pointer_));
     }
     shell->Title()->SetVisible(top || (interacting && shell->Title()->Visible()));
     shell->Bar()->SetVisible(bottom || (interacting && shell->Bar()->Visible()));
+    // The right band opens the edge panel. The Mac menus are popups of this host, so an open menu (Windows: a native
+    // menu, above every app window) keeps it closed rather than opening it over the menu.
+    if (z.right && !panelPopup_ && !host.Captured() && !app::nativemenu::IsOpen()) OpenPanelOverlay();
+    if (panelPopup_ && !PanelInteractionActive()) host.ClosePopup(panelPopup_);
+}
+
+size_t MainView::NonPanelPopups() const {
+    size_t n = host.PopupCount();
+    if (infoBar_ && host.IsPopupOpen(infoBar_) && n > 0) n--;   // the app's own notice (App::notices_)
+    if (panelPopup_ && modes_.fullscreen && n > 0) n--;
+    return n;
+}
+
+bool MainView::PanelInteractionActive() const {
+    if (!panelPopup_) return false;
+    if (NonPanelPopups() > 0 || pui::TextBox::IsTextInputFocused(host)) return true;
+    if (const pui::Widget* cp = host.Captured()) if (cp == panelPopup_ || panelPopup_->IsAncestorOf(cp)) return true;
+    return pointer_ && panelPopup_->Bounds().Contains(*pointer_);
 }
 
 void MainView::PointerAt(std::optional<pui::PointF> p) {
+    const bool moved = p.has_value() != pointer_.has_value() || (p && (p->x != pointer_->x || p->y != pointer_->y));
+    if (moved) {   // App::PointerMoved / CheckPointerLeft
+        if (p) { cursorIdle_.Moved(NowMs()); SetCursorHidden(false); MiniBarActivity(); }
+        else { SetCursorHidden(false); StartMiniBarAnim(miniHide_.PointerLeft(host.Now(), MiniBarInteractionActive())); }
+    }
     pointer_ = p;
     UpdateOverlays();
 }
@@ -476,10 +547,13 @@ bool MainView::IsVideoPoint(pui::PointF p) const {
 }
 
 void MainView::PressAt(pui::Widget* hit) {
-    app::PlaylistPanel* panel = shell->Panel();
-    const bool inPanel = hit && panel->Visible() && (hit == panel || panel->IsAncestorOf(hit));
-    panel->SetActive(inPanel);
-    if (!inPanel && host.Focused() && host.Focused() == panel->Search()) host.SetFocus(nullptr);
+    const app::PlaylistPanel* hitPanel = nullptr;
+    for (const pui::Widget* p = hit; p && !hitPanel; p = p->Parent()) hitPanel = dynamic_cast<const app::PlaylistPanel*>(p);
+    if (pui::TextBox::IsTextInputFocused(host) && (!hitPanel || hit != hitPanel->Search())) {
+        if (const pui::Widget* f = host.Focused(); f && dynamic_cast<const app::PlaylistPanel*>(f->Parent())) host.SetFocus(nullptr);
+    }
+    if (hitPanel) ForPanels([&](app::PlaylistPanel& p) { p.SetActive(&p == hitPanel); });
+    else if (!hit || hit == shell || shell->IsAncestorOf(hit)) ForPanels([](app::PlaylistPanel& p) { p.SetActive(false); });
 }
 
 /// App::RouteDropAtClient.
@@ -510,15 +584,16 @@ void MainView::Tick() {
         const double pos = player_->Position(), dur = player_->Duration();
         if (!std::isnan(pos)) model_.pos = pos;
         if (dur > 0) model_.dur = dur;
-        for (std::uint64_t& at : chipsAt_)
-            if (at && now >= at) { at = 0; RefreshChips(); }
+        ChipsTick(now);
     }
+    MiniAutoHideTick(host.Now());
+    CursorTick(now);
     if (infoBar_ && now >= infoBarUntil_) {
         if (host.IsPopupOpen(infoBar_)) host.ClosePopup(infoBar_);
         infoBar_ = nullptr;
     }
     engine_->Poll(now);
-    if (modes_.mini) UpdateOverlays();
+    if (modes_.mini || modes_.fullscreen) UpdateOverlays();   // App::AutoHideTick: a closed menu / released drag hides at once
     if (debugVisible_ && now >= debugNextMs_) {   // ~4 Hz while shown, nothing while hidden (App::Tick)
         debugNextMs_ = now + 250;
         RefreshDebugOverlay();
@@ -539,7 +614,7 @@ void MainView::SyncModel() {
     m.playing = state_ == wvp::PlayerState::Playing;
     m.fullscreen = modes_.fullscreen;
     m.mini = modes_.mini;
-    m.panelOpen = svc_.settings.playlistPanel && !layout_.panelOverlay;
+    m.panelOpen = svc_.settings.playlistPanel && (!layout_.panelOverlay || panelPopup_);   // narrow window: pressed only while the popup is open
     m.panelAvailable = modes_.Mode() == app::ShellMode::NowPlaying;
     m.controlPanelOpen = app::IsFiltersPanelOpen(*this);
     m.timeMode = svc_.settings.timeRemaining ? app::sl::TimeDisplayMode::Remaining : app::sl::TimeDisplayMode::Elapsed;
@@ -568,9 +643,12 @@ bool MainView::SubtitlesShown() {
     });
 }
 
-bool MainView::CanPlaySelection() const {
-    return !Loaded() && shell->Panel()->Visible() && shell->Panel()->CanPlaySelection();
+app::PlaylistPanel* MainView::SelectionPanel() const {
+    app::PlaylistPanel* p = panelPopup_ ? panelPopup_ : (svc_.settings.playlistPanel && !layout_.panelOverlay ? shell->Panel() : nullptr);
+    return p && !p->Stale() && p->CanPlaySelection() ? p : nullptr;
 }
+
+bool MainView::CanPlaySelection() const { return !Loaded() && SelectionPanel(); }
 
 // --- playlists + history (AppPlayback.cpp) ----------------------------------------------------------------------------
 
@@ -595,7 +673,7 @@ void MainView::RestoreCurrentPlaylist() {
     suppressPlaylistPersistence_ = true;
     ctl_->SetQueue(currentPlaylistItems_, -1, false);
     suppressPlaylistPersistence_ = false;
-    shell->Panel()->OnCurrentPlaylistChanged();
+    ForPanels([](app::PlaylistPanel& p) { p.OnCurrentPlaylistChanged(); });
 }
 
 bool MainView::PersistCurrentPlaylist() {
@@ -609,7 +687,7 @@ void MainView::SetCurrentPlaylistName(const std::string& name) {
     currentPlaylist_ = name;
     svc_.settings.currentPlaylist = name;
     svc_.settingsStore.Save(svc_.settings);
-    shell->Panel()->OnCurrentPlaylistChanged();
+    ForPanels([](app::PlaylistPanel& p) { p.OnCurrentPlaylistChanged(); });
 }
 
 void MainView::SavePlaybackSnapshot(const std::string& playlist, const std::string& url, int index, double position, double duration,
@@ -623,7 +701,7 @@ void MainView::SavePlaybackSnapshot(const std::string& playlist, const std::stri
     const bool played = wvp::PlaylistStore::IsPlayedPosition(position, duration, ended);
     svc_.playlists.SavePlaybackStateAsync(playlist, url, position, duration, played, canResume, index);
     historyWriteAt_ = now + 1000;
-    if (played) shell->Panel()->OnItemPlayed(url);
+    if (played) ForPanels([&](app::PlaylistPanel& p) { p.OnItemPlayed(url); });
     if (played) resumeDecision_ = "played: reset to start (near end / EOF)";
 }
 
@@ -717,12 +795,12 @@ void MainView::ReplaceUnnamedPlaylistAtPosition(std::vector<wvp::MediaItem> item
 }
 
 void MainView::PlaylistRenamed(const std::string& from, const std::string& to) {
-    shell->Panel()->OnPlaylistRenamed(from, to);
+    ForPanels([&](app::PlaylistPanel& p) { p.OnPlaylistRenamed(from, to); });
     if (currentPlaylist_ == from) SetCurrentPlaylistName(to);
 }
 
 void MainView::PlaylistDeleted(const std::string& name) {
-    shell->Panel()->OnPlaylistDeleted(name);
+    ForPanels([&](app::PlaylistPanel& p) { p.OnPlaylistDeleted(name); });
     if (currentPlaylist_ != name) return;
     std::vector<wvp::MediaItem> unnamed = PlaylistItems({});
     SetCurrentPlaylistName({});
@@ -733,7 +811,7 @@ void MainView::PlaylistDeleted(const std::string& name) {
     suppressPlaylistPersistence_ = false;
 }
 
-void MainView::PlaylistsChanged() { shell->Panel()->OnPlaylistsChanged(); }
+void MainView::PlaylistsChanged() { ForPanels([](app::PlaylistPanel& p) { p.OnPlaylistsChanged(); }); }
 
 void MainView::CloseMedia() {
     if (!Loaded()) return;
@@ -781,17 +859,22 @@ void MainView::ShowToast(const std::wstring& text) {
     }
 }
 
-/// The toast pill fits its text (24 DIP padding), centred near the video's bottom, never wider than the video - 32.
+/// App::ShowToast's geometry: the text width + 40 (at most the client width - 16), 40 high, centred in the client,
+/// 16 DIP above the bar's rect (the docked bar, the full-screen bar zone whether shown or not, the mini bar).
 void MainView::LayoutToast() {
     if (!toast_) return;
-    const pui::RectF v = layout_.video.Empty() ? pui::RectF{0, 0, host.Size().w, host.Size().h}
-                                               : pui::RectF{layout_.video.l / scale_, layout_.video.t / scale_, layout_.video.r / scale_, layout_.video.b / scale_};
+    const float clientW = host.Size().w, clientH = host.Size().h;
     float textW = 336;
     if (measurer_ && !toast_->Text().empty()) textW = measurer_->MeasureText(toast_->Text(), Toast::Style(), 0).w;
-    const float w = std::max(0.f, std::min(v.w() - 32, std::max(120.f, std::ceil(textW) + 24))), h = 32;
-    const float bottom = modes_.mini ? v.b - app::kMiniBarDip - 8 : v.b - 24;
-    toast_->SetBounds({v.cx() - w / 2, bottom - h, v.cx() + w / 2, bottom});
+    const float h = std::min(40.f, clientH);
+    const float w = std::min(std::max(0.f, clientW - 16.f), std::ceil(textW) + 40.f);
+    const float x = std::clamp(std::round((clientW - w) / 2), 0.f, std::max(0.f, clientW - w));
+    const float barTop = layout_.bar.Empty() ? clientH : layout_.bar.t;
+    const float y = std::clamp(barTop - 16 - h, 0.f, std::max(0.f, clientH - h));
+    toast_->SetBounds(pui::RectF::XYWH(x, y, w, h));
 }
+
+pui::RectF MainView::ToastBounds() const { return toast_ ? toast_->Bounds() : pui::RectF{}; }
 
 void MainView::ApplyTheme(pui::ThemeMode mode, uint32_t accent) {
     themeMode_ = mode;
@@ -826,6 +909,17 @@ bool MainView::UserPopupOpen() const {
 /// unless a focused text box owns the key (App::TextInputOwnsKey: plain / Shift keys type there; Esc and F-keys pass).
 bool MainView::Key(int vk, unsigned mods, bool repeat) {
     heldKeys_.insert(vk);
+    miniHide_.KeyPress();   // keys never reveal the mini bar nor keep it alive; nor an auto-hidden cursor
+    struct KeyInputScope {   // App::KeyInputScope
+        bool& flag;
+        bool was;
+        explicit KeyInputScope(bool& f) : flag(f), was(f) { flag = true; }
+        ~KeyInputScope() { flag = was; }
+    } keyScope(keyInput_);
+    if (vk == pui::key::Space && mods == 0 && SpaceIsPlayPause()) {   // before the focused widget (it would act on key up)
+        if (!repeat) Execute(CommandId::PlayPause);                     // a held Space's auto-repeat does not toggle back and forth
+        return true;
+    }
     if (vk == pui::key::Tab && !(mods & (pui::ModCtrl | pui::ModAlt))) {   // App's WM_KEYDOWN: before the host
         const bool userPopup = UserPopupOpen();   // App::UserPopupOpen
         const app::dbg::TabAction tab = app::dbg::DecideTab(userPopup, (mods & pui::ModShift) != 0);
@@ -892,9 +986,15 @@ wvp::FrameStepController::Hooks MainView::MakeFrameStepHooks() {
     return h;
 }
 
-void MainView::VideoWheel(float notches) {
+void MainView::WheelVolume(float notches) {
     if (notches == 0) return;
-    SetVolume(ctl_->Volume() + (int)std::lround(notches * 5));
+    // App::AdjustVolume(delta / WHEEL_DELTA): whole notches; a trackpad's fractions add up, a direction change starts over.
+    if ((wheelRemainder_ > 0 && notches < 0) || (wheelRemainder_ < 0 && notches > 0)) wheelRemainder_ = 0;
+    wheelRemainder_ += notches;
+    const int steps = (int)std::trunc(wheelRemainder_);
+    wheelRemainder_ -= (float)steps;
+    if (steps) SetVolume(ctl_->Volume() + steps);
+    if (!keyInput_) MiniBarActivity();   // the wheel reveals the mini bar, volume keys do not
 }
 
 void MainView::SetVolume(int v) {
@@ -904,21 +1004,74 @@ void MainView::SetVolume(int v) {
     SyncModel();
 }
 
+/// App::TogglePlaylistPanel. Full screen (the right-edge panel) and the mini player keep the toggle disabled.
 void MainView::TogglePlaylistPanel() {
     if (modes_.fullscreen || modes_.mini) return;
-    const bool narrow = layout_.panelOverlay;
+    // Row too narrow to dock the panel (layout_.panelOverlay): the toggle opens / closes it as a light-dismiss popup over the video.
+    // Closing it with the toggle also clears the persisted setting; a light dismiss keeps it (the panel docks once the window is wide enough).
+    const bool nowPlaying = modes_.Mode() == app::ShellMode::NowPlaying;
+    const bool narrow = nowPlaying && layout_.panelOverlay;
+    if (narrow && !panelPopup_) { OpenPanelOverlay(); SyncModel(); return; }
+    if (narrow && panelPopup_) host.ClosePopup(panelPopup_);
+    // The window grows / shrinks by the panel so the video keeps its size (App::ResizeWindowForPlaylistPanel); the narrow
+    // overlay keeps the video-resizing behaviour.
+    const bool resizeWindow = nowPlaying && !narrow && !layout_.video.Empty() && hooks.resizeForPanel;
     const int videoW = layout_.video.w();
     svc_.settings.playlistPanel = !svc_.settings.playlistPanel;
     svc_.settingsStore.Save(svc_.settings);
-    // The window grows / shrinks by the panel so the video keeps its size (App::ResizeWindowForPlaylistPanel).
-    if (!narrow && !layout_.video.Empty() && hooks.resizeForPanel) hooks.resizeForPanel(videoW, svc_.settings.playlistPanel);
-    else ApplyMode();
+    if (resizeWindow) hooks.resizeForPanel(videoW, svc_.settings.playlistPanel);
+    if (nowPlaying) {
+        ApplyMode();
+        if (!narrow && layout_.panelOverlay) OpenPanelOverlay();   // switched on in a window too narrow to dock it
+    } else {
+        SyncModel();
+    }
+}
+
+/// App::FocusPlaylistSearch (Ctrl+S, ⌘F here): opens the panel when hidden and puts the keyboard focus in its search box.
+void MainView::FocusPlaylistSearch() {
+    if (modes_.Mode() != app::ShellMode::NowPlaying) return;
+    if (!svc_.settings.playlistPanel) TogglePlaylistPanel();
+    else if (layout_.panelOverlay && !panelPopup_) OpenPanelOverlay();
+    app::PlaylistPanel* p = panelPopup_ ? panelPopup_ : (shell->Panel()->Visible() ? shell->Panel() : nullptr);
+    if (p) p->FocusSearch();
+}
+
+void MainView::OpenPanelOverlay() {
+    if (panelPopup_ || layout_.video.Empty()) return;
+    const bool fs = modes_.Mode() == app::ShellMode::FullScreen;
+    if (!fs && modes_.Mode() != app::ShellMode::NowPlaying) return;
+    // Narrow window: over the video column. Full screen: the full-height column on the right edge.
+    const float top = layout_.video.t / scale_, bottom = layout_.video.b / scale_, right = layout_.video.r / scale_;
+    const float w = std::max(0.f, std::min((float)svc_.settings.playlistPanelWidthDip, cw_ / scale_ - 16.f));
+    auto panel = std::make_unique<app::PlaylistPanel>(*this, true);
+    app::PlaylistPanel* raw = panel.get();
+    raw->SetBounds({right - w, top, right, bottom});
+    raw->SetSquareCorners(fs);
+    pui::PopupOptions po;
+    po.lightDismiss = true;
+    po.takeFocus = false;
+    if (fs) po.acrylicRadius = 0.f;
+    po.onClosed = [this, raw] {
+        if (panelPopup_ == raw) panelPopup_ = nullptr;
+        SyncModel();
+    };
+    panelPopup_ = raw;
+    host.OpenPopup(std::move(panel), po);
+    raw->Refresh();
+    raw->SetActive(!fs);   // full screen: the hover reveals it; keys stay with the player until the user clicks into it
+    SyncModel();
+}
+
+void MainView::ForPanels(const std::function<void(app::PlaylistPanel&)>& f) {
+    f(*shell->Panel());
+    if (panelPopup_) f(*panelPopup_);
 }
 
 /// App::TogglePause.
 void MainView::TogglePause() {
     if (!Loaded()) {
-        if (CanPlaySelection()) { shell->Panel()->PlaySelection(); return; }
+        if (app::PlaylistPanel* p = SelectionPanel()) { p->PlaySelection(); return; }
     }
     using wvp::PlayerState;
     if (state_ == PlayerState::Ended || state_ == PlayerState::Stopped || state_ == PlayerState::Idle || state_ == PlayerState::Error)
@@ -974,11 +1127,7 @@ void MainView::Execute(CommandId c) {
         break;
     case C::ToggleControlPanel: app::ToggleFiltersPanel(*this); break;
     case C::TogglePlaylistPanel: TogglePlaylistPanel(); break;
-    case C::FocusPlaylistSearch:
-        if (modes_.Mode() != app::ShellMode::NowPlaying) break;
-        if (!svc_.settings.playlistPanel) TogglePlaylistPanel();
-        if (shell->Panel()->Visible()) shell->Panel()->FocusSearch();
-        break;
+    case C::FocusPlaylistSearch: FocusPlaylistSearch(); break;
     case C::CycleAlwaysOnTop: {
         svc_.settings.alwaysOnTop = app::sl::NextAlwaysOnTop(svc_.settings.alwaysOnTop);
         app::OnSettingsChanged(*this);
@@ -1170,6 +1319,150 @@ bool MainView::EndSplitterDrag() {
     svc_.settingsStore.Save(svc_.settings);
     Log("panel", "playlist panel width " + std::to_string(svc_.settings.playlistPanelWidthDip) + " DIP");
     return true;
+}
+
+// --- keep awake, cursor, mini bar (App::UpdateKeepAwake, AppRender.cpp AutoHideTick / SetCursorHidden, App::ChipsTick) ---
+
+void MainView::UpdateKeepAwake() {
+    // Only while playing: video keeps the display on, audio only keeps the system from sleeping. Paused / stopped: nothing.
+    const KeepAwake want = state_ != wvp::PlayerState::Playing ? KeepAwake::None
+                         : prepared_ && prepared_->HasVideo ? KeepAwake::Display : KeepAwake::System;
+    if (want == keepAwake_) return;
+    ReleaseKeepAwake();
+    if (want == KeepAwake::None) return;
+    IOPMAssertionID id = 0;
+    const CFStringRef type = want == KeepAwake::Display ? kIOPMAssertionTypePreventUserIdleDisplaySleep : kIOPMAssertionTypePreventUserIdleSystemSleep;
+    const CFStringRef name = want == KeepAwake::Display ? CFSTR("ARIB Player is playing video") : CFSTR("ARIB Player is playing audio");
+    if (IOPMAssertionCreateWithName(type, kIOPMAssertionLevelOn, name, &id) != kIOReturnSuccess) {
+        Log("power", "IOPMAssertionCreateWithName failed");
+        return;
+    }
+    keepAwakeId_ = id;
+    keepAwake_ = want;
+    Log("power", want == KeepAwake::Display ? "keep awake: display" : "keep awake: system");
+}
+
+void MainView::ReleaseKeepAwake() {
+    if (keepAwake_ == KeepAwake::None) return;
+    IOPMAssertionRelease((IOPMAssertionID)keepAwakeId_);
+    keepAwakeId_ = 0;
+    keepAwake_ = KeepAwake::None;
+    Log("power", "keep awake: released");
+}
+
+/// NSCursor hide / unhide nest, so the state is kept here and each change is applied once (App::SetCursorHidden).
+void MainView::SetCursorHidden(bool hide) {
+    if (hide == cursorHidden_) return;
+    cursorHidden_ = hide;
+    if (hide) [NSCursor hide]; else [NSCursor unhide];
+}
+
+/// AppRender.cpp AutoHideTick's cursor part: hidden over the full-screen video after kCursorIdleHideMs without a move;
+/// never over the bar / title / a popup, nor while another window, a modal dialog or another app is under the pointer.
+/// The position is polled too (the 10 Hz tick), so a move that AppKit sends elsewhere (a drag) still brings it back.
+void MainView::CursorTick(std::uint64_t now) {
+    std::optional<pui::PointF> at = hooks.cursorAt ? hooks.cursorAt() : std::nullopt;
+    const bool moved = at.has_value() != cursorLast_.has_value() || (at && (at->x != cursorLast_->x || at->y != cursorLast_->y));
+    cursorLast_ = at;
+    if (moved && at) { cursorIdle_.Moved(now); SetCursorHidden(false); }
+    bool overChrome = false;
+    if (at) {
+        if (shell->Bar()->Visible() && shell->Bar()->Bounds().Contains(*at)) overChrome = true;
+        if (shell->Title()->Visible() && shell->Title()->Bounds().Contains(*at)) overChrome = true;
+        for (pui::Widget* popup : host.Popups())
+            if (popup && popup->IsEffectivelyVisible() && popup->Bounds().Contains(*at)) overChrome = true;
+    }
+    const bool blocked = !at || NSApp.modalWindow != nil;
+    SetCursorHidden(cursorIdle_.ShouldHide(now, modes_.fullscreen, overChrome, UserPopupOpen(), blocked));
+}
+
+/// App::SpaceIsPlayPause: Space is play / pause unless a popup is open or the focused widget uses Space itself.
+bool MainView::SpaceIsPlayPause() const {
+    const pui::Widget* f = host.Focused();
+    const pui::Role r = f ? f->GetRole() : pui::Role::Custom;
+    const bool focusUsesSpace = f && (r == pui::Role::Edit || r == pui::Role::List || r == pui::Role::ListItem ||
+                                      r == pui::Role::ComboBox || r == pui::Role::Tree || r == pui::Role::TreeItem);
+    return app::SpaceTogglesPlayback(host.PopupCount() > 0, focusUsesSpace);
+}
+
+/// AppRender.cpp ApplyMode's auto-hide part, on a mode change (a relayout keeps the state): the cursor shows; the mini
+/// player's bar shows, except that a key-driven switch keeps a hidden bar hidden. Full screen keeps its edge reveal
+/// (UpdateOverlays).
+void MainView::ApplyAutoHideMode() {
+    if (autoHideMode_ == modes_.Mode()) { PlaceMiniBar(); return; }
+    autoHideMode_ = modes_.Mode();
+    SetCursorHidden(false);
+    const std::uint64_t now = host.Now();
+    const bool keepHidden = keyInput_ && modes_.mini && miniHide_.Enabled() && miniHide_.Hidden();
+    miniHide_.SetEnabled(modes_.mini, now);
+    miniHide_.Snap(keepHidden ? 1.f : 0.f);
+    if (!keepHidden) miniHide_.Touch(now);
+    PlaceMiniBar();
+}
+
+/// Pointer activity in the mini player (a move, a press, the wheel): restart the idle countdown and show the bar.
+void MainView::MiniBarActivity() {
+    if (modes_.mini) StartMiniBarAnim(miniHide_.Activity(host.Now()));
+}
+
+void MainView::PointerPressed() { MiniBarActivity(); }
+
+/// App::BarInteractionActive for the mini bar: a popup / menu, a seek drag, the pointer over it or a press held on it.
+bool MainView::MiniBarInteractionActive() const {
+    app::MiniBar* mb = shell->Mini();
+    if (UserPopupOpen() || mb->SeekDragging()) return true;
+    if (const pui::Widget* hv = host.Hovered()) if (mb->IsAncestorOf(hv)) return true;
+    if (const pui::Widget* cp = host.Captured()) if (mb->IsAncestorOf(cp)) return true;
+    return false;
+}
+
+/// AppRender.cpp AutoHideTick (windowed / mini rule): hide after 3 s idle while playing, show again when not playing.
+void MainView::MiniAutoHideTick(std::uint64_t now) {
+    if (!modes_.mini) return;
+    NSWindow* w = (__bridge NSWindow*)(void*)MainHwnd();
+    StartMiniBarAnim(miniHide_.Tick(now, state_ == wvp::PlayerState::Playing, MiniBarInteractionActive(), w && w.miniaturized));
+}
+
+/// AppRender.cpp StartBarAnim: 300 ms ease-out show / 500 ms ease-in hide, sliding kBarSlideDip down while fading.
+void MainView::StartMiniBarAnim(app::AutoHide::Action a) {
+    if (a == app::AutoHide::Action::None) return;
+    PlaceMiniBar();
+    if (miniFadeBegin_ && miniHide_.Animating(host.Now())) host.StartAnimating(miniFadeBegin_);
+}
+
+/// The mini bar at the auto-hide progress p: its layout rect moved p x kBarSlideDip down, opacity 1 - p, hidden at p = 1.
+void MainView::PlaceMiniBar() {
+    app::MiniBar* mini = shell->Mini();
+    if (!modes_.mini) {
+        if (miniFadeBegin_) miniFadeBegin_->opacity = 1;
+        return;
+    }
+    const float p = std::clamp(miniHide_.P(host.Now()), 0.f, 1.f);
+    if (!layout_.bar.Empty()) mini->SetBounds(layout_.bar.Offset(0, app::kBarSlideDip * p));
+    mini->SetVisible(p < 1.f);
+    if (miniFadeBegin_) miniFadeBegin_->opacity = 1.f - p;
+    host.Invalidate();
+}
+
+/// App::mediaAspect_ for the mini player's aspect-locked resizing (App's WM_SIZING -> MiniConstrainSizing).
+void MainView::ApplyMiniAspect() {
+    if (!modes_.mini) return;
+    if (NSWindow* w = (__bridge NSWindow*)(void*)MainHwnd()) w.contentAspectRatio = NSMakeSize(mediaAspect_ * 1000, 1000);
+}
+
+/// App::ChipsTick.
+void MainView::ChipsTick(std::uint64_t now) {
+    if (!Loaded() || chipsNextMs_ == 0 || now < chipsNextMs_) return;
+    if (chipsStage_ == 0) { RefreshChips(); chipsStage_ = 1; chipsNextMs_ = std::max(now + 1, chipsPreparedMs_ + 1500); return; }
+    if (chipsStage_ == 1) { RefreshChips(); chipsStage_ = 2; chipsNextMs_ = now + 2000; return; }
+    if (state_ == wvp::PlayerState::Playing) RefreshChips();
+    chipsNextMs_ = now + 2000;
+}
+
+/// IsZoomed / IsIconic of the player window.
+bool MainView::WindowZoomedOrMinimized() const {
+    NSWindow* w = (__bridge NSWindow*)(void*)MainHwnd();
+    return w && (w.zoomed || w.miniaturized);
 }
 
 // --- main menu: features/Menus.cpp ---------------------------------------------------------------------

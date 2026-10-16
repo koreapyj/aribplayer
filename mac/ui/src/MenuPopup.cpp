@@ -1,6 +1,8 @@
 #include "puimac/MenuPopup.h"
 
 #include <algorithm>
+#include <cmath>
+#include <unordered_map>
 
 #include "pui/Buttons.h"
 #include "pui/Glyphs.h"
@@ -12,6 +14,19 @@ namespace puimac {
 namespace {
 constexpr uint64_t kSubMenuDelayMs = 180;
 constexpr float kAccelGap = 24, kSubChevronW = 20;
+constexpr float kEdge = 4;   // gap between a menu and the edges of its area
+
+std::unordered_map<UiHost*, std::function<RectF(PointF)>>& MenuAreas() {
+    static std::unordered_map<UiHost*, std::function<RectF(PointF)>> areas;
+    return areas;
+}
+
+// Inside the area (the top-left edge wins when the menu is larger than it), on whole DIPs.
+RectF KeepInside(const RectF& area, float x, float y, SizeF sz) {
+    x = std::clamp(x, area.l + kEdge, std::max(area.l + kEdge, area.r - kEdge - sz.w));
+    y = std::clamp(y, area.t + kEdge, std::max(area.t + kEdge, area.b - kEdge - sz.h));
+    return RectF::XYWH(std::round(x), std::round(y), sz.w, sz.h);
+}
 
 TextStyle MenuText() { return BodyTextStyle(13); }
 TextStyle AccelText() { TextStyle s = BodyTextStyle(13); s.align = TextAlign::Trailing; return s; }
@@ -62,7 +77,14 @@ int MenuPopup::IndexAt(PointF p) const {
     return -1;
 }
 
+void MenuPopup::PaintInWindow(IRenderer& r, const Theme& t) {
+    paintingInWindow_ = true;
+    PaintTree(r, t);
+    paintingInWindow_ = false;
+}
+
 void MenuPopup::Paint(IRenderer& r, const Theme& t) {
+    if (ownWindow_ && !paintingInWindow_) return;   // its window paints it
     RectF b = Bounds();
     r.FillRoundRect(b, t.overlayRadius, t.flyoutSurface);
     r.StrokeRoundRect(b.Deflate(0.5f, 0.5f, 0.5f, 0.5f), t.overlayRadius, t.flyoutStroke, 1);
@@ -168,11 +190,13 @@ void MenuPopup::OpenSubMenu(int i) {
     MenuPopup* raw = sub.get();
     SizeF sz = sub->DesiredSize(nullptr);
     RectF row = RowRect(i);
-    SizeF client = h->Size();
+    const RectF area = MenuArea(*h, {Bounds().r, row.t});
+    // Beside the row, to the right; to the left of the menu when it would leave the area there; moved up when it
+    // would leave it at the bottom (native submenus do the same).
     float x = Bounds().r - 4, y = row.t - kPadV;
-    if (x + sz.w > client.w - 4) x = std::max(4.f, Bounds().l - sz.w + 4);
-    y = std::clamp(y, 4.f, std::max(4.f, client.h - sz.h - 4));
-    sub->SetBounds(RectF::XYWH(x, y, sz.w, sz.h));
+    if (x + sz.w > area.r - kEdge) x = Bounds().l - sz.w + 4;
+    if (y + sz.h > area.b - kEdge) y = area.b - kEdge - sz.h;
+    sub->SetBounds(KeepInside(area, x, y, sz));
     PopupOptions o = MenuOptions(this);
     o.onClosed = [this, raw] { if (sub_ == raw) { sub_ = nullptr; subIndex_ = -1; Invalidate(); } };
     sub_ = h->OpenPopup(std::move(sub), std::move(o));
@@ -302,14 +326,38 @@ bool MenuPopup::OnKeyDown(int vk, unsigned mods) {
     }
 }
 
+RectF MenuArea(UiHost& host, PointF near) {
+    auto it = MenuAreas().find(&host);
+    if (it != MenuAreas().end()) return it->second(near);
+    const SizeF client = host.Size();
+    return {0, 0, client.w, client.h};
+}
+
+void SetMenuArea(UiHost* host, std::function<RectF(PointF)> area) {
+    if (area) MenuAreas()[host] = std::move(area);
+    else MenuAreas().erase(host);
+}
+
+RectF PlaceMenuAtPoint(const RectF& area, PointF p, SizeF sz) {
+    float x = p.x, y = p.y;
+    if (x + sz.w > area.r - kEdge && p.x - sz.w >= area.l + kEdge) x = p.x - sz.w;
+    if (y + sz.h > area.b - kEdge && p.y - sz.h >= area.t + kEdge) y = p.y - sz.h;
+    return KeepInside(area, x, y, sz);
+}
+
+RectF PlaceMenuBeside(const RectF& area, const RectF& a, SizeF sz, bool preferAbove) {
+    float y = preferAbove ? a.t - 4 - sz.h : a.b + 4;
+    if (preferAbove && y < area.t + kEdge && a.b + 4 + sz.h <= area.b - kEdge) y = a.b + 4;
+    if (!preferAbove && y + sz.h > area.b - kEdge && a.t - 4 - sz.h >= area.t + kEdge) y = a.t - 4 - sz.h;
+    float x = a.l;
+    if (x + sz.w > area.r - kEdge) x = a.r - sz.w;
+    return KeepInside(area, x, y, sz);
+}
+
 MenuPopup* ShowMenu(UiHost& host, std::vector<MenuItemDesc> items, PointF at, IRenderer* measurer, Widget* focusReturn) {
     auto m = std::make_unique<MenuPopup>(std::move(items));
     MenuPopup* raw = m.get();
-    SizeF sz = m->DesiredSize(measurer);
-    SizeF client = host.Size();
-    float x = std::clamp(at.x, 4.f, std::max(4.f, client.w - sz.w - 4));
-    float y = std::clamp(at.y, 4.f, std::max(4.f, client.h - sz.h - 4));
-    m->SetBounds(RectF::XYWH(x, y, sz.w, sz.h));
+    m->SetBounds(PlaceMenuAtPoint(MenuArea(host, at), at, m->DesiredSize(measurer)));
     host.OpenPopup(std::move(m), MenuOptions(focusReturn));
     raw->Raise(UiEvent::MenuOpened);
     return raw;
@@ -318,14 +366,8 @@ MenuPopup* ShowMenu(UiHost& host, std::vector<MenuItemDesc> items, PointF at, IR
 MenuPopup* ShowMenu(UiHost& host, std::vector<MenuItemDesc> items, Widget* anchor, IRenderer* measurer) {
     auto m = std::make_unique<MenuPopup>(std::move(items));
     MenuPopup* raw = m.get();
-    SizeF sz = m->DesiredSize(measurer);
-    RectF a = anchor ? anchor->Bounds() : RectF{};
-    SizeF client = host.Size();
-    float y = a.b + 4;
-    if (y + sz.h > client.h - 4 && a.t - 4 - sz.h >= 4) y = a.t - 4 - sz.h;
-    float x = std::clamp(a.l, 4.f, std::max(4.f, client.w - sz.w - 4));
-    y = std::clamp(y, 4.f, std::max(4.f, client.h - sz.h - 4));
-    m->SetBounds(RectF::XYWH(x, y, sz.w, sz.h));
+    const RectF a = anchor ? anchor->Bounds() : RectF{};
+    m->SetBounds(PlaceMenuBeside(MenuArea(host, {a.l, a.b}), a, m->DesiredSize(measurer), false));
     host.OpenPopup(std::move(m), MenuOptions(anchor));
     raw->Raise(UiEvent::MenuOpened);
     return raw;

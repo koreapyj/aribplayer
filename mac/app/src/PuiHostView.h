@@ -22,4 +22,6 @@ namespace puimac { class CGRenderer; }
 - (void)applyTheme;
 /// Repaints when the host is dirty and keeps the 60 Hz tick alive while widgets animate.
 - (void)afterEvent;
+/// Esc that no widget or popup took (an open flyout / dialog closes first): the window's own Esc (Settings closes).
+- (void)setOnEscape:(std::function<void()>)onEscape;
 @end

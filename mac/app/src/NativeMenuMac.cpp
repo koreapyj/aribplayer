@@ -121,20 +121,11 @@ bool Show(std::vector<pui::MenuItemDesc> items, pui::RectF anchor, bool point, b
     if (OsDialogsBlocked() || !g_host) return false;
     auto m = std::make_unique<puimac::MenuPopup>(std::move(items));
     puimac::MenuPopup* raw = m.get();
-    pui::SizeF sz = m->DesiredSize(g_measurer);
-    pui::SizeF client = g_host->Size();
-    float x, y;
-    if (point) {
-        x = anchor.l; y = anchor.t;
-    } else {
-        x = anchor.l;
-        y = preferAbove ? anchor.t - 4 - sz.h : anchor.b + 4;
-        if (preferAbove && y < 4 && anchor.b + 4 + sz.h <= client.h - 4) y = anchor.b + 4;
-        if (!preferAbove && y + sz.h > client.h - 4 && anchor.t - 4 - sz.h >= 4) y = anchor.t - 4 - sz.h;
-    }
-    x = std::clamp(x, 4.f, std::max(4.f, client.w - sz.w - 4));
-    y = std::clamp(y, 4.f, std::max(4.f, client.h - sz.h - 4));
-    m->SetBounds(pui::RectF::XYWH(x, y, sz.w, sz.h));
+    // Inside the menu area: the visible frame of the screen where the menus have their own windows (MenuWindowsMac),
+    // flipping left / above at its edges like a native menu; TrackPopupMenuEx does the same on Windows.
+    const pui::SizeF sz = m->DesiredSize(g_measurer);
+    const pui::RectF area = puimac::MenuArea(*g_host, {anchor.l, point ? anchor.t : anchor.b});
+    m->SetBounds(point ? puimac::PlaceMenuAtPoint(area, {anchor.l, anchor.t}, sz) : puimac::PlaceMenuBeside(area, anchor, sz, preferAbove));
     pui::PopupOptions o;
     o.lightDismiss = true;
     o.takeFocus = true;

@@ -1,7 +1,8 @@
 #pragma once
 // Mac implementation of features/NativeMenu.h (app::nativemenu): the pui::MenuItemDesc trees the shell builds are shown
-// as pui-drawn puimac::MenuPopup popups in the shell's UiHost instead of Win32 TrackPopupMenuEx. The host registers the
-// UiHost + measurer once; HWND owner functions are accepted and ignored.
+// as pui-drawn puimac::MenuPopup popups in the shell's UiHost instead of Win32 TrackPopupMenuEx, each in a window of its
+// own (MenuWindowsMac) like the native menus. The host registers the UiHost + measurer once; HWND owner functions are
+// accepted and ignored.
 #include <string>
 #include <vector>
 
