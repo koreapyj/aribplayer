@@ -30,7 +30,7 @@ enum class CommandId : int {
     KeyframePrevious, KeyframeNext,
     SeekForward5,
     Stop, ToggleControlPanel, TogglePlaylistPanel, CycleAlwaysOnTop, ToggleTimeMode,
-    FocusPlaylistSearch
+    FocusPlaylistSearch, CopyFfmpegCommandLine
 };
 
 /// Modifier bits (identical to pui::Mods): 1 Shift, 2 Ctrl, 4 Alt.

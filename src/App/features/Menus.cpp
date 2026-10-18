@@ -4,6 +4,7 @@
 
 #include "AppContext.h"
 #include "Localize.h"
+#include "features/FfmpegCommand.h"
 #include "features/FiltersPanel.h"
 #include "features/FxModel.h"
 #include "features/NativeMenu.h"
@@ -112,6 +113,7 @@ std::vector<MenuItemDesc> BuildMenu(const MenuState& s, std::function<void(const
         vs.push_back(MenuItemDesc::Check(Tr(L"Zoom to fill", L"화면 채우기"), s.zoom, [run](bool v) { if (run) run(MenuCmd{Cmd::Zoom, 0, 0, v}); },
                                          acc(CommandId::ZoomToFill)));
         vs.push_back(item(Tr(L"Enhancements…", L"영상 향상…"), CommandId::VideoEnhancements, G::VideoEnhancer));
+        vs.push_back(item(Tr(L"Copy ffmpeg command line for current frame", L"현재 프레임의 ffmpeg 명령줄 복사"), CommandId::CopyFfmpegCommandLine, 0, s.canCopyFfmpeg));
         m.push_back(MenuItemDesc::Sub(Tr(L"Video", L"영상"), std::move(vs), G::VideoSettings));
     }
     if (s.aribAudio) {
@@ -183,6 +185,7 @@ MenuState CaptureMenuState(AppContext& ctx) {
         s.bar.playing = p->State() == wvp::PlayerState::Playing;
         if (auto mi = p->GetMediaInfo()) {
             s.hasMedia = true;
+            s.canCopyFfmpeg = mi->Seekable && !mi->Of(wvp::StreamType::Video).empty() && !FfmpegInputOf(ctx.Controller() ? ctx.Controller()->Current() : nullptr).empty();
             s.audio = mi->Of(wvp::StreamType::Audio);
             s.subs = mi->Of(wvp::StreamType::Subtitle);
             if (mi->AribAudio.Present) {

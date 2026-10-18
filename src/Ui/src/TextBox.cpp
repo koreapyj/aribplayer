@@ -1,9 +1,8 @@
 #include "pui/TextBox.h"
 
-#include <windows.h>
+#include <algorithm>
 
-#include <cstring>
-
+#include "pui/Clipboard.h"
 #include "pui/Glyphs.h"
 
 namespace pui {
@@ -11,32 +10,6 @@ namespace pui {
 namespace {
 constexpr int kVkC = 0x43, kVkV = 0x56, kVkX = 0x58;
 constexpr float kPadL = 10, kPadR = 8, kGlyphSize = 14, kGlyphGap = 8, kCharGuess = 7;
-
-std::wstring ClipboardText() {
-    std::wstring out;
-    if (!OpenClipboard(nullptr)) return out;
-    if (HANDLE h = GetClipboardData(CF_UNICODETEXT)) {
-        if (auto* p = static_cast<const wchar_t*>(GlobalLock(h))) {
-            out = p;
-            GlobalUnlock(h);
-        }
-    }
-    CloseClipboard();
-    return out;
-}
-
-void SetClipboardText(const std::wstring& s) {
-    if (!OpenClipboard(nullptr)) return;
-    EmptyClipboard();
-    if (HGLOBAL g = GlobalAlloc(GMEM_MOVEABLE, (s.size() + 1) * sizeof(wchar_t))) {
-        if (auto* p = static_cast<wchar_t*>(GlobalLock(g))) {
-            std::memcpy(p, s.c_str(), (s.size() + 1) * sizeof(wchar_t));
-            GlobalUnlock(g);
-            if (!SetClipboardData(CF_UNICODETEXT, g)) GlobalFree(g);
-        } else GlobalFree(g);
-    }
-    CloseClipboard();
-}
 }
 
 TextBox::TextBox() : Widget(Role::Edit) {

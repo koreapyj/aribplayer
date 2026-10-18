@@ -69,6 +69,7 @@ set(AP_APP_SOURCES
     ${APP_ROOT}/features/BadgeLogic.cpp
     ${APP_ROOT}/features/ListsCommon.cpp
     ${APP_ROOT}/features/Menus.cpp
+    ${APP_ROOT}/features/FfmpegCommand.cpp
     ${APP_ROOT}/features/FiltersPanel.cpp
     ${APP_ROOT}/features/FxModel.cpp
     ${APP_ROOT}/features/FxProps.cpp

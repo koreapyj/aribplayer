@@ -84,6 +84,8 @@ public:
     virtual std::optional<BgraFrame> Snapshot() = 0;
     /// Captures with optional subtitle composition. The default implementation captures video only.
     virtual std::optional<BgraFrame> Snapshot(bool withSubtitles) { (void)withSubtitles; return Snapshot(); }
+    /// nullopt when no video frame is displayed or the backend cannot tell.
+    virtual std::optional<FrameSeekPoint> DisplayedFrameSeekPoint() { return std::nullopt; }
     // UTF-8 JSON snapshot of live decoder/filter/sync state (libffplay ffp_get_debug_info, see wvp/DebugInfo.h),
     // nullopt when unsupported or nothing is open. Default: unsupported.
     virtual std::optional<std::string> GetDebugInfoJson() { return std::nullopt; }

@@ -271,6 +271,7 @@ private:
     void CloseMedia();
     void TogglePlaylistPanel();
     void FocusPlaylistSearch();
+    void CopyFfmpegCommandLine();
     /// Narrow window: the playlist panel as a right-side light-dismiss popup over the video (second PlaylistPanel instance).
     void OpenPanelOverlay();   // full screen: the same panel, full height at the right edge (opened by the right edge zone)
     /// Runs f on the docked panel and on the overlay instance when open (queue / playlist change notifications).

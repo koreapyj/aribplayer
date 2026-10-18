@@ -47,6 +47,7 @@ struct MenuState {
     wvp::AlwaysOnTop alwaysOnTop = wvp::AlwaysOnTop::Disable;
     double speed = 1.0;
     bool zoom = false;
+    bool canCopyFfmpeg = false;                 // seekable media with video and a usable input path / URL
     std::vector<wvp::StreamInfo> audio, subs;   // same-type streams of the current media
     bool subVisible = true;                     // the caption layer is shown (setting showCaptions)
     // ARIB TS: the audio item is a fixed pair Audio 1 / Audio 2 (the preference); audio 2 stays selectable while no

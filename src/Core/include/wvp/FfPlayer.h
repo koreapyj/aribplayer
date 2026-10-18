@@ -72,6 +72,7 @@ public:
     bool IsMuted() const override { return muted_.load(); }
     void SetMuted(bool m) override;
     double Position() override;
+    std::optional<FrameSeekPoint> DisplayedFrameSeekPoint() override;
     double Duration() override;
     int Open(const std::string& url, const OpenOptions& options = {}) override;
     int Stop() override;

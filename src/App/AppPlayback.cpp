@@ -22,6 +22,8 @@
 #include "features/PlaybackExtras.h"
 #include "features/PropertiesDialog.h"
 #include "wvp/win32/FrameCapture.h"
+#include "features/FfmpegCommand.h"
+#include "pui/Clipboard.h"
 #include "wvp/M3uWriter.h"
 #include "wvp/PlaylistLoader.h"
 #include "wvp/win32/Utf.h"
@@ -648,6 +650,14 @@ void App::Capture(bool withSubtitles) {
     }).detach();
 }
 
+void App::CopyFfmpegCommandLine() {
+    auto point = player_ ? player_->DisplayedFrameSeekPoint() : std::nullopt;
+    const std::wstring input = FfmpegInputOf(ctl_ ? ctl_->Current() : nullptr);
+    if (!point || input.empty()) { ShowToast(Tr(L"No frame to copy", L"복사할 프레임이 없습니다")); return; }
+    pui::SetClipboardText(FfmpegFrameCommandLine(input, *point, false));
+    ShowToast(Tr(L"Copied", L"복사됨"));
+}
+
 PlaylistPanel* App::SelectionPanel() const {
     if (!shell_) return nullptr;
     PlaylistPanel* p = panelPopup_ ? panelPopup_ : (svc_->settings.playlistPanel && !layout_.panelOverlay ? shell_->Panel() : nullptr);
@@ -788,6 +798,7 @@ void App::Execute(CommandId c) {
     case C::OpenFolder: OpenFolder(*this); break;
     case C::OpenUrl: OpenUrl(*this); break;
     case C::CaptureFrame: Capture(false); break;
+    case C::CopyFfmpegCommandLine: CopyFfmpegCommandLine(); break;
     case C::CaptureFrameWithCaptions: Capture(true); break;
     case C::ShowProperties: ShowPropertiesDialog(*this); break;
     case C::ShowEqualizer: ShowFiltersPanel(*this, FiltersTab::Audio); break;

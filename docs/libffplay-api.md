@@ -131,6 +131,12 @@ key or forward past the last, nothing moves). It takes the same one-at-a-time sl
 `ffp_seek_keyframe` (`FFP_EBUSY`, never queued), completes with POSITION and KEYSEEK_DONE, and keeps the play state. Without
 a seekable video stream (audio only, cover art, live) it queues a plain relative `ffp_seek` and reports `moved` `0`.
 
+`ffp_get_frame_seek_point(p, &frame, &key)` reports where the displayed video frame sits for an external cut
+(`ffmpeg -ss <key> -i file -ss <frame-key>`): `frame` is its source PTS (before IVTC / output-timing filters) and `key` the
+PTS of the key packet decoding must start from to reach it, both media-relative seconds, `key <= frame`. A frame shown before
+its own keyframe (open-GOP leading picture) reports the previous key. Returns `0`; `FFP_EINVAL` for NULL arguments;
+`FFP_EAGAIN` (outputs untouched) when no video frame is displayed or the key is unknown. Refreshed with the position.
+
 ## Event payloads (JSON, UTF-8)
 
 | Code | Name | Payload |

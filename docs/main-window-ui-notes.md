@@ -95,7 +95,7 @@ Windowed: no bar fill (the window backdrop shows). Full screen / mini: `barFill`
 | Playlist toggle, windowed | window grows/shrinks by panel width + gap so the video keeps its size | - | maximized/fullscreen/narrow: video resizes instead |
 
 Main menu (`features/Menus`): Open file / folder / URL, Close; Play submenu (play/pause, prev/next, seek
-steps, speed, repeat, shuffle, mini player); Subtitles / Video / Sound submenus; Always on top submenu; Equalizer, Copy frame, Properties;
+steps, speed, repeat, shuffle, mini player); Subtitles / Video (zoom to fill, enhancements, copy ffmpeg command line for the current frame) / Sound submenus; Always on top submenu; Equalizer, Copy frame, Properties;
 Playlist panel (F6), Control panel (F7), Settings (F5: opens the separate Settings window, see §9); Exit.
 
 Subtitles submenu (`BuildSubtitleItems`, also the bar button's right-click menu; needs open media): Off, then every selectable subtitle track,

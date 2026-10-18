@@ -24,12 +24,13 @@ set(PUI_NEUTRAL_SOURCES
     ${PUI_ROOT}/src/Panels.cpp
     ${PUI_ROOT}/src/ScrollViewer.cpp
     ${PUI_ROOT}/src/Slider.cpp
+    ${PUI_ROOT}/src/TextBox.cpp
     ${PUI_ROOT}/src/Toggles.cpp
     ${PUI_ROOT}/src/ToolTipStyle.cpp
     ${PUI_ROOT}/src/VirtualList.cpp
     ${PUI_ROOT}/src/Widget.cpp)
-# Excluded (Win32 only):      D2dRenderer.cpp (Direct2D), Uia.cpp + UiaProviders.cpp (UI Automation / COM).
-# Replaced by mac/ui/src/TextBoxMac.mm: TextBox.cpp (Win32 clipboard).
+# Excluded (Win32 only):      D2dRenderer.cpp (Direct2D), Uia.cpp + UiaProviders.cpp (UI Automation / COM), Clipboard.cpp (Win32
+# clipboard; replaced by mac/ui/src/ClipboardMac.mm).
 
 add_library(pui_mac STATIC
     ${PUI_NEUTRAL_SOURCES}
@@ -38,7 +39,7 @@ add_library(pui_mac STATIC
     src/MacTheme.mm
     src/KeyMap.mm
     src/MenuPopup.cpp
-    src/TextBoxMac.mm)
+    src/ClipboardMac.mm)
 target_include_directories(pui_mac PUBLIC ${PUI_ROOT}/include ${CMAKE_CURRENT_SOURCE_DIR}/include)
 # -Wno-missing-field-initializers: Renderer.h RecordingRenderer aggregate inits; -Wno-overloaded-virtual: Slider.h:28
 # SetValue(double) hides Widget::SetValue(const wstring&).

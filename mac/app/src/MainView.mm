@@ -16,6 +16,7 @@
 #include "NativeMenuMac.h"
 #include "WindowSizing.h"
 #include "features/BadgeLogic.h"
+#include "features/FfmpegCommand.h"
 #include "features/Logging.h"
 #include "features/LoggingFormat.h"
 #include "features/FiltersPanel.h"
@@ -29,6 +30,7 @@
 #include "features/SettingsLogic.h"
 #include "features/SettingsService.h"
 #include "pui/Buttons.h"
+#include "pui/Clipboard.h"
 #include "pui/Glyphs.h"
 #include "pui/InfoBar.h"
 #include "pui/TextBox.h"
@@ -1087,6 +1089,15 @@ void MainView::Capture(bool withSubtitles) {
     ShowToast(app::Tr(L"Copied", L"복사됨"));
 }
 
+/// App::CopyFfmpegCommandLine: `ffmpeg -ss <key> -i '<input>' -ss <offset>` for the displayed frame to the text clipboard.
+void MainView::CopyFfmpegCommandLine() {
+    auto point = player_->DisplayedFrameSeekPoint();
+    const std::wstring input = app::FfmpegInputOf(ctl_->Current());
+    if (!point || input.empty()) { ShowToast(app::Tr(L"No frame to copy", L"복사할 프레임이 없습니다")); return; }
+    pui::SetClipboardText(app::FfmpegFrameCommandLine(input, *point, true));
+    ShowToast(app::Tr(L"Copied", L"복사됨"));
+}
+
 void MainView::Execute(CommandId c) {
     subsDirty_ = true;
     using C = CommandId;
@@ -1153,6 +1164,7 @@ void MainView::Execute(CommandId c) {
     case C::OpenFolder: app::OpenFolder(*this); break;
     case C::OpenUrl: app::OpenUrl(*this); break;
     case C::CaptureFrame: Capture(false); break;
+    case C::CopyFfmpegCommandLine: CopyFfmpegCommandLine(); break;
     case C::CaptureFrameWithCaptions: Capture(true); break;
     case C::ShowProperties: app::ShowPropertiesDialog(*this); break;
     case C::ShowEqualizer: app::ShowFiltersPanel(*this, app::FiltersTab::Audio); break;

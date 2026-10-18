@@ -88,5 +88,5 @@ libffpmetalpresenter; `Resources/` holds the icon, caption font, notices and `li
 - libaribcaption's CoreText provider uses family names. `CaptionFont.mm` registers the bundled TTF
   per process and passes its family.
 - SDL's audio initialization installs SIGINT/SIGTERM handlers; `main.mm` reclaims both with dispatch sources.
-- `ui/src/TextBoxMac.mm` mirrors `src/Ui/src/TextBox.cpp` except its clipboard helpers; keep them in sync.
+- `ui/src/ClipboardMac.mm` implements `pui/Clipboard.h` (text clipboard) on NSPasteboard; `TextBox.cpp` is shared as-is.
 - `CGRenderer` maps pui's Fluent text sizes 14/12/20/28 to Mac sizes 13/11/17/22.

@@ -1452,6 +1452,40 @@ TEST_CASE_INTEGRATION(FfPlayer_keyframe_seek_paused_walks_every_keyframe) {
     }
 }
 
+// The seek point of the displayed frame: on a keyframe Key == Frame; stepping forward advances Frame (its source pts)
+// while Key stays the pts of the GOP's key packet.
+TEST_CASE_INTEGRATION(FfPlayer_frame_seek_point_tracks_source_frame_and_gop_key) {
+    for (const KeyFixture& fx : kKeyFixtures) {
+        if (std::string(fx.rel).find(".ts") == std::string::npos) continue;
+        const fs::path path = RepoRoot() / L"testmedia" / fx.rel;
+        REQUIRE_MSG(fs::exists(path), std::string("missing fixture ") + fx.name);
+        Session s;
+        s.OpenAndPrepare(wvp::ToUtf8(path.wstring()), KeyOptions());
+        WaitFirstFrame(s);
+        Delay(300);
+        WaitPaused(s);
+        const std::string tag = std::string(fx.name) + ": ";
+        REQUIRE_MSG(DoKeySeek(s, +1).moved && DoKeySeek(s, +1).moved, tag + "could not reach keyframe 2");
+        const double key = s.lastKey.key;
+
+        auto point = s.player->DisplayedFrameSeekPoint();
+        REQUIRE_MSG(point.has_value(), tag + "no seek point on a displayed keyframe");
+        CHECK_MSG(std::fabs(point->Frame - key) < 1e-3 && std::fabs(point->Key - key) < 1e-3,
+                  tag + "keyframe seek point is " + std::to_string(point->Frame) + "/" + std::to_string(point->Key) + ", key packet " + std::to_string(key));
+
+        double prevFrame = point->Frame;
+        for (int i = 0; i < 4; ++i) {
+            const int done = s.stepDones;
+            REQUIRE_MSG(s.player->StepFrame(+1) == 0 && WaitFor([&] { return s.stepDones > done; }, 15), tag + "frame step failed");
+            point = s.player->DisplayedFrameSeekPoint();
+            REQUIRE_MSG(point.has_value(), tag + "no seek point after a step");
+            CHECK_MSG(point->Frame > prevFrame, tag + "Frame did not advance on step " + std::to_string(i));
+            CHECK_MSG(std::fabs(point->Key - key) < 1e-3 && point->Key <= point->Frame, tag + "Key left the GOP key: " + std::to_string(point->Key));
+            prevFrame = point->Frame;
+        }
+    }
+}
+
 // D (previous output frame) across a GOP boundary: from a keyframe and from the frame after it, on short and long GOPs.
 // The predecessor of a keyframe is the last frame of the previous GOP, however far back that GOP's keyframe is.
 TEST_CASE_INTEGRATION(FfPlayer_step_frame_previous_crosses_a_keyframe_boundary) {

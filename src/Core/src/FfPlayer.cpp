@@ -320,6 +320,11 @@ void FfPlayer::SetMuted(bool m) {
 }
 
 double FfPlayer::Position() { return p_ ? ffp_get_position(p_) : std::nan(""); }
+std::optional<FrameSeekPoint> FfPlayer::DisplayedFrameSeekPoint() {
+    double frame = 0.0, key = 0.0;
+    if (!p_ || ffp_get_frame_seek_point(p_, &frame, &key) != 0) return std::nullopt;
+    return FrameSeekPoint{frame, key};
+}
 double FfPlayer::Duration() { return p_ ? ffp_get_duration(p_) : 0.0; }
 
 std::optional<MediaInfo> FfPlayer::GetMediaInfo() {

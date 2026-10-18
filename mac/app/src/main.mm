@@ -56,6 +56,7 @@
 #include "WindowSizing.h"
 #include "features/FiltersPanel.h"
 #include "features/Logging.h"
+#include "features/Menus.h"
 #include "features/MiniLogic.h"
 #include "features/OpenFlows.h"
 #include "features/OpenLogic.h"
@@ -376,6 +377,7 @@ static NSEventModifierFlags MacMods(unsigned m) {
     [view addItem:[NSMenuItem separatorItem]];
     [self add:view title:Tr(L"Always on Top", L"항상 위에") command:C::CycleAlwaysOnTop symbol:@"pin"];
     [self add:view title:Tr(L"Zoom to Fill", L"화면 채우기") command:C::ZoomToFill symbol:@"arrow.up.and.down.and.arrow.left.and.right"];
+    [self add:view title:Tr(L"Copy ffmpeg Command Line for Current Frame", L"현재 프레임의 ffmpeg 명령줄 복사") command:C::CopyFfmpegCommandLine symbol:@"terminal"];
     viewItem.submenu = view;
 
     NSMenuItem* windowItem = [bar addItemWithTitle:ToNS(Tr(L"Window", L"윈도우")) action:nil keyEquivalent:@""];
@@ -424,6 +426,8 @@ static NSEventModifierFlags MacMods(unsigned m) {
         case C::CycleAlwaysOnTop:
             item.state = _mv->Svc().settings.alwaysOnTop != wvp::AlwaysOnTop::Disable ? NSControlStateValueOn : NSControlStateValueOff;
             return YES;
+        case C::CopyFfmpegCommandLine:
+            return app::menus::CaptureMenuState(*_mv).canCopyFfmpeg;
         default: break;
         }
         if (c == C::Previous) return _mv->Ctl().HasPrevious();

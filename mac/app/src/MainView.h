@@ -217,6 +217,7 @@ private:
     void SyncModel();
     void TogglePlaylistPanel();
     void FocusPlaylistSearch();
+    void CopyFfmpegCommandLine();
     /// App::OpenPanelOverlay: the playlist panel as a light-dismiss popup at the stored width (min(width, W - 16)) over
     /// the video's right side; full screen: the full-height column at the right edge with square corners, not active.
     void OpenPanelOverlay();

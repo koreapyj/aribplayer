@@ -105,6 +105,12 @@ struct MediaInfo {
     static std::optional<MediaInfo> Parse(const std::string& json);
 };
 
+// Source timestamps of the displayed video frame, media-relative seconds (the timeline of ffmpeg's input -ss): the
+// frame itself and the key packet decoding has to start from to reach it.
+struct FrameSeekPoint {
+    double Frame = 0, Key = 0;
+};
+
 // Owned BGRA frame (bytes B,G,R,A; top-down rows; Stride bytes per row).
 struct BgraFrame {
     int Width = 0, Height = 0, Stride = 0;
