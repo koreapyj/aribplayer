@@ -1,5 +1,7 @@
---- a/libavcodec/libaribcaption.c
-+++ b/libavcodec/libaribcaption.c
+Index: quilt-tree/libavcodec/libaribcaption.c
+===================================================================
+--- quilt-tree.orig/libavcodec/libaribcaption.c
++++ quilt-tree/libavcodec/libaribcaption.c
 @@ -38,7 +38,7 @@
  
  #define ARIBC_BPRINT_SIZE_INIT         64
@@ -277,16 +279,32 @@
              return 0;
          sub->format = 0;
          sub->num_rects = 0;
-@@ -599,7 +594,7 @@ static int aribcaption_trans_bitmap_subt
+@@ -599,7 +594,15 @@ static int aribcaption_trans_bitmap_subt
                  rect->x, rect->y, rect->w, rect->h,
                  rect_idx, ctx->clut_idx);
          if (ctx->clut_overflow)
 -            av_log(ctx, AV_LOG_WARNING, "CLUT overflow (%d).\n", ctx->clut_overflow);
 +            ff_dlog(ctx, "CLUT overflow (%d).\n", ctx->clut_overflow);
++    }
++    /* The plain text of the whole caption (the decoder leaves ruby out of it) rides on the first rect. */
++    if (rect_count && caption->text && *caption->text) {
++        sub->rects[0]->text = av_strdup(caption->text);
++        if (!sub->rects[0]->text) {
++            ret = AVERROR(ENOMEM);
++            goto fail;
++        }
      }
      sub->num_rects = rect_idx;
  
-@@ -621,6 +616,47 @@ fail:
+@@ -611,6 +614,7 @@ fail:
+             if (sub->rects[i]) {
+                 av_freep(&sub->rects[i]->data[0]);
+                 av_freep(&sub->rects[i]->data[1]);
++                av_freep(&sub->rects[i]->text);
+                 av_freep(&sub->rects[i]);
+             }
+         }
+@@ -621,6 +625,47 @@ fail:
      return ret;
  }
  
@@ -334,7 +352,7 @@
  static int set_ass_header(ARIBCaptionContext *ctx)
  {
      AVCodecContext *avctx = ctx->avctx;
-@@ -1404,13 +1440,8 @@ static int aribcaption_rerender(ARIBCapt
+@@ -1404,13 +1449,8 @@ static int aribcaption_rerender(ARIBCapt
      h = &ctx->store.events[idx];
      /* The renderer copies the caption; the history keeps ownership. Appending
       * an older pts re-inserts it and invalidates the renderer's image cache. */
@@ -349,7 +367,7 @@
      if (ret < 0)
          return ret;
      ctx->rendered_subtitle_pts = h->subtitle_pts;
-@@ -1691,7 +1722,7 @@ static av_cold int aribcaption_init(AVCo
+@@ -1691,7 +1731,7 @@ static av_cold int aribcaption_init(AVCo
  
          aribcc_renderer_set_storage_policy(ctx->renderer, ARIBCC_CAPTION_STORAGE_POLICY_MINIMUM, 0);
          aribcc_renderer_set_replace_drcs(ctx->renderer, ctx->replace_drcs);

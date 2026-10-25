@@ -1048,7 +1048,9 @@ void App::OnVideoInput(const VideoInput& e) {
             StartBarAnim(autoHide_.Activity(now));   // a single click does nothing else (VideoClickCommand(1) == None)
         } else if (e.button == 3) {
             StartBarAnim(autoHide_.Activity(now));
-            ShowMainMenu(*this, {(e.x + layout_.video.l) / scale_, (e.y + layout_.video.t) / scale_});
+            const pui::PointF at{(e.x + layout_.video.l) / scale_, (e.y + layout_.video.t) / scale_};
+            if (!ShowCaptionMenu(*this, at, e.x, e.y, layout_.video.r - layout_.video.l, layout_.video.b - layout_.video.t))
+                ShowMainMenu(*this, at);
         }
         break;
     case Kind::DoubleClick:
@@ -1353,7 +1355,9 @@ LRESULT App::Proc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
         host_.PointerUp(MakePointer(lp, pui::PointerButton::Right));
         if (overVideo && !onPopup && !onChrome && !UserPopupOpen()) {
             StartBarAnim(autoHide_.Activity(Now()));
-            ShowMainMenu(*this, dip);
+            if (!ShowCaptionMenu(*this, dip, GET_X_LPARAM(lp) - layout_.video.l, GET_Y_LPARAM(lp) - layout_.video.t,
+                                 layout_.video.r - layout_.video.l, layout_.video.b - layout_.video.t))
+                ShowMainMenu(*this, dip);
         }
         Flush();
         return 0;

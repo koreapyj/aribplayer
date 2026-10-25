@@ -1479,7 +1479,10 @@ bool MainView::WindowZoomedOrMinimized() const {
 
 // --- main menu: features/Menus.cpp ---------------------------------------------------------------------
 
-void MainView::ShowMainMenu(pui::PointF at) { app::ShowMainMenu(*this, at); }
+void MainView::ShowMainMenu(pui::PointF at) {
+    const app::RectPx& v = layout_.video;
+    if (!app::ShowCaptionMenu(*this, at, at.x * scale_ - v.l, at.y * scale_ - v.t, v.r - v.l, v.b - v.t)) app::ShowMainMenu(*this, at);
+}
 
 void MainView::ShowMainMenu(pui::Widget* anchor) {
     app::GlyphButton* btn = shell->Title()->MainMenuButton();

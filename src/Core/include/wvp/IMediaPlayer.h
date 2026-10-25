@@ -86,6 +86,9 @@ public:
     virtual std::optional<BgraFrame> Snapshot(bool withSubtitles) { (void)withSubtitles; return Snapshot(); }
     /// nullopt when no video frame is displayed or the backend cannot tell.
     virtual std::optional<FrameSeekPoint> DisplayedFrameSeekPoint() { return std::nullopt; }
+    /// UTF-8 plain text of the displayed caption / subtitle under a point of the displayed video area (x, y in 0..1 of
+    /// its width and height); nullopt when no text cue is there (bitmap subtitles have none) or the backend cannot tell.
+    virtual std::optional<std::string> CaptionTextAt(double x, double y) { (void)x; (void)y; return std::nullopt; }
     // UTF-8 JSON snapshot of live decoder/filter/sync state (libffplay ffp_get_debug_info, see wvp/DebugInfo.h),
     // nullopt when unsupported or nothing is open. Default: unsupported.
     virtual std::optional<std::string> GetDebugInfoJson() { return std::nullopt; }

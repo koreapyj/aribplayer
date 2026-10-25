@@ -95,6 +95,7 @@ public:
     int SetAudioPreference(int pref) override;
     int AudioPreference() const override { return audioPref_.load(); }
     int SetSubtitleVisible(SubtitleLayer layer, bool on) override;
+    std::optional<std::string> CaptionTextAt(double x, double y) override;
     // Reopens only the ARIB caption decoder; video/audio are untouched.
     int RefreshCaptionStyle(bool ignoreBackground, bool forceOutline);
     int SetVideoFilter(const std::string& vf) override;

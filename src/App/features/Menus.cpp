@@ -4,6 +4,8 @@
 
 #include "AppContext.h"
 #include "Localize.h"
+#include "WindowSizing.h"
+#include "features/CaptionPoint.h"
 #include "features/FfmpegCommand.h"
 #include "features/FiltersPanel.h"
 #include "features/FxModel.h"
@@ -11,6 +13,8 @@
 #include "features/PlaybackExtras.h"
 #include "features/SettingsLogic.h"
 #include "features/SettingsService.h"
+#include "pui/Clipboard.h"
+#include "wvp/win32/Utf.h"
 
 namespace app {
 namespace menus {
@@ -247,6 +251,37 @@ std::vector<pui::MenuItemDesc> LiveMenu(AppContext& ctx) {
 
 void ShowMainMenu(AppContext& ctx, pui::PointF pt) {
     nativemenu::ShowAtPoint(LiveMenu(ctx), pt);
+}
+
+bool ShowCaptionMenu(AppContext& ctx, pui::PointF ptDip, double xPx, double yPx, double areaWPx, double areaHPx) {
+    auto* player = ctx.Player();
+    if (!player) return false;
+    double aspect = 0;
+    if (auto mi = player->GetMediaInfo()) {
+        const wvp::StreamInfo* vs = nullptr;
+        for (const auto& st : mi->Streams)
+            if (st.Type == wvp::StreamType::Video && (!vs || st.Selected)) vs = &st;
+        if (vs)
+            if (auto sz = VideoDisplaySize(vs->Width, vs->Height, vs->SarNum, vs->SarDen)) aspect = (double)sz->w / sz->h;
+    }
+    auto q = CaptionQueryPoint(xPx, yPx, areaWPx, areaHPx, aspect, IsZoomToFill());
+    if (!q) return false;
+    auto text = player->CaptionTextAt(q->x, q->y);
+    if (!text || text->empty()) return false;
+    std::wstring w = wvp::ToWide(*text);
+#ifdef _WIN32
+    for (size_t i = 0; i < w.size(); i++)
+        if (w[i] == L'\n' && (i == 0 || w[i - 1] != L'\r')) w.insert(i++, 1, L'\r');
+#endif
+    std::vector<pui::MenuItemDesc> items;
+    items.push_back(pui::MenuItemDesc::Item(Tr(L"Copy text", L"텍스트 복사"), [&ctx, w] {
+        ctx.PostToUi([&ctx, w] {
+            pui::SetClipboardText(w);
+            ctx.ShowToast(Tr(L"Copied", L"복사됨"));
+        });
+    }, {}, pui::glyph::Copy));
+    nativemenu::ShowAtPoint(std::move(items), ptDip);
+    return true;
 }
 
 void ShowMainMenu(AppContext& ctx, pui::Widget* anchor, nativemenu::Callbacks cb) {

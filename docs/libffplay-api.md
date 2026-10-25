@@ -558,6 +558,19 @@ from its default style for every dialogue event. `font_size` is converted as poi
 smaller than the same point size in a word processor. A track nothing applies to renders with its own styles and font
 scale 1.0.
 
+### Caption text: `ffp_get_caption_text_at`
+
+`ffp_get_caption_text_at(p, x, y, buf, size)`: the plain text of the text cue under the point (x, y), both 0..1 of the
+displayed video area (the overlay canvas). Caption layer first, then superimpose; only visible layers; a cue is hit
+inside the rects last handed to the presenter, widened by 1% of the canvas height. It works paused and playing and may
+be called from any thread. Returns the UTF-8 byte length of the text (no NUL) and copies what fits into `buf`, always
+NUL-terminated when `size > 0` (`buf` may be NULL with `size` 0 to get the length). Returns 0 where no text cue is (no
+cue, a bitmap subtitle such as PGS / DVD, a hidden layer) and `FFP_EINVAL` for a NULL `p`, x or y outside 0..1, a
+negative `size` or a NULL `buf` with `size > 0`. The text is the whole cue, lines joined with `\n`. ARIB captions carry
+the decoder's plain text (ruby left out; it stays with the cue in the history and in re-renders); libass tracks give the
+events shown at the picture's time by layer and read order, with override tags removed, `\N` / `\n` as line breaks and
+`\h` as a space.
+
 ### Delay: `ffp_set_subtitle_delay` / `ffp_get_subtitle_delay`
 
 Milliseconds, positive = subtitles later. Live; `ffp_open` resets it to 0. libass renders at `t - delay`; bitmap

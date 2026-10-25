@@ -1,5 +1,6 @@
 #include "wvp/FfPlayer.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <unordered_map>
@@ -409,6 +410,17 @@ int FfPlayer::SetAudioPreference(int pref) {
 int FfPlayer::SetSubtitleVisible(SubtitleLayer layer, bool on) {
     if (!p_) return FFP_EINVAL;
     return ffp_set_subtitle_visible(p_, static_cast<int>(layer), on ? 1 : 0);
+}
+
+std::optional<std::string> FfPlayer::CaptionTextAt(double x, double y) {
+    if (!p_) return std::nullopt;
+    int len = ffp_get_caption_text_at(p_, x, y, nullptr, 0);
+    if (len <= 0) return std::nullopt;
+    std::string text(static_cast<size_t>(len) + 1, '\0');
+    int got = ffp_get_caption_text_at(p_, x, y, text.data(), static_cast<int>(text.size()));
+    if (got <= 0) return std::nullopt;
+    text.resize(static_cast<size_t>(std::min(got, len)));
+    return text;
 }
 
 int FfPlayer::RefreshCaptionStyle(bool ignoreBackground, bool forceOutline) {

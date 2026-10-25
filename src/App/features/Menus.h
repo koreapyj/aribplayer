@@ -17,6 +17,10 @@ namespace app {
 class AppContext;
 /// The main menu at a client DIP position (right click on the video).
 void ShowMainMenu(AppContext& ctx, pui::PointF ptDip);
+/// Right click on the video: when a caption text is displayed under the click, shows the one-item "Copy text" menu at `ptDip`
+/// and returns true; false = nothing there, the caller shows the main menu. (xPx, yPx) = the click relative to the video
+/// area, (areaWPx, areaHPx) = the video area size (device pixels).
+bool ShowCaptionMenu(AppContext& ctx, pui::PointF ptDip, double xPx, double yPx, double areaWPx, double areaHPx);
 /// The main menu below `anchor` (the title strip's Player button); cb.onOpen / cb.onClose drive its pressed look.
 void ShowMainMenu(AppContext& ctx, pui::Widget* anchor, nativemenu::Callbacks cb = {});
 /// The subtitle track list (the "Subtitles" sub-menu of the main menu) as its own menu; anchor = the bar's Subtitle button.

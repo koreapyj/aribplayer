@@ -189,3 +189,39 @@ TEST_CASE_INTEGRATION(Arib_fixture_caption_classification_visibility_and_snapsho
     REQUIRE(shownAgain.has_value());
     CHECK_MSG(DifferentPixels(*videoOnly, *shownAgain) > 0, "active caption did not reappear after hide/show");
 }
+
+TEST_CASE_INTEGRATION(Arib_caption_text_under_the_point_without_ruby) {
+    if (!fs::exists(AribFixture())) throw wvptest::SkipFailure{ "gitignored ARIB fixture is not present" };
+    AribSession s;
+    OpenOptions options = {
+        { "superimpose", "0" },
+        { "an", "1" },
+        { "arib_font", AribFontOption(wvp::ToUtf8(AribFont().wstring())) },
+    };
+    REQUIRE_MSG(s.player->Open(wvp::ToUtf8(AribFixture().wstring()), options) == 0, "ARIB fixture open rejected");
+    REQUIRE_MSG(WaitArib([&] { return s.prepared > 0 || s.errors > 0; }, 20) && s.errors == 0, "fixture did not open");
+
+    std::optional<std::string> text;
+    int misses = 0;
+    auto sweep = [&] {
+        text.reset();
+        misses = 0;
+        for (int gy = 0; gy < 25; gy++)
+            for (int gx = 0; gx < 25; gx++) {
+                auto t = s.player->CaptionTextAt((gx + 0.5) / 25, (gy + 0.5) / 25);
+                if (t) { if (!text) text = t; }
+                else misses++;
+            }
+        return text.has_value();
+    };
+    REQUIRE_MSG(WaitArib(sweep, 25), "no caption text answered while the fixture played");
+    CHECK_EQ(s.player->Pause(), 0);
+    REQUIRE_MSG(WaitArib([&] { return s.player->State() == PlayerState::Paused; }, 5), "player did not pause");
+    REQUIRE_MSG(WaitArib(sweep, 5), "no caption text answered while paused");
+    CHECK_MSG(!text->empty() && text->front() != '\n' && text->back() != '\n', "caption text is not trimmed");
+    CHECK_MSG(misses > 0, "every point of the video area answered with the caption text");
+    CHECK(!s.player->CaptionTextAt(0.005, 0.005).has_value());
+
+    CHECK_EQ(s.player->SetSubtitleVisible(SubtitleLayer::Caption, false), 0);
+    CHECK_MSG(WaitArib([&] { return !sweep(); }, 5), "caption text answered while the layer is hidden");
+}

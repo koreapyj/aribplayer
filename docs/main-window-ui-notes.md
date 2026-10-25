@@ -90,7 +90,7 @@ Windowed: no bar fill (the window backdrop shows). Full screen / mini: `barFill`
 | Playlist toggle (F6) | show/hide panel, pressed while visible | - | narrow window: popup mode |
 | Pin (title) | cycle always-on-top: Off -> On -> While playing -> While fullscreen | - | same as Ctrl+T, persisted |
 | Elapsed label | elapsed / remaining | - | |
-| Hamburger button / video | main menu | main menu on the video | the main menu is the context menu |
+| Hamburger button / video | main menu | main menu on the video | the main menu is the context menu; right-click on a displayed text caption (`ShowCaptionMenu`) opens a one-item menu instead: Copy text (toast "Copied"); the keyboard context-menu key keeps the main menu |
 | Video | double click = play/pause (not fullscreen); left-drag moves the window (not in fullscreen) | main menu | wheel = volume |
 | Playlist toggle, windowed | window grows/shrinks by panel width + gap so the video keeps its size | - | maximized/fullscreen/narrow: video resizes instead |
 

@@ -69,6 +69,19 @@ struct SubSession {
         wvptest::Delay(300);
         return SubtitlePixels() == 0;
     }
+    // The text of the first caption found on a 20 x 20 grid over the displayed video area; `misses` counts the points without one.
+    std::optional<std::string> CaptionTextOnGrid(int* misses = nullptr) {
+        std::optional<std::string> found;
+        int none = 0;
+        for (int gy = 0; gy < 20; gy++)
+            for (int gx = 0; gx < 20; gx++) {
+                auto text = player->CaptionTextAt((gx + 0.5) / 20, (gy + 0.5) / 20);
+                if (text) { if (!found) found = text; }
+                else none++;
+            }
+        if (misses) *misses = none;
+        return found;
+    }
     const StreamInfo* FindSubtitle(const MediaInfo& mi, const std::string& codec, bool external) {
         for (const auto& s : mi.Streams)
             if (s.Type == StreamType::Subtitle && s.Codec == codec && s.external == external) return &s;
@@ -163,4 +176,21 @@ TEST_CASE_INTEGRATION(Subtitle_style_fallback_reaches_plain_text_tracks_only_thr
     REQUIRE(s.player->SetSubtitleStyle(box) == 0);
     CHECK_MSG(wvptest::WaitFor([&] { return std::abs(s.SubtitlePixels() - plain) <= plain / 10; }, 5),
               "the subtitle did not return to its own style: " + std::to_string(plain) + " -> " + std::to_string(s.SubtitlePixels()));
+}
+
+TEST_CASE_INTEGRATION(Subtitle_text_cue_answers_caption_text_under_the_point) {
+    SubSession s(L"video-subs.mkv");
+    s.PlayTo(2.8);
+    std::optional<std::string> text;
+    int misses = 0;
+    CHECK_MSG(wvptest::WaitFor([&] { text = s.CaptionTextOnGrid(&misses); return text.has_value(); }, 5),
+              "no caption text inside cue 2-4 s");
+    REQUIRE(text.has_value());
+    CHECK_MSG(text->find("Hello") == 0, "caption text: " + *text);
+    CHECK_MSG(misses > 0, "every point of the video area answered with the caption text");
+    CHECK(!s.player->CaptionTextAt(0.01, 0.01).has_value());
+
+    s.PlayTo(4.6);
+    wvptest::Delay(300);
+    CHECK_MSG(!s.CaptionTextOnGrid().has_value(), "caption text between cues");
 }
