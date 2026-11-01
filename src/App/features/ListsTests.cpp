@@ -756,31 +756,31 @@ LOGIC_TEST(lists_panel_item_menu_has_copy_delete_and_move) {
         auto* menu = ShownMenu();
         LT_CHECK(menu != nullptr);
         if (menu) {
-            LT_CHECK(MenuTexts(*menu) == (std::vector<std::wstring>{L"Play", L"", L"Copy", L"", L"Move to top", L"Move to bottom", L"",
+            LT_CHECK(MenuTexts(*menu) == (std::vector<std::wstring>{L"Play", L"", L"Copy", L"Copy path", L"", L"Move to top", L"Move to bottom", L"",
                                                                      L"Delete", L"Delete others", L"Delete missing files", L"Delete items above"}));
         }
-        if (menu && menu->ItemCount() == 11) {
-            for (int i : {0, 2, 4, 5, 7, 8, 9, 10}) LT_CHECK(menu->Item(i).enabled);   // row 1 is the topmost selected: row 0 lies above
+        if (menu && menu->ItemCount() == 12) {
+            for (int i : {0, 2, 3, 5, 6, 8, 9, 10, 11}) LT_CHECK(menu->Item(i).enabled);   // row 1 is the topmost selected: row 0 lies above
             LT_CHECK_EQ(menu->Item(0).accelerator, L"Enter");
-            LT_CHECK_EQ(menu->Item(4).accelerator, L"Ctrl+Home");
-            LT_CHECK_EQ(menu->Item(5).accelerator, L"Ctrl+End");
-            LT_CHECK_EQ(menu->Item(7).accelerator, L"Del");
-            LT_CHECK_EQ(menu->Item(8).accelerator, L"Ctrl+Del");
-            LT_CHECK_EQ(menu->Item(9).accelerator, L"Ctrl+T");
-            LT_CHECK(menu->Item(10).accelerator.empty());
+            LT_CHECK_EQ(menu->Item(5).accelerator, L"Ctrl+Home");
+            LT_CHECK_EQ(menu->Item(6).accelerator, L"Ctrl+End");
+            LT_CHECK_EQ(menu->Item(8).accelerator, L"Del");
+            LT_CHECK_EQ(menu->Item(9).accelerator, L"Ctrl+Del");
+            LT_CHECK_EQ(menu->Item(10).accelerator, L"Ctrl+T");
+            LT_CHECK(menu->Item(11).accelerator.empty());
             // no other playlist: a disabled placeholder, then a separator and "New playlist…"
             auto copy = menu->Item(2).sub;
             LT_CHECK(MenuTexts(MenuProbe{copy}) == (std::vector<std::wstring>{L"(No playlists)", L"", L"New playlist…"}));
             if (copy.size() == 3) LT_CHECK(!copy[0].enabled && copy[2].enabled);
             // Delete items above removes row 0 only
-            menu->ActivateIndex(10);
+            menu->ActivateIndex(11);
             LT_CHECK_EQ(ctx.svc.playlists.Load("Alpha").size(), (size_t)2);
         }
         // the topmost selected item is row 0: nothing above, the entry is disabled
         panel->List()->onContextMenu(0, pui::PointF{0, 0}, false);
         menu = ShownMenu();
         LT_CHECK(menu != nullptr);
-        if (menu) LT_CHECK(menu->ItemCount() == 11 && !menu->Item(10).enabled);
+        if (menu) LT_CHECK(menu->ItemCount() == 12 && !menu->Item(11).enabled);
         ctx.host.SetRoot(nullptr);
     }
     RemoveDir(dir);
@@ -822,8 +822,8 @@ LOGIC_TEST(lists_panel_read_only_item_menu_disables_delete_and_move) {
         auto* menu = ShownMenu();
         LT_CHECK(menu != nullptr);
         if (menu) {
-            LT_CHECK(menu->ItemCount() == 11 && menu->Item(0).enabled && menu->Item(2).enabled);
-            if (menu->ItemCount() == 11) for (int i : {4, 5, 7, 8, 9, 10}) LT_CHECK(!menu->Item(i).enabled);
+            LT_CHECK(menu->ItemCount() == 12 && menu->Item(0).enabled && menu->Item(2).enabled);
+            if (menu->ItemCount() == 12) for (int i : {5, 6, 8, 9, 10, 11}) LT_CHECK(!menu->Item(i).enabled);
         }
         ctx.host.SetRoot(nullptr);
     }

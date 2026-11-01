@@ -27,6 +27,7 @@ std::wstring ToW(NSString* s) {
     NSTrackingArea* _tracking;
     std::wstring _marked;             // IME composition currently shown inline in the focused TextBox
     size_t _markedStart;
+    bool _ibeamShown;                 // this view set the I-beam and owes the arrow back
 }
 
 - (instancetype)initWithFrame:(NSRect)frame host:(pui::UiHost*)host renderer:(puimac::CGRenderer*)renderer {
@@ -88,7 +89,7 @@ std::wstring ToW(NSString* s) {
 - (void)updateTracking {
     if (_tracking) [self removeTrackingArea:_tracking];
     _tracking = [[NSTrackingArea alloc] initWithRect:self.bounds
-                                             options:NSTrackingMouseMoved | NSTrackingMouseEnteredAndExited | NSTrackingActiveAlways | NSTrackingInVisibleRect
+                                             options:NSTrackingMouseMoved | NSTrackingMouseEnteredAndExited | NSTrackingCursorUpdate | NSTrackingActiveAlways | NSTrackingInVisibleRect
                                                owner:self userInfo:nil];
     [self addTrackingArea:_tracking];
 }
@@ -164,6 +165,7 @@ std::wstring ToW(NSString* s) {
 
 - (void)mouseDragged:(NSEvent*)e {
     _host->PointerMove([self pointerEvent:e button:pui::PointerButton::Left]);
+    [self updateCursorAt:[self pointerEvent:e button:pui::PointerButton::None].pt];
     [self afterEvent];
 }
 
@@ -190,12 +192,26 @@ std::wstring ToW(NSString* s) {
 }
 
 - (void)mouseMoved:(NSEvent*)e {
-    _host->PointerMove([self pointerEvent:e button:pui::PointerButton::None]);
+    pui::PointerEvent pe = [self pointerEvent:e button:pui::PointerButton::None];
+    _host->PointerMove(pe);
+    [self updateCursorAt:pe.pt];
     [self afterEvent];
+}
+
+/// pui::UiHost::CursorAt (the capture widget's, else the hovered widget's): the I-beam over text, the arrow back otherwise.
+- (void)updateCursorAt:(pui::PointF)pt {
+    const bool ibeam = _host->CursorAt(pt) == pui::CursorKind::IBeam;
+    if (ibeam) { [NSCursor.IBeamCursor set]; _ibeamShown = true; }
+    else if (_ibeamShown) { [NSCursor.arrowCursor set]; _ibeamShown = false; }
+}
+
+- (void)cursorUpdate:(NSEvent*)e {
+    [self updateCursorAt:[self pointerEvent:e button:pui::PointerButton::None].pt];
 }
 
 - (void)mouseExited:(NSEvent*)e {
     (void)e;
+    if (_ibeamShown) { [NSCursor.arrowCursor set]; _ibeamShown = false; }
     _host->PointerLeave();
     [self afterEvent];
 }

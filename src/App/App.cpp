@@ -29,6 +29,7 @@
 #include "pui/Buttons.h"
 #include "pui/TextBox.h"
 #include "pui/ToolTipStyle.h"
+#include "shell/PropertiesWindow.h"
 #include "shell/SettingsWindow.h"
 #include "wvp/win32/Utf.h"
 
@@ -433,7 +434,8 @@ void App::Destroy() {
     { std::lock_guard<std::mutex> lk(g_qmu); g_queue.clear(); }
     g_postHwnd = nullptr;
     gfx_.StopRemovalWatch();
-    settingsWin_.reset();   // destroys its window and hidden owner; drops its composition objects
+    settingsWin_.reset();   // destroys their windows and the hidden owner; drops their composition objects
+    propsWin_.reset();
     sPopup_ = {}; sBar_ = {}; sTitle_ = {}; sDebug_ = {}; sPanel_ = {}; sContent_ = {};
     gfx_.root.Reset(); gfx_.target.Reset();
 }
@@ -457,7 +459,7 @@ void App::ApplyTheme(pui::ThemeMode mode, uint32_t accent) {
     if (themeHighContrast_) ApplyHighContrastTokens(theme);
     themeLight_ = light;
     host_.SetTheme(theme);
-    if (settingsWin_) settingsWin_->ApplyTheme(SettingsTheme(), light);
+    ForEachHostWindow([&](HostWindow& w) { w.ApplyTheme(SettingsTheme(), light); });
     nativemenu::ApplyTheme(mode);   // native popup menus: uxtheme app mode (System follows the OS, Dark / Light force)
     UpdateAcrylicState(true);
     if (hwnd_) {
@@ -484,6 +486,19 @@ void App::ShowSettings() {
     if (!settingsWin_->IsOpen()) settingsWin_->ApplyTheme(SettingsTheme(), themeLight_);
     if (!settingsWin_->Open(hidden_, gfxOk_)) log::Event("settings", "cannot create the Settings window", log::kError);
     else settingsWin_->StartFocusCycle(hwnd_);
+}
+
+void App::ShowPropertiesWindow(std::vector<fx::PropSection> sections) {
+    if (!hwnd_ || destroyed_) return;
+    if (!propsWin_) propsWin_ = std::make_unique<PropertiesWindow>(*this, gfx_, dw_.Get());
+    if (!propsWin_->IsOpen()) propsWin_->ApplyTheme(SettingsTheme(), themeLight_);
+    if (!propsWin_->Show(std::move(sections), hidden_, gfxOk_)) log::Event("properties", "cannot create the Properties window", log::kError);
+    else propsWin_->StartFocusCycle(hwnd_);
+}
+
+void App::ForEachHostWindow(const std::function<void(HostWindow&)>& fn) {
+    if (settingsWin_) fn(*settingsWin_);
+    if (propsWin_) fn(*propsWin_);
 }
 
 void App::ApplyWindowFullscreen(bool on) {
@@ -532,11 +547,11 @@ void App::SetMiniPlayer(bool on) {
 
 void App::NotePlayerPressed() {
     if (skipActivationPress_) { skipActivationPress_ = false; return; }
-    if (settingsWin_) settingsWin_->OnPlayerPressed(hwnd_);
+    ForEachHostWindow([&](HostWindow& w) { w.OnPlayerPressed(hwnd_); });
 }
 
 void App::NoteTopmostReasserted() {
-    if (settingsWin_) settingsWin_->KeepAbove(hwnd_);
+    ForEachHostWindow([&](HostWindow& w) { w.KeepAbove(hwnd_); });
 }
 
 void App::ApplyWindowTopmost() {
@@ -878,7 +893,7 @@ LPARAM App::NcClientLParam(LPARAM screenLp) const {
 void App::OnClose() {
     if (destroyed_) return;
     SavePlaybackHistory(true);
-    if (settingsWin_) settingsWin_->Close();   // persists its placement before the settings file is written below
+    ForEachHostWindow([](HostWindow& w) { w.Close(); });   // Settings persists its placement before the settings file is written below
     if (modes_.mini) ExitMiniPlayer(*this);   // so settings.window is the normal placement, not the mini rect
     SaveSettingsAtShutdown(*this);
     StopSystemCaptionSettingsWatch();
@@ -1116,11 +1131,11 @@ LRESULT App::Proc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
     case WM_SIZE:
         if (wp == SIZE_MINIMIZED) {
             minimized_ = true; host_.CloseAllPopups(); SetCursorHidden(false);
-            if (settingsWin_) settingsWin_->OnPlayerMinimized(h, true);
+            ForEachHostWindow([&](HostWindow& w) { w.OnPlayerMinimized(h, true); });
         } else if (shell_) {
             bool restored = minimized_;
             minimized_ = false;
-            if (restored && settingsWin_) settingsWin_->OnPlayerMinimized(h, false);
+            if (restored) ForEachHostWindow([&](HostWindow& w) { w.OnPlayerMinimized(h, false); });
             shell_->Title()->SetMaximized(IsZoomed(h) != 0);
             Relayout();
             RefreshZoomAspect(*this);
@@ -1199,10 +1214,10 @@ LRESULT App::Proc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
             bool ownDialog = other && GetWindow(other, GW_OWNER) == hwnd_;   // PromptText / file dialogs owned by us keep the popups
             if (!ownDialog) host_.CloseAllPopups();
         }
-        else if (settingsWin_ && LOWORD(wp) != WA_INACTIVE && !HIWORD(wp) && SettingsWindow::FromOtherApp(reinterpret_cast<HWND>(lp))) {
+        else if ((settingsWin_ || propsWin_) && LOWORD(wp) != WA_INACTIVE && !HIWORD(wp) && HostWindow::FromOtherApp(reinterpret_cast<HWND>(lp))) {
             // The app came back from another application: a new focus cycle. The click that did it is not a press on the player.
             skipActivationPress_ = LOWORD(wp) == WA_CLICKACTIVE;
-            settingsWin_->StartFocusCycle(hwnd_);
+            ForEachHostWindow([&](HostWindow& w) { w.StartFocusCycle(hwnd_); });
         }
         break;
     case WM_RUN_QUEUE: {
@@ -1216,6 +1231,7 @@ LRESULT App::Proc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
         if (LOWORD(lp) == HTCLIENT && (HWND)wp == h) {
             POINT p; GetCursorPos(&p); ScreenToClient(h, &p);
             if (splitDrag_ || SplitterAt(p)) { SetCursor(LoadCursorW(nullptr, IDC_SIZEWE)); return TRUE; }
+            if (host_.CursorAt({p.x / scale_, p.y / scale_}) == pui::CursorKind::IBeam) { SetCursor(LoadCursorW(nullptr, IDC_IBEAM)); return TRUE; }
         }
         break;
     case WM_MOUSEMOVE: {

@@ -2,12 +2,15 @@
 #include "Localize.h"
 
 #include <algorithm>
+#include <functional>
 
 #include "AppContext.h"
 #include "features/FxModel.h"
 #include "pui/Buttons.h"
 #include "pui/Panels.h"
 #include "pui/ScrollViewer.h"
+#include "pui/SelectableText.h"
+#include "features/NativeMenu.h"
 #include "wvp/win32/Utf.h"
 
 namespace app {
@@ -32,7 +35,7 @@ std::vector<PropsLine> LayoutProps(const std::vector<PropSection>& sections, pui
         out.push_back({PropsLine::Kind::Heading, (int)si, -1, y, PropsMetrics::kHeadingH});
         y += PropsMetrics::kHeadingH;
         for (size_t ri = 0; ri < sections[si].rows.size(); ri++) {
-            float th = m.MeasureText(sections[si].rows[ri].value.empty() ? L" " : sections[si].rows[ri].value, PropsValueStyle(), vw).h;
+            float th = pui::SelectableText::HeightFor(m, sections[si].rows[ri].value, PropsValueStyle(), vw);
             float h = std::max(PropsMetrics::kRowMin, th + 2 * PropsMetrics::kRowPadV);
             out.push_back({PropsLine::Kind::Row, (int)si, (int)ri, y, h});
             y += h;
@@ -51,17 +54,45 @@ public:
     PropsView(std::vector<fx::PropSection> sections, pui::IRenderer* m) : Widget(pui::Role::List), s_(std::move(sections)), m_(m) {
         SetName(Tr(L"Properties", L"재생 정보"));
         SetHitTestVisible(false);
+        for (const auto& sec : s_) {
+            for (const auto& row : sec.rows) {
+                auto v = std::make_unique<pui::SelectableText>(row.value, fx::PropsValueStyle());
+                v->SetName(row.label);
+                pui::SelectableText* raw = v.get();
+                v->onContextMenu = [raw](pui::PointF pt) {
+                    std::vector<pui::MenuItemDesc> items;
+                    items.push_back(pui::MenuItemDesc::Item(Tr(L"Copy", L"복사"), [raw] { raw->CopySelection(); }, L"Ctrl+C"));
+                    items.push_back(pui::MenuItemDesc::Item(Tr(L"Select all", L"모두 선택"), [raw] { raw->SelectAll(); }, L"Ctrl+A"));
+                    nativemenu::ShowAtPoint(std::move(items), pt);
+                };
+                values_.push_back(raw);
+                AddChild(std::move(v));
+            }
+        }
     }
     float HeightForWidth(pui::IRenderer* m, float width) override {
         return fx::PropsTotalHeight(fx::LayoutProps(s_, pui::MeasurerOr(m ? m : m_), width)) + 8;
     }
     pui::SizeF DesiredSize(pui::IRenderer* m) override { return {Bounds().w(), HeightForWidth(m, Bounds().w())}; }
+    void OnLayout() override {
+        const pui::RectF b = Bounds();
+        if (b.w() != laidWidth_) {
+            lines_ = fx::LayoutProps(s_, pui::MeasurerOr(m_), b.w());
+            laidWidth_ = b.w();
+        }
+        const float vx = b.l + fx::PropsMetrics::kLabelW + fx::PropsMetrics::kGap;
+        const float pv = fx::PropsMetrics::kRowPadV;
+        size_t n = 0;
+        for (const auto& ln : lines_) {
+            if (ln.kind != fx::PropsLine::Kind::Row) continue;
+            const float y = b.t + ln.y;
+            values_[n++]->SetBounds({vx, y + pv, std::max(vx, b.r), y + ln.h - pv});
+        }
+    }
     void Paint(pui::IRenderer& r, const pui::Theme& t) override {
         pui::RectF b = Bounds();
-        auto lines = fx::LayoutProps(s_, r, b.w());
-        for (auto& ln : lines) {
+        for (auto& ln : lines_) {
             float y = b.t + ln.y;
-            if (y > b.b + 2000) break;
             if (ln.kind == fx::PropsLine::Kind::Heading) {
                 pui::TextStyle hs;
                 hs.size = 14; hs.weight = 600;
@@ -71,19 +102,20 @@ public:
                 const auto& row = s_[(size_t)ln.section].rows[(size_t)ln.row];
                 float pv = fx::PropsMetrics::kRowPadV;
                 r.Text(row.label, pui::RectF::XYWH(b.l, y + pv, fx::PropsMetrics::kLabelW, ln.h - 2 * pv), fx::PropsLabelStyle(), t.textSecondary);
-                float vx = b.l + fx::PropsMetrics::kLabelW + fx::PropsMetrics::kGap;
-                r.Text(row.value, pui::RectF::XYWH(vx, y + pv, std::max(0.f, b.r - vx), ln.h - 2 * pv), fx::PropsValueStyle(), t.textPrimary);
             }
         }
     }
 private:
     std::vector<fx::PropSection> s_;
     pui::IRenderer* m_;
+    std::vector<pui::SelectableText*> values_;
+    std::vector<fx::PropsLine> lines_;
+    float laidWidth_ = -1;
 };
 
-class PropertiesDialogWidget : public pui::Widget {
+class PropertiesPageWidget : public pui::Widget {
 public:
-    PropertiesDialogWidget(std::vector<fx::PropSection> sections, pui::IRenderer* m) : Widget(pui::Role::Pane), m_(m) {
+    PropertiesPageWidget(std::vector<fx::PropSection> sections, pui::IRenderer* m, std::function<void()> onClose) : Widget(pui::Role::Pane), m_(m) {
         SetName(Tr(L"Properties", L"재생 정보"));
         auto title = std::make_unique<pui::TextBlock>(Tr(L"Properties", L"재생 정보"), pui::TextKind::Subtitle);
         title_ = title.get();
@@ -97,17 +129,11 @@ public:
         AddChild(std::move(sv));
         auto close = std::make_unique<pui::Button>(Tr(L"Close", L"닫기"), pui::ButtonStyle::Accent);
         close_ = close.get();
-        close_->onClick = [this] { Close(); };
+        close_->onClick = std::move(onClose);
         AddChild(std::move(close));
     }
-    void Close() { if (Host()) Host()->ClosePopup(this); }
     pui::Button* CloseButton() const { return close_; }
-    pui::ScrollViewer* Scroll() const { return sv_; }
 
-    bool OnKeyDown(int vk, unsigned mods) override {
-        if (vk == pui::key::Escape && mods == 0) { Close(); return true; }
-        return false;
-    }
     void OnLayout() override {
         pui::RectF b = Bounds();
         constexpr float pad = 24;
@@ -121,11 +147,6 @@ public:
         sv_->SetBounds(svr);
         sv_->UpdateLayout();
     }
-    void Paint(pui::IRenderer& r, const pui::Theme& t) override {
-        pui::RectF b = Bounds();
-        r.FillRoundRect(b, t.overlayRadius, t.flyoutSurface);
-        r.StrokeRoundRect(b.Deflate(0.5f, 0.5f, 0.5f, 0.5f), t.overlayRadius, t.flyoutStroke, 1);
-    }
 private:
     pui::IRenderer* m_;
     pui::TextBlock* title_ = nullptr;
@@ -134,6 +155,14 @@ private:
     pui::Button* close_ = nullptr;
 };
 
+}
+
+PropertiesPage CreatePropertiesPage(std::vector<fx::PropSection> sections, pui::IRenderer* measurer, std::function<void()> onClose) {
+    auto page = std::make_unique<PropertiesPageWidget>(std::move(sections), measurer, std::move(onClose));
+    PropertiesPage out;
+    out.initialFocus = page->CloseButton();
+    out.root = std::move(page);
+    return out;
 }
 
 void ShowPropertiesDialog(AppContext& ctx) {
@@ -150,15 +179,7 @@ void ShowPropertiesDialog(AppContext& ctx) {
         if (GetFileAttributesExW(wideUrl.c_str(), GetFileExInfoStandard, &fa))
             size = (std::int64_t)(((std::uint64_t)fa.nFileSizeHigh << 32) | fa.nFileSizeLow);
     }
-    auto dlg = std::make_unique<PropertiesDialogWidget>(fx::BuildProperties(*info, size), &ctx.Measurer());
-    pui::SizeF cs = ctx.Ui().Size();
-    float w = std::min(560.f, std::max(280.f, cs.w - 32)), h = std::min(560.f, std::max(240.f, cs.h - 64));
-    dlg->SetBounds(pui::RectF::XYWH(std::round((cs.w - w) / 2), std::round((cs.h - h) / 2), w, h));
-    pui::PopupOptions po;
-    po.modal = true;
-    po.lightDismiss = false;
-    po.takeFocus = true;
-    ctx.Ui().OpenPopup(std::move(dlg), po);
+    ctx.ShowPropertiesWindow(fx::BuildProperties(*info, size));
 }
 
 }

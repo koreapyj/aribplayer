@@ -45,6 +45,7 @@ public:
         std::function<void(pui::ThemeMode, std::uint32_t accent)> applyTheme;
         std::function<void(bool on)> miniPlayer;                // after the mini player window shape changed (MiniPlayerMac.mm)
         std::function<void()> openSettings;
+        std::function<void(std::vector<app::fx::PropSection>)> showProperties;   // opens / refreshes the Properties window
         std::function<void(const wvp::BgraFrame&)> copyFrame;   // Capture frame -> clipboard
         std::function<void()> quit;
         std::function<void()> layoutChanged;                    // the shell layout was recomputed (cursor rects: the splitter)
@@ -149,6 +150,7 @@ public:
     void PlaylistsChanged() override;
     void ShowInfoBar(app::InfoSeverity severity, const std::wstring& title, const std::wstring& message) override;
     void ShowToast(const std::wstring& text) override;
+    void ShowPropertiesWindow(std::vector<app::fx::PropSection> sections) override { if (hooks.showProperties) hooks.showProperties(std::move(sections)); }
     const std::wstring& LastToast() const { return lastToast_; }   // self-test
     pui::RectF ToastBounds() const;                                 // self-test
     void LayoutToast();

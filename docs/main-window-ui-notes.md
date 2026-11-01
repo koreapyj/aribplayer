@@ -95,7 +95,7 @@ Windowed: no bar fill (the window backdrop shows). Full screen / mini: `barFill`
 | Playlist toggle, windowed | window grows/shrinks by panel width + gap so the video keeps its size | - | maximized/fullscreen/narrow: video resizes instead |
 
 Main menu (`features/Menus`): Open file / folder / URL, Close; Play submenu (play/pause, prev/next, seek
-steps, speed, repeat, shuffle, mini player); Subtitles / Video (zoom to fill, enhancements, copy ffmpeg command line for the current frame) / Sound submenus; Always on top submenu; Equalizer, Copy frame, Properties;
+steps, speed, repeat, shuffle, mini player); Subtitles / Video (zoom to fill, enhancements, copy ffmpeg command line for the current frame) / Sound submenus; Always on top submenu; Equalizer, Copy frame, Properties (its own movable window, see section 9: the Settings window model, closed with its Close button, Esc or the title-bar X; every value is selectable text, drag or double-click to select, Ctrl+C / Cmd+C or the right-click Copy menu to copy);
 Playlist panel (F6), Control panel (F7), Settings (F5: opens the separate Settings window, see §9); Exit.
 
 Subtitles submenu (`BuildSubtitleItems`, also the bar button's right-click menu; needs open media): Off, then every selectable subtitle track,
@@ -118,7 +118,7 @@ open `App::NonPanelPopups` counts it, so the full screen bar / title / edge pane
 Icons (glyph) of the descriptors are not shown. `--logictest` / `--headless-check` never show a menu (`OsDialogsBlocked`): the call only
 records the descriptors (`nativemenu::LastShown`) and tests run actions with `nativemenu::InvokeItem`.
 
-Playlist panel. Chips pick the viewed playlist. The player view is the only view (no playlist pages, no Back button, no back history): all playlist management is native menus. "+" menu: New playlist… (Ctrl+N), Import playlist file… (editable copy via `ImportPlaylist`), Import from URL… (prompt, then a read-only reference playlist through `AddPlaylistUrl` = `AddOrUpdateReference`; HLS / non-playlist URLs are refused), Open playlists folder (Explorer on `PlaylistStore::Dir()`). Two context menus. Playlist menu (right-click on a chip, which first switches the view to that playlist, or on empty list space): Play playlist (resumes it), Add ▸ (Files… Ctrl+I, Folder… Ctrl+O, URL… Ctrl+U; disabled on read-only playlists), Add to current playlist (not offered on the current one), then Rename… (Ctrl+R) / Delete playlist (Ctrl+D, in-app confirm; both also work on references), for the default chip instead Save as playlist… (names the default playlist; disabled while empty), and for reference playlists Refresh (`RefreshPlaylistReference`, offline fallback keeps the cached items with a warning bar) and Make editable copy (`ImportReferenceAsEditableCopy`). Item menu (right-click on a row, which selects it first when it is not selected), flat with separators between the groups: Play (Enter) | Copy ▸ (every other editable playlist, or a disabled "(No playlists)"; then a separator and New playlist… which creates it from the selected items) | Move to top (Ctrl+Home) / Move to bottom (Ctrl+End) (need a selection; Ctrl+Up/Down still move by keyboard) | Delete (Del = selected), Delete others (Ctrl+Del = unselected), Delete missing files (Ctrl+T), Delete items above (everything above the topmost selected item; disabled when that is row 0 or nothing is selected; no shortcut). Move and delete items are disabled on read-only playlists. A Sort icon button right of the search box opens the Sort menu (pressed look while open; same items and Ctrl+1..0 shortcuts). The footer holds only the item count text; there are no Add / Delete / Sort / move buttons. Reference playlists are read-only: their chip carries a Link glyph (U+E71B) and every edit control stays disabled. There is no export (Save as file) command. An overflowing chip strip scrolls with the wheel, by dragging it, or with hover-only ‹ › edge buttons, and keeps the viewed chip in view.
+Playlist panel. Chips pick the viewed playlist. The player view is the only view (no playlist pages, no Back button, no back history): all playlist management is native menus. "+" menu: New playlist… (Ctrl+N), Import playlist file… (editable copy via `ImportPlaylist`), Import from URL… (prompt, then a read-only reference playlist through `AddPlaylistUrl` = `AddOrUpdateReference`; HLS / non-playlist URLs are refused), Open playlists folder (Explorer on `PlaylistStore::Dir()`). Two context menus. Playlist menu (right-click on a chip, which first switches the view to that playlist, or on empty list space): Play playlist (resumes it), Add ▸ (Files… Ctrl+I, Folder… Ctrl+O, URL… Ctrl+U; disabled on read-only playlists), Add to current playlist (not offered on the current one), then Rename… (Ctrl+R) / Delete playlist (Ctrl+D, in-app confirm; both also work on references), for the default chip instead Save as playlist… (names the default playlist; disabled while empty), and for reference playlists Refresh (`RefreshPlaylistReference`, offline fallback keeps the cached items with a warning bar) and Make editable copy (`ImportReferenceAsEditableCopy`). Item menu (right-click on a row, which selects it first when it is not selected), flat with separators between the groups: Play (Enter) | Copy ▸ (every other editable playlist, or a disabled "(No playlists)"; then a separator and New playlist… which creates it from the selected items) | Copy path (the selected items' native paths, one per line, or the URL as it is for network items; toast "Copied"; works on read-only playlists) | Move to top (Ctrl+Home) / Move to bottom (Ctrl+End) (need a selection; Ctrl+Up/Down still move by keyboard) | Delete (Del = selected), Delete others (Ctrl+Del = unselected), Delete missing files (Ctrl+T), Delete items above (everything above the topmost selected item; disabled when that is row 0 or nothing is selected; no shortcut). Move and delete items are disabled on read-only playlists. A Sort icon button right of the search box opens the Sort menu (pressed look while open; same items and Ctrl+1..0 shortcuts). The footer holds only the item count text; there are no Add / Delete / Sort / move buttons. Reference playlists are read-only: their chip carries a Link glyph (U+E71B) and every edit control stays disabled. There is no export (Save as file) command. An overflowing chip strip scrolls with the wheel, by dragging it, or with hover-only ‹ › edge buttons, and keeps the viewed chip in view.
 Rows: click select, double-click / Enter / P play, Del removes, drag reorders, dropped files insert at the row, current row highlighted and
 scrolled into view. Search box filters. Footer: Add (files Ctrl+I, folder Ctrl+O, URL Ctrl+U), Delete (selected Del, others Ctrl+Del, missing files Ctrl+T; "Delete items above" has no shortcut),
 Sort (Ctrl+1/2 sort/reverse, 3 title, 4 name, 5 extension, 6 size, 7 duration, 8 date, 9 shuffle, 0 folder), move top/up/down/bottom
@@ -206,17 +206,24 @@ Segoe Fluent Icons (fallback Segoe MDL2 Assets), constants in `src/Ui/include/pu
 
 ## 9. Settings window
 
-`shell/SettingsWindow` is a separate, modeless, single-instance top-level window hosting the Settings
+`shell/HostWindow` is the shared window model of the Settings and the Properties windows (`shell/SettingsWindow`,
+`shell/PropertiesWindow`; everything below except the Settings-specific rows applies to both). `shell/SettingsWindow` is a
+separate, modeless, single-instance top-level window hosting the Settings
 content (`pages/SettingsPage`, unchanged rows; every change saves and applies live through `OnSettingsChanged`). F5 and the main
 menu's Settings run `CommandId::OpenSettings` -> `App::ShowSettings`: create it, or restore + bring the open one to the front.
 The player keeps running and keeps its own keyboard / view state meanwhile.
 
-- Window: unowned by the player (so the player can cover it) but owned by one invisible app-wide top-level (`aribplayer.SettingsOwner`,
+- Window: unowned by the player (so the player can cover it) but owned by one invisible app-wide top-level (`aribplayer.HostOwner`, shared by both windows,
   never shown, no `WS_EX_TOOLWINDOW`), which gives it no taskbar button; standard system frame
   (`WS_OVERLAPPEDWINDOW`, title "Settings" / "환경 설정", app icon; caption buttons, snap layouts, system menu and resize borders are
   all native, none of the main window's custom-caption handling). Mica (`DWMWA_SYSTEMBACKDROP_TYPE` + frame extended into the
   client) and the immersive dark caption follow `App::ApplyTheme`. Default 900 x 700 DIP centred over the main window, minimum
   480 x 360 DIP client; position / size / maximized are remembered in `AppSettings::settingsWindow` when it closes.
+- Properties (`shell/PropertiesWindow`, `CommandId::ShowProperties` -> `AppContext::ShowPropertiesWindow`): the same window
+  without min / max boxes, title "Properties" / "재생 정보", default 560 x 560 DIP centred over the main window (minimum 320 x
+  240), position and size not remembered. Content: heading, scrolling rows of label + `pui::SelectableText` value, and a
+  Close button that has the initial focus (Enter closes). Showing it again while open refreshes the rows for the current media and
+  brings it to the front. Nothing is shown in the player window.
 - Z-order: Settings sits directly above the player, in the player's always-on-top band, until the user presses a mouse button on
   the player; the player then stays in front until the next focus cycle. Nothing here activates Settings.
   - Focus cycle (`SettingsWindow::StartFocusCycle`): Settings opened, or the app comes back from another application
@@ -232,6 +239,9 @@ The player keeps running and keeps its own keyboard / view state meanwhile.
 - Rendering: the App's UI device (`Gfx`) with its own DComp target for this HWND (content visual = page tree, popup visual =
   ComboBox flyouts + tooltip), its own `D2dRenderer` / `LayerRenderer` at its own DPI (WM_DPICHANGED) and hash-gated repaints.
   Draw / commit failures go through `Gfx::onFailure`, so a loss in either window runs the one rebind.
+- Cursor: `pui::Widget::Cursor()` (`CursorKind::IBeam` for `TextBox` and `SelectableText`); `UiHost::CursorAt(point)` returns the capture
+  widget's cursor, else the nearest non-arrow cursor from the hit widget up; the host windows' `WM_SETCURSOR` (and the main window's, after the splitter)
+  sets `IDC_IBEAM` from it.
 - Input: its own `pui::UiHost` with normal focus (Tab traversal; the player-view "no focus" rule does not apply), mouse / wheel /
   capture / keys / WM_CHAR / tooltips and its own UIA bridge. Esc closes an open flyout or the licenses dialog first, otherwise the window. Deactivating
   it closes its flyouts (not for its own dialogs, e.g. the subtitle font and colour pickers, which it owns).

@@ -11,6 +11,7 @@
 #include "Localize.h"
 #include "pui/Geometry.h"
 #include "wvp/MediaItem.h"
+#include "wvp/MediaUri.h"
 #include "wvp/PlaybackController.h"
 #include "wvp/win32/Utf.h"
 
@@ -197,7 +198,22 @@ inline std::vector<int> RemapSelection(const std::vector<int>& order, const std:
     return out;
 }
 
-/// Rows 0..count-1 that are not in `selected`.
+/// Native path (file URIs) or the URL as it is, of each listed row, one per line.
+inline std::wstring ItemPathsText(const std::vector<wvp::MediaItem>& items, const std::vector<int>& rows) {
+#ifdef _WIN32
+    const wchar_t* eol = L"\r\n";
+#else
+    const wchar_t* eol = L"\n";
+#endif
+    std::wstring out;
+    for (int r : rows) {
+        if (r < 0 || (size_t)r >= items.size()) continue;
+        if (!out.empty()) out += eol;
+        out += wvp::ToWide(wvp::MediaUri::Parse(items[(size_t)r].url).FfmpegInput());
+    }
+    return out;
+}
+
 /// Rows above the topmost selected one (selected rows and everything below stay); empty without a selection.
 inline std::vector<int> RowsAbove(const std::vector<int>& selected) {
     std::vector<int> out;

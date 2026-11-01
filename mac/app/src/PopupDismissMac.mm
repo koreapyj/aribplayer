@@ -30,7 +30,8 @@ void CloseFor(pui::UiHost& host) {
     if (it->second.keep)
         for (size_t i = popups.size(); i-- > 0;)
             if (it->second.keep(popups[i])) { first = i + 1; break; }
-    if (first < popups.size()) host.ClosePopup(popups[first]);   // and every popup above it
+    for (size_t i = first; i < popups.size(); i++)   // each popup above the kept ones
+        host.ClosePopup(popups[i]);
     if (it->second.after) it->second.after();
 }
 

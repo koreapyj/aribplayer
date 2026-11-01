@@ -1,5 +1,6 @@
 // ARIB media/settings contracts and a libffplay fixture integration test on the recording presenter.
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
@@ -51,6 +52,33 @@ std::optional<double> FindNumber(const json::Value& v, std::string_view key) {
             if (auto n = FindNumber(item, key)) return n;
     }
     return std::nullopt;
+}
+
+const json::Value* FindKey(const json::Value& v, std::string_view key) {
+    if (v.kind == json::Value::Kind::Object) {
+        for (size_t i = 0; i < v.keys.size() && i < v.vals.size(); i++) {
+            if (v.keys[i] == key) return &v.vals[i];
+            if (auto f = FindKey(v.vals[i], key)) return f;
+        }
+    } else if (v.kind == json::Value::Kind::Array) {
+        for (const auto& item : v.arr)
+            if (auto f = FindKey(item, key)) return f;
+    }
+    return nullptr;
+}
+
+struct ShownCue { double start; std::optional<double> end; };
+
+std::optional<ShownCue> ShownCaptionCue(FfPlayer& player) {
+    auto text = player.GetDebugInfoJson();
+    if (!text) return std::nullopt;
+    auto root = json::Parse(*text);
+    if (!root) return std::nullopt;
+    const json::Value* cue = FindKey(*root, "active_cue");
+    if (!cue) return std::nullopt;
+    auto start = FindNumber(*cue, "start");
+    if (!start) return std::nullopt;
+    return ShownCue{ *start, FindNumber(*cue, "end") };
 }
 
 bool SamePixels(const BgraFrame& a, const BgraFrame& b) {
@@ -224,4 +252,89 @@ TEST_CASE_INTEGRATION(Arib_caption_text_under_the_point_without_ruby) {
 
     CHECK_EQ(s.player->SetSubtitleVisible(SubtitleLayer::Caption, false), 0);
     CHECK_MSG(WaitArib([&] { return !sweep(); }, 5), "caption text answered while the layer is hidden");
+}
+
+TEST_CASE_INTEGRATION(Arib_caption_follows_the_subtitle_delay_paused_and_playing) {
+    if (!fs::exists(AribFixture())) throw wvptest::SkipFailure{ "gitignored ARIB fixture is not present" };
+    AribSession s;
+    OpenOptions options = {
+        { "superimpose", "0" },
+        { "an", "1" },
+        { "arib_font", AribFontOption(wvp::ToUtf8(AribFont().wstring())) },
+    };
+    REQUIRE_MSG(s.player->Open(wvp::ToUtf8(AribFixture().wstring()), options) == 0, "ARIB fixture open rejected");
+    REQUIRE_MSG(WaitArib([&] { return s.prepared > 0 || s.errors > 0; }, 20) && s.errors == 0, "fixture did not open");
+
+    // playing without delay: how far the position is past a cue's own time when it is first seen
+    auto firstSeenLag = [&](double seconds) {
+        std::optional<double> lag;
+        bool ok = WaitArib([&] {
+            auto cue = ShownCaptionCue(*s.player);
+            if (!cue) return false;
+            lag = s.player->Position() - cue->start;
+            return true;
+        }, seconds);
+        REQUIRE_MSG(ok, "no caption cue was shown");
+        return *lag;
+    };
+    std::optional<ShownCue> shown;
+    REQUIRE_MSG(WaitArib([&] { shown = ShownCaptionCue(*s.player); return shown.has_value(); }, 25), "no caption cue was shown");
+    CHECK_EQ(s.player->Pause(), 0);
+    REQUIRE_MSG(WaitArib([&] { return s.player->State() == PlayerState::Paused; }, 5), "player did not pause");
+    shown = ShownCaptionCue(*s.player);
+    REQUIRE(shown.has_value());
+
+    const double cueStart = shown->start;
+    const double delay = shown->end ? *shown->end - shown->start + 1.0 : 60.0;
+    CHECK_EQ(s.player->SetSubtitleDelay((std::int64_t)(delay * 1000)), 0);
+    CHECK_MSG(WaitArib([&] {
+        auto now = ShownCaptionCue(*s.player);
+        return !now || now->start < cueStart - 0.5;
+    }, 5), "the paused caption stayed on screen after a positive delay longer than the cue");
+    CHECK_EQ(s.player->SetSubtitleDelay(0), 0);
+    std::optional<ShownCue> back;
+    CHECK_MSG(WaitArib([&] {
+        back = ShownCaptionCue(*s.player);
+        return back && std::abs(back->start - cueStart) < 0.01;
+    }, 5), "the paused caption did not return after the delay was reset: " + (back ? std::to_string(back->start) : std::string("none")) + " vs " + std::to_string(cueStart) + " delay " + std::to_string(delay));
+
+    // playing: a cue is due its delay later
+    CHECK_EQ(s.player->Seek(0), 0);
+    CHECK_EQ(s.player->Play(), 0);
+    REQUIRE_MSG(WaitArib([&] { return !ShownCaptionCue(*s.player); }, 5), "the caption stayed on screen after the seek to the start");
+    const double lagPlain = firstSeenLag(25);
+    CHECK_EQ(s.player->SetSubtitleDelay(2000), 0);
+    CHECK_EQ(s.player->Seek(0), 0);
+    REQUIRE_MSG(WaitArib([&] { return !ShownCaptionCue(*s.player); }, 5), "the caption stayed on screen after the seek to the start");
+    const double lagDelayed = firstSeenLag(25);
+    CHECK_MSG(std::abs((lagDelayed - lagPlain) - 2.0) < 0.3,
+              "a delayed cue did not appear 2 s later: " + std::to_string(lagPlain) + " vs " + std::to_string(lagDelayed));
+}
+
+// testmedia/arib/tbs-captions-wrap.ts (ffmpeg/tools/make_arib_wrap_fixture.py): the 33-bit clock wraps 9 s in (media
+// time 0 once libavformat unwraps it) and the caption component joins the PMT only after the first video packet.
+TEST_CASE_INTEGRATION(Arib_caption_after_the_33_bit_clock_wrap_is_shown_at_its_time) {
+    const fs::path wrapFixture = RepoRoot() / L"testmedia" / L"arib" / L"tbs-captions-wrap.ts";
+    if (!fs::exists(wrapFixture)) throw wvptest::SkipFailure{ "generated wrap fixture is not present (ffmpeg/tools/make_arib_wrap_fixture.py)" };
+    AribSession s;
+    OpenOptions options = {
+        { "superimpose", "0" },
+        { "an", "1" },
+        { "arib_font", AribFontOption(wvp::ToUtf8(AribFont().wstring())) },
+    };
+    REQUIRE_MSG(s.player->Open(wvp::ToUtf8(wrapFixture.wstring()), options) == 0, "wrap fixture open rejected");
+    REQUIRE_MSG(WaitArib([&] { return s.prepared > 0 || s.errors > 0; }, 20) && s.errors == 0, "wrap fixture did not open");
+
+    // cue start is on the stream timeline, Position() counts from the first timestamp: their difference is constant
+    std::optional<double> offsetBefore, offsetAfter;
+    bool ok = WaitArib([&] {
+        auto cue = ShownCaptionCue(*s.player);
+        if (cue && cue->start <= 0 && !offsetBefore) offsetBefore = s.player->Position() - cue->start;
+        if (cue && cue->start > 0 && !offsetAfter) offsetAfter = s.player->Position() - cue->start;
+        return offsetAfter.has_value() || s.errors > 0;
+    }, 30);
+    REQUIRE_MSG(offsetBefore.has_value(), "no caption cue before the clock wrap was shown");
+    REQUIRE_MSG(ok && offsetAfter.has_value(), "no caption cue after the clock wrap was shown");
+    CHECK_MSG(std::abs(*offsetAfter - *offsetBefore) < 5.0,
+              "a cue after the wrap is off the clock: " + std::to_string(*offsetBefore) + " before, " + std::to_string(*offsetAfter) + " after");
 }

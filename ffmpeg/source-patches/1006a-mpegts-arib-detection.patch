@@ -1,5 +1,7 @@
---- a/libavformat/mpegts.c
-+++ b/libavformat/mpegts.c
+Index: quilt-tree/libavformat/mpegts.c
+===================================================================
+--- quilt-tree.orig/libavformat/mpegts.c	2026-10-18 11:16:24.467433963 +0900
++++ quilt-tree/libavformat/mpegts.c	2026-10-18 11:16:24.464959395 +0900
 @@ -22,6 +22,7 @@
  #include "config_components.h"
  
@@ -8,7 +10,7 @@
  #include "libavutil/buffer.h"
  #include "libavutil/crc.h"
  #include "libavutil/internal.h"
-@@ -128,6 +129,8 @@ struct Program {
+@@ -128,6 +129,8 @@
  
      /** have we found pmt for this program */
      int pmt_found;
@@ -17,7 +19,7 @@
  };
  
  struct MpegTSContext {
-@@ -294,6 +297,94 @@ static struct Program * get_program(Mpeg
+@@ -294,6 +297,94 @@
      return NULL;
  }
  
@@ -112,7 +114,7 @@
  static void clear_avprogram(MpegTSContext *ts, unsigned int programid)
  {
      AVProgram *prg = NULL;
-@@ -344,6 +435,7 @@ static struct Program * add_program(Mpeg
+@@ -344,6 +435,7 @@
      ts->prg = tmp;
      p = &ts->prg[ts->nb_prg];
      p->id = programid;
@@ -120,7 +122,7 @@
      clear_program(p);
      ts->nb_prg++;
      return p;
-@@ -2242,6 +2334,8 @@ int ff_parse_mpeg2_descriptor(AVFormatCo
+@@ -2242,6 +2334,8 @@
          break;
      case STREAM_IDENTIFIER_DESCRIPTOR:
          sti->stream_identifier = 1 + get8(pp, desc_end);
@@ -129,7 +131,7 @@
          break;
      case METADATA_DESCRIPTOR:
          if (get16(pp, desc_end) == 0xFFFF)
-@@ -2498,6 +2592,7 @@ static AVStream *find_matching_stream(Mp
+@@ -2498,6 +2592,7 @@
                 "reusing existing %s stream %d (pid=0x%x) for new pid=0x%x\n",
                 av_get_media_type_string(found->codecpar->codec_type),
                 found->index, found->id, pid);
@@ -137,7 +139,7 @@
      }
  
      return found;
-@@ -2569,6 +2664,8 @@ static void pmt_cb(MpegTSFilter *filter,
+@@ -2569,6 +2664,8 @@
      uint32_t prog_reg_desc = 0; /* registration descriptor */
      int stream_identifier = -1;
      struct Program *prg;
@@ -146,7 +148,7 @@
  
      int mp4_descr_count = 0;
      Mp4Descr mp4_descr[MAX_MP4_DESCR_COUNT] = { { 0 } };
-@@ -2597,8 +2694,16 @@ static void pmt_cb(MpegTSFilter *filter,
+@@ -2597,8 +2694,16 @@
      prg = get_program(ts, h->id);
      if (prg)
          old_program = *prg;
@@ -164,7 +166,7 @@
  
      if (ts->skip_unknown_pmt && !prg)
          return;
-@@ -2635,6 +2740,12 @@ static void pmt_cb(MpegTSFilter *filter,
+@@ -2635,6 +2740,12 @@
              // something else is broken, exit the program_descriptors_loop
              break;
          program_info_length -= len;
@@ -177,7 +179,7 @@
          if (tag == IOD_DESCRIPTOR && len >= 2) {
              get8(&p, p_end); // scope
              get8(&p, p_end); // label
-@@ -2676,7 +2787,7 @@ static void pmt_cb(MpegTSFilter *filter,
+@@ -2676,7 +2787,7 @@
          /* now create stream */
          if (ts->pids[pid] && ts->pids[pid]->type == MPEGTS_PES) {
              pes = ts->pids[pid]->u.pes_filter.opaque;
@@ -186,7 +188,7 @@
                  st = find_matching_stream(ts, pid, h->id, stream_identifier, i, &old_program);
                  if (st) {
                      pes->st = st;
-@@ -2695,7 +2806,7 @@ static void pmt_cb(MpegTSFilter *filter,
+@@ -2695,7 +2806,7 @@
              if (ts->pids[pid])
                  mpegts_close_filter(ts, ts->pids[pid]); // wrongly added sdt filter probably
              pes = add_pes_stream(ts, pid, pcr_pid);
@@ -195,7 +197,7 @@
                  st = find_matching_stream(ts, pid, h->id, stream_identifier, i, &old_program);
                  if (st) {
                      pes->st = st;
-@@ -2714,7 +2825,7 @@ static void pmt_cb(MpegTSFilter *filter,
+@@ -2714,7 +2825,7 @@
              if (idx >= 0) {
                  st = ts->stream->streams[idx];
              }
@@ -204,7 +206,7 @@
                  st = find_matching_stream(ts, pid, h->id, stream_identifier, i, &old_program);
              }
              if (!st) {
-@@ -2752,6 +2863,7 @@ static void pmt_cb(MpegTSFilter *filter,
+@@ -2752,6 +2863,7 @@
          desc_list_end  = p + desc_list_len;
          if (desc_list_end > p_end)
              goto out;
@@ -212,7 +214,7 @@
          for (;;) {
              if (ff_parse_mpeg2_descriptor(ts->stream, st, stream_type, h->id, &p,
                                            desc_list_end, mp4_descr,
-@@ -2768,6 +2880,8 @@ static void pmt_cb(MpegTSFilter *filter,
+@@ -2768,6 +2880,8 @@
          p = desc_list_end;
      }
  
@@ -221,3 +223,18 @@
      if (!ts->pids[pcr_pid])
          mpegts_open_pcr_filter(ts, pcr_pid);
  
+Index: quilt-tree/libavformat/demux.c
+===================================================================
+--- quilt-tree.orig/libavformat/demux.c	2026-11-02 06:39:12.000000000 +0900
++++ quilt-tree/libavformat/demux.c	2026-11-02 06:39:12.958681222 +0900
+@@ -538,6 +538,10 @@
+             }
+             program = av_find_program_from_stream(s, program, stream_index);
+         }
++
++        // a stream added to the program after its reference was set (late PMT) was not covered above
++        sti->pts_wrap_reference = pts_wrap_reference;
++        sti->pts_wrap_behavior  = pts_wrap_behavior;
+     }
+     return 1;
+ }

@@ -109,3 +109,15 @@ LOGIC_TEST(playlist_panel_move_permutation) {
     LT_CHECK((plp::RemapSelection({2, 0, 1}, {0, 2}) == std::vector<int>{0, 1}));
     LT_CHECK((plp::Complement(5, {1, 3}) == std::vector<int>{0, 2, 4}));
 }
+
+LOGIC_TEST(playlist_panel_item_paths_text_is_native_path_per_line) {
+    std::vector<wvp::MediaItem> items{Item("file:///C:/media/a%20b.mp4"), Item("C:/media/c.mkv"), Item("https://example.com/v.m3u8")};
+#ifdef _WIN32
+    const std::wstring eol = L"\r\n";
+#else
+    const std::wstring eol = L"\n";
+#endif
+    LT_CHECK(plp::ItemPathsText(items, {0}) == L"C:\\media\\a b.mp4");
+    LT_CHECK(plp::ItemPathsText(items, {1, 2}) == std::wstring(L"C:\\media\\c.mkv") + eol + L"https://example.com/v.m3u8");
+    LT_CHECK(plp::ItemPathsText(items, {}).empty());
+}

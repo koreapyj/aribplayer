@@ -478,7 +478,7 @@ Subtitle stream entries in `ffp_get_media_info` may include `arib_type` (`"capti
 
 ### Cue timing and presentation
 
-ARIB decoder output is a sequence of timed RGBA bitmap events. Cue start is the subtitle PTS plus `start_display_time`; an end time of `UINT32_MAX` means that the cue remains active until replaced or cleared. An event with no rectangles clears that layer immediately. Cue state is driven by the playback clock, not the coarse POSITION event cadence, and is flushed on seek and stream changes.
+ARIB decoder output is a sequence of timed RGBA bitmap events. Cue start is the subtitle PTS plus `start_display_time`; an end time of `UINT32_MAX` means that the cue remains active until replaced or cleared. An event with no rectangles clears that layer immediately. Cue state is driven by the playback clock, not the coarse POSITION event cadence, and is flushed on seek and stream changes. Caption and other PES streams share the 33-bit MPEG-TS clock unwrapping of the video: a caption component that joins the PMT after the first video packet is unwrapped against the same reference (libavformat otherwise left its timestamps raw after the clock wrap, about 26.5 hours of ticks behind the video).
 
 Both subtitle layers are handed to the presenter with every picture (`FFPPicture.overlays`, straight-alpha RGBA in the canvas of the displayed video area; a new `generation` means new pixels); the D3D11 presenter uploads cue rectangles as cached RGBA textures and blends them over the presented frame in both routes. Caption toggle visibility does not hide superimpose. A presenter resize updates decoder canvas sizes after the size is stable; the old cue remains scaled until its exact-size replacement arrives. Re-rendered cues preserve their original timing and cannot override a newer cue.
 
@@ -574,8 +574,10 @@ events shown at the picture's time by layer and read order, with override tags r
 ### Delay: `ffp_set_subtitle_delay` / `ffp_get_subtitle_delay`
 
 Milliseconds, positive = subtitles later. Live; `ffp_open` resets it to 0. libass renders at `t - delay`; bitmap
-cues (embedded PGS and external `.sup`) are due at their time + delay. ARIB captions are not delayed. For embedded
-streams a negative delay can show a cue only once its packet has been read (the read-ahead of the demuxer).
+cues (embedded PGS and external `.sup`) and the ARIB caption layer are due at their time + delay (the ARIB superimpose
+layer is not delayed). A change also applies to a paused picture at once: the ARIB caption on screen is chosen again,
+an earlier one from the decoder's caption history. For embedded streams a negative delay can show a cue only once its
+packet has been read (the read-ahead of the demuxer).
 
 ### Stream selection: `ffp_select_stream`
 

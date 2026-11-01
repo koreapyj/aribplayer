@@ -25,6 +25,7 @@ std::wstring ToW(NSString* s) {
     NSTrackingArea* _tracking;
     std::wstring _marked;
     size_t _markedStart;
+    bool _ibeamShown;                 // this view set the I-beam and owes the arrow back
 }
 
 - (instancetype)initWithFrame:(NSRect)frame mainView:(mainview::MainView*)mv renderer:(puimac::CGRenderer*)renderer {
@@ -94,7 +95,7 @@ std::wstring ToW(NSString* s) {
 - (void)updateTracking {
     if (_tracking) [self removeTrackingArea:_tracking];
     _tracking = [[NSTrackingArea alloc] initWithRect:self.bounds
-                                             options:NSTrackingMouseMoved | NSTrackingMouseEnteredAndExited | NSTrackingActiveAlways | NSTrackingInVisibleRect
+                                             options:NSTrackingMouseMoved | NSTrackingMouseEnteredAndExited | NSTrackingCursorUpdate | NSTrackingActiveAlways | NSTrackingInVisibleRect
                                                owner:self userInfo:nil];
     [self addTrackingArea:_tracking];
 }
@@ -199,6 +200,7 @@ std::wstring ToW(NSString* s) {
     }
     pui::PointerEvent pe = [self pointerEvent:e button:pui::PointerButton::Left];
     _mv->host.PointerMove(pe);
+    [self updateCursorAt:pe.pt];
     _mv->PointerAt(pe.pt);   // the full-screen reveal follows a drag too (the capture keeps what it started on)
     [self afterEvent];
 }
@@ -243,12 +245,26 @@ std::wstring ToW(NSString* s) {
 - (void)mouseMoved:(NSEvent*)e {
     pui::PointerEvent pe = [self pointerEvent:e button:pui::PointerButton::None];
     _mv->host.PointerMove(pe);
+    [self updateCursorAt:pe.pt];
     _mv->PointerAt(pe.pt);
     [self afterEvent];
 }
 
+/// pui::UiHost::CursorAt: the I-beam over text (the playlist search box), the arrow back otherwise; the splitter's cursor
+/// rect stays AppKit's.
+- (void)updateCursorAt:(pui::PointF)pt {
+    const bool ibeam = _mv->host.CursorAt(pt) == pui::CursorKind::IBeam;
+    if (ibeam) { [NSCursor.IBeamCursor set]; _ibeamShown = true; }
+    else if (_ibeamShown) { [NSCursor.arrowCursor set]; _ibeamShown = false; }
+}
+
+- (void)cursorUpdate:(NSEvent*)e {
+    [self updateCursorAt:[self pointerEvent:e button:pui::PointerButton::None].pt];
+}
+
 - (void)mouseExited:(NSEvent*)e {
     (void)e;
+    if (_ibeamShown) { [NSCursor.arrowCursor set]; _ibeamShown = false; }
     _mv->host.PointerLeave();
     _mv->PointerAt(std::nullopt);
     [self afterEvent];

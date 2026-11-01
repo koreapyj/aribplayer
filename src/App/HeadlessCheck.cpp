@@ -29,6 +29,7 @@
 #include "features/SettingsLogic.h"
 #include "features/SettingsService.h"
 #include "pui/VirtualList.h"
+#include "shell/PropertiesWindow.h"
 #include "shell/SettingsWindow.h"
 #include <shellapi.h>
 #include <shlobj.h>
@@ -1042,7 +1043,12 @@ int App::RunHeadlessCheck() {
                 SendMessageW(hwnd_, WM_RUN_QUEUE, 0, 0);
                 ForceRender();
             }
-            Step(invokeStep, (ran && host_.HasModalPopup()) ? S_OK : E_FAIL);   // Properties opens only through the menu item.
+            // Properties opens only through the menu item, as its own window (hidden here) rather than a popup of the player.
+            PropertiesWindow* pw = Properties();
+            const bool propsOpen = ran && pw && pw->IsOpen() && pw->DeviceReady() && pw->ContentDrawn() && !IsWindowVisible(pw->Hwnd()) &&
+                                   host_.PopupCount() == 0 && IsWindowEnabled(hwnd_);
+            Step(invokeStep, propsOpen ? S_OK : E_FAIL);
+            if (pw) pw->Close();
             host_.CloseAllPopups();
             UpdateAcrylicState(true);
             ForceRender();

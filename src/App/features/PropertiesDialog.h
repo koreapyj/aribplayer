@@ -1,16 +1,26 @@
 #pragma once
-// File properties dialog (ffp_get_media_info).
+// File properties (ffp_get_media_info), shown in the Properties window (AppContext::ShowPropertiesWindow).
 // Model + formatting: features/FxProps.h. The row layout below is pure so it can be tested with a RecordingRenderer.
+#include <functional>
+#include <memory>
 #include <vector>
 
 #include "features/FxProps.h"
 #include "pui/Renderer.h"
+#include "pui/Widget.h"
 
 namespace app {
 class AppContext;
 
 /// Shows a toast when nothing is playing.
 void ShowPropertiesDialog(AppContext& ctx);
+
+struct PropertiesPage {
+    std::unique_ptr<pui::Widget> root;
+    pui::Widget* initialFocus = nullptr;   // the Close button
+};
+/// The window content: heading, scrolling selectable rows, Close button (onClick = onClose). `measurer` outlives it.
+PropertiesPage CreatePropertiesPage(std::vector<fx::PropSection> sections, pui::IRenderer* measurer, std::function<void()> onClose);
 
 namespace fx {
 struct PropsLine {

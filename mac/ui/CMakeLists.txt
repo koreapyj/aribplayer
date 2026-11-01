@@ -23,6 +23,7 @@ set(PUI_NEUTRAL_SOURCES
     ${PUI_ROOT}/src/Menu.cpp
     ${PUI_ROOT}/src/Panels.cpp
     ${PUI_ROOT}/src/ScrollViewer.cpp
+    ${PUI_ROOT}/src/SelectableText.cpp
     ${PUI_ROOT}/src/Slider.cpp
     ${PUI_ROOT}/src/TextBox.cpp
     ${PUI_ROOT}/src/Toggles.cpp

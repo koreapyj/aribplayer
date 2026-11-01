@@ -31,6 +31,8 @@ enum class Role {
 
 enum class PointerButton { None, Left, Right };
 
+enum class CursorKind { Arrow, IBeam };
+
 struct PointerEvent {
     PointF pt{};
     PointerButton button = PointerButton::Left;
@@ -137,6 +139,8 @@ public:
     virtual bool OnChar(wchar_t ch) { (void)ch; return false; }
     /// Context menu request (right click: keyboard=false, pt = pointer; Shift+F10/Apps: keyboard=true, pt = widget centre).
     virtual bool OnContextMenu(PointF pt, bool keyboard) { (void)pt; (void)keyboard; return false; }
+    /// Cursor shown while the pointer is over this widget (the window hosts map it to the OS cursor).
+    virtual CursorKind Cursor() const { return CursorKind::Arrow; }
     virtual void OnFocusChanged(bool focused) { (void)focused; }
     /// Animation tick (after UiHost::StartAnimating(this)); return false to stop ticking.
     virtual bool OnTick(uint64_t nowMs) { (void)nowMs; return false; }
@@ -229,7 +233,7 @@ public:
 
     // The host owns an open popup until it is closed.
     Widget* OpenPopup(std::unique_ptr<Widget> popup, PopupOptions opts = {});
-    void ClosePopup(Widget* popup);                                    // no-op when not open
+    void ClosePopup(Widget* popup);                                    // it and the popups above it; no-op when not open
     void CloseAllPopups();
     Widget* TopPopup() const;
     size_t PopupCount() const { return popups_.size(); }
@@ -247,6 +251,8 @@ public:
     bool PointerWheel(const PointerEvent& e);
     void PointerLeave();                                               // pointer left the window
     Widget* HitTest(PointF p) const;                                   // popups first (top to bottom), then root
+    /// The mouse cursor for the pointer at p: the capture widget's, else the nearest Cursor() other than Arrow up from the hit widget.
+    CursorKind CursorAt(PointF p) const;
     Widget* Hovered() const { return hovered_; }
     Widget* Captured() const { return capture_; }
     void SetCapture(Widget* w) { capture_ = w; }

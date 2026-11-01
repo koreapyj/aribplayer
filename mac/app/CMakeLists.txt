@@ -115,6 +115,7 @@ add_executable(aribplayer MACOSX_BUNDLE
     src/VideoView.mm
     src/PuiHostView.mm
     src/SettingsWindowMac.mm
+    src/PropertiesWindowMac.mm
     src/SettingsServiceMac.mm
     src/OpenFlowsMac.mm
     src/MiniPlayerMac.mm

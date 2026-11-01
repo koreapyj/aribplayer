@@ -12,6 +12,7 @@
 #include "Commands.h"
 #include "Services.h"
 #include "ShellLogic.h"
+#include "features/FxProps.h"
 #include "pui/Renderer.h"
 #include "pui/Theme.h"
 #include "pui/Widget.h"
@@ -102,6 +103,9 @@ public:
     virtual void ShowInfoBar(InfoSeverity severity, const std::wstring& title, const std::wstring& message) = 0;
     /// Short pill above the bar (~2.5 s) and the status line in the bar header.
     virtual void ShowToast(const std::wstring& text) = 0;
+    /// Opens the Properties window (a separate, modeless, single-instance window) with the rows for the current media; shown
+    /// again while open it refreshes and comes to the front. Default: no window (test stubs).
+    virtual void ShowPropertiesWindow(std::vector<fx::PropSection> sections) { (void)sections; }
     /// Hardware adapters that can be the video GPU (from the capability probes), for Settings > Playback > Video GPU.
     virtual std::vector<wvp::VideoGpuPref> VideoGpus() const { return {}; }
     /// settings.videoGpu changed: select again and reopen the current item on the new adapter when it changed.

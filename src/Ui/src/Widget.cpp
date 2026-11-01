@@ -240,10 +240,13 @@ Widget* UiHost::OpenPopup(std::unique_ptr<Widget> popup, PopupOptions opts) {
 void UiHost::ClosePopup(Widget* popup) {
     auto it = std::find_if(popups_.begin(), popups_.end(), [&](const Popup& p) { return p.widget.get() == popup; });
     if (it == popups_.end()) return;
-    size_t idx = (size_t)(it - popups_.begin());
-    while (popups_.size() > idx) {
-        Popup p = std::move(popups_.back());
-        popups_.pop_back();
+    std::vector<Widget*> victims;
+    for (auto jt = it; jt != popups_.end(); ++jt) victims.push_back(jt->widget.get());
+    for (size_t i = victims.size(); i-- > 0;) {
+        auto vt = std::find_if(popups_.begin(), popups_.end(), [&](const Popup& p) { return p.widget.get() == victims[i]; });
+        if (vt == popups_.end()) continue;
+        Popup p = std::move(*vt);
+        popups_.erase(vt);
         Widget* w = p.widget.get();
         bool focusInside = focused_ && w->IsAncestorOf(focused_);
         OnWidgetRemoved(w);
@@ -261,7 +264,9 @@ void UiHost::ClosePopup(Widget* popup) {
 }
 
 void UiHost::CloseAllPopups() {
-    if (!popups_.empty()) ClosePopup(popups_.front().widget.get());
+    std::vector<Widget*> targets;
+    for (auto& p : popups_) targets.push_back(p.widget.get());
+    for (Widget* w : targets) ClosePopup(w);
 }
 
 Widget* UiHost::TopPopup() const {
@@ -303,6 +308,12 @@ bool UiHost::IsPopupOpen(const Widget* popup) const {
     return false;
 }
 
+
+CursorKind UiHost::CursorAt(PointF p) const {
+    for (Widget* w = capture_ ? capture_ : HitTest(p); w; w = w->Parent())
+        if (w->Cursor() != CursorKind::Arrow) return w->Cursor();
+    return CursorKind::Arrow;
+}
 
 Widget* UiHost::HitTest(PointF p) const {
     for (auto it = popups_.rbegin(); it != popups_.rend(); ++it) {

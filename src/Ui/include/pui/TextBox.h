@@ -33,6 +33,7 @@ public:
     bool OnPointerUp(const PointerEvent& e) override;
     bool OnKeyDown(int vk, unsigned mods) override;
     bool OnChar(wchar_t ch) override;
+    CursorKind Cursor() const override { return CursorKind::IBeam; }
     void OnFocusChanged(bool focused) override { (void)focused; Invalidate(); }
     bool SupportsValue() const override { return true; }
     std::wstring GetValue() const override { return text_; }

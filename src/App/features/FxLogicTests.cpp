@@ -13,6 +13,8 @@
 #include "features/NativeMenu.h"
 #include "features/PlaybackExtras.h"
 #include "features/PropertiesDialog.h"
+#include "pui/SelectableText.h"
+#include "pui/TextBox.h"
 #include "Services.h"
 #include "pui/Renderer.h"
 
@@ -659,4 +661,41 @@ LOGIC_TEST(media_info_parses_arib_audio_roles) {
     LT_CHECK(mi && mi->AribAudio.Present && mi->AribAudio.Audio1 == 1 && mi->AribAudio.Audio2 == -1);
     auto plain = wvp::MediaInfo::Parse(R"({"streams":[{"index":0,"type":"audio"}]})");
     LT_CHECK(plain && !plain->AribAudio.Present);
+}
+
+LOGIC_TEST(ui_cursor_is_ibeam_over_text_widgets_and_while_captured) {
+    pui::UiHost host;
+    auto root = std::make_unique<pui::Widget>();
+    pui::SelectableText* text = root->Add<pui::SelectableText>(L"abc", pui::TextStyle{});
+    pui::TextBox* box = root->Add<pui::TextBox>();
+    pui::Widget* plain = root->Add<pui::Widget>();
+    text->SetBounds({0, 0, 100, 20});
+    box->SetBounds({0, 30, 100, 62});
+    plain->SetBounds({0, 70, 100, 100});
+    host.SetRoot(std::move(root));
+    host.SetSize({200, 200});
+    LT_CHECK(host.CursorAt({10, 10}) == pui::CursorKind::IBeam);
+    LT_CHECK(host.CursorAt({10, 40}) == pui::CursorKind::IBeam);
+    LT_CHECK(host.CursorAt({10, 80}) == pui::CursorKind::Arrow);
+    LT_CHECK(host.CursorAt({150, 150}) == pui::CursorKind::Arrow);
+    host.SetCapture(text);
+    LT_CHECK(host.CursorAt({10, 80}) == pui::CursorKind::IBeam);
+    host.ReleaseCapture();
+    LT_CHECK(host.CursorAt({10, 80}) == pui::CursorKind::Arrow);
+}
+
+LOGIC_TEST(ui_selectable_text_wraps_selects_and_reports_selection) {
+    pui::RecordingRenderer r;
+    pui::TextStyle st;
+    st.size = 14;
+    const std::wstring path = L"C:/media/folder/a-very-long-file-name.mkv";
+    pui::SelectableText t(path, st);
+    float oneLine = pui::SelectableText::HeightFor(r, path, st, 10000);
+    float wrapped = pui::SelectableText::HeightFor(r, path, st, 100);
+    LT_CHECK(wrapped > oneLine);
+    t.SelectAll();
+    LT_CHECK(t.SelectedText() == path);
+    t.SetSelection(3, 8);
+    LT_CHECK(t.SelectedText() == path.substr(3, 5));
+    LT_CHECK(t.GetValue() == path);
 }

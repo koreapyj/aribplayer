@@ -12,6 +12,7 @@
 #include "Localize.h"
 #include "LoggingMac.h"
 #include "MainView.h"
+#include "PlayerAttachedMac.h"
 #include "PopupDismissMac.h"
 #include "PuiHostView.h"
 #include "features/FiltersPanel.h"
@@ -449,27 +450,14 @@ void AdaptPageForMac(pui::Widget* page, MainView& mv, pui::UiHost& host, const s
 }
 }
 
-struct SettingsWindow::Impl {
-    MainView& mv;
+struct SettingsWindow::Impl : PlayerAttached {
     pui::UiHost host;
     puimac::CGRenderer renderer;
-    NSWindow* window = nil;
     PuiHostView* view = nil;
     SettingsWindowDelegate* delegate = nil;
     Root* root = nullptr;
     pui::Widget* page = nullptr;
-    bool inFront = false;            // a press on the player put it in front of this window (SettingsWindow::inFront_)
-    bool hiddenForPlayer = false;    // hidden while the player is minimized
-    explicit Impl(MainView& m) : mv(m) {}
-    NSWindow* Player() const { return (__bridge NSWindow*)(void*)mv.MainHwnd(); }
-    bool Shown() const { return window.visible && !hiddenForPlayer; }
-    /// Directly above the player, without activation, in the player's band.
-    void RaiseAbove() {
-        NSWindow* player = Player();
-        if (!player) return;
-        if (window.level != player.level) window.level = player.level;
-        [window orderWindow:NSWindowAbove relativeTo:player.windowNumber];
-    }
+    explicit Impl(MainView& m) : PlayerAttached(m) {}
 };
 
 SettingsWindow::SettingsWindow(MainView& mv) : impl_(std::make_unique<Impl>(mv)) {
@@ -604,40 +592,13 @@ void SettingsWindow::Close() {
 
 bool SettingsWindow::IsOpen() const { return impl_->window.visible || impl_->hiddenForPlayer; }
 
-void SettingsWindow::StartFocusCycle() {
-    Impl& d = *impl_;
-    if (!d.Shown()) return;
-    d.inFront = false;
-    d.RaiseAbove();
-}
+void SettingsWindow::StartFocusCycle() { impl_->StartFocusCycle(); }
 
-void SettingsWindow::OnPlayerPressed() {
-    Impl& d = *impl_;
-    if (!d.Shown() || d.inFront) return;
-    d.inFront = true;
-    // Out of the topmost band; below a player that is not in it.
-    if (d.window.level != NSNormalWindowLevel) d.window.level = NSNormalWindowLevel;
-    NSWindow* player = d.Player();
-    if (player && player.level == NSNormalWindowLevel) [d.window orderWindow:NSWindowBelow relativeTo:player.windowNumber];
-}
+void SettingsWindow::OnPlayerPressed() { impl_->OnPlayerPressed(); }
 
-void SettingsWindow::KeepAbove() {
-    Impl& d = *impl_;
-    if (d.Shown() && !d.inFront) d.RaiseAbove();
-}
+void SettingsWindow::KeepAbove() { impl_->KeepAbove(); }
 
-void SettingsWindow::OnPlayerMinimized(bool minimized) {
-    Impl& d = *impl_;
-    if (minimized) {
-        if (!d.window.visible) return;
-        d.hiddenForPlayer = true;
-        d.host.CloseAllPopups();
-        [d.window orderOut:nil];
-    } else if (d.hiddenForPlayer) {
-        d.hiddenForPlayer = false;
-        d.RaiseAbove();   // orders it in without making it key
-    }
-}
+void SettingsWindow::OnPlayerMinimized(bool minimized) { impl_->OnPlayerMinimized(impl_->host, minimized); }
 
 bool SettingsWindow::PlayerInFront() const { return impl_->inFront; }
 

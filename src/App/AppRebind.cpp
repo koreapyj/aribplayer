@@ -6,6 +6,7 @@
 #include "App.h"
 #include "Localize.h"
 #include "features/Logging.h"
+#include "shell/PropertiesWindow.h"
 #include "shell/SettingsWindow.h"
 #include "wvp/win32/Utf.h"
 
@@ -97,8 +98,8 @@ bool App::RebindUi(RebindReason reason, bool forceWarp) {
     rebuildFailed_ = false;
 
     // Device children first, then the devices: layers (visual + surface) -> renderer's dc-bound brush -> DComp -> D2D -> D3D.
-    // The Settings window's target / visuals / surfaces live on the same devices.
-    if (settingsWin_) settingsWin_->ReleaseDevice();
+    // The Settings / Properties windows' targets / visuals / surfaces live on the same devices.
+    ForEachHostWindow([](HostWindow& w) { w.ReleaseDevice(); });
     for (Layer l : kLayerStack) LayerSurf(l) = {};
     d2d_.ReleaseDevice();
     gfx_.Shutdown();
@@ -117,10 +118,12 @@ bool App::RebindUi(RebindReason reason, bool forceWarp) {
         return false;
     }
     ArmGfx();
-    if (settingsWin_ && settingsWin_->IsOpen() && FAILED(settingsWin_->AttachDevice())) {   // its own target for its HWND
-        log::Event("gpu", "rebuild step failed: settings window target", log::kError);
-        rebuildFailed_ = true;
-    }
+    ForEachHostWindow([&](HostWindow& w) {
+        if (w.IsOpen() && FAILED(w.AttachDevice())) {   // its own target for its HWND
+            log::Event("gpu", "rebuild step failed: host window target", log::kError);
+            rebuildFailed_ = true;
+        }
+    });
 
     // Playback restore can start now; the hook returns without waiting for the open.
     videoSoftwareFallback_ = rebind_.FallbackActive() || forceWarp;
@@ -138,7 +141,7 @@ bool App::RebindUi(RebindReason reason, bool forceWarp) {
         SnapBar();
         Flush();
     }
-    if (settingsWin_) settingsWin_->Render(true);
+    ForEachHostWindow([](HostWindow& w) { w.Render(true); });
     const HRESULT chr = gfx_.Commit();
     rebindTiming_.uiVisibleUs = QpcUs();
     rebuilding_ = false;

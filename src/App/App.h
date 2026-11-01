@@ -10,8 +10,9 @@
 // ONE pui::UiHost (root = ShellRoot) owns focus/hover/capture/popups. Each layer is painted by pointing the renderer at a
 // subtree; a layer repaints only when its paint hash changed (LayerRenderer hash mode), after a UiHost invalidation
 // (coalesced through a posted message) or the periodic tick (100 ms idle / 16 ms animating).
-// Settings is a separate owned top-level window (shell/SettingsWindow): own HWND, DComp target, UiHost and renderer, drawn
-// with the same UI device (gfx_); App::ShowSettings opens it or brings it to the front, RebindUi recreates its surfaces.
+// Settings and Properties are separate owned top-level windows (shell/HostWindow: SettingsWindow, PropertiesWindow): own HWND,
+// DComp target, UiHost and renderer, drawn with the same UI device (gfx_); App::ShowSettings / ShowPropertiesWindow open one
+// or bring it to the front, RebindUi recreates their surfaces.
 #include <windows.h>
 #include <oleidl.h>
 
@@ -46,7 +47,9 @@
 
 namespace app {
 
+class HostWindow;
 class SettingsWindow;
+class PropertiesWindow;
 
 struct AppOptions {
     std::vector<std::wstring> inputs;
@@ -114,6 +117,7 @@ public:
     void ApplyTheme(pui::ThemeMode mode, uint32_t accent) override;
     /// F5 / main menu "Settings": opens the Settings window, or brings the open one to the front (single instance, modeless).
     void ShowSettings();
+    void ShowPropertiesWindow(std::vector<fx::PropSection> sections) override;
     void NotePlayerPressed();         // a mouse button went down on the player (never consumes the message): it goes in front of Settings
     void NoteTopmostReasserted();     // the player re-asserted its z-order / always-on-top state: Settings stays above unless the player is in front
     const pui::Theme& CurrentTheme() const override { return host_.GetTheme(); }
@@ -384,6 +388,8 @@ private:
     Gfx gfx_;
     Surf sContent_, sPanel_, sDebug_, sTitle_, sBar_, sPopup_;   // DComp layers, created in LayerOrder.h order
     std::unique_ptr<SettingsWindow> settingsWin_;                // created on the first ShowSettings; its HWND lives while open
+    std::unique_ptr<PropertiesWindow> propsWin_;                 // likewise for ShowPropertiesWindow
+    void ForEachHostWindow(const std::function<void(HostWindow&)>& fn);   // the open-or-closed Settings / Properties windows
     bool skipActivationPress_ = false;   // the next press is the click that brought the app back from another application
     bool themeLight_ = false;
     pui::Theme SettingsTheme() const;                            // the app theme for the Settings window (no in-video Acrylic)
@@ -472,6 +478,7 @@ public:
     /// Test hooks (headless-check): drive everything through the public paths on a hidden window.
     ShellRoot* Shell() const { return shell_; }
     SettingsWindow* Settings() const { return settingsWin_.get(); }
+    PropertiesWindow* Properties() const { return propsWin_.get(); }
     const ShellLayout& Layout() const { return layout_; }
     HRESULT LastDrawHr() const { return lastDrawHr_; }
     bool GfxOk() const { return gfxOk_; }

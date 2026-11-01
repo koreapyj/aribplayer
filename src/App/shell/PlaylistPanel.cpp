@@ -11,6 +11,7 @@
 #include "features/NativeMenu.h"
 #include "features/OpenFlows.h"
 #include "features/ListsCommon.h"
+#include "pui/Clipboard.h"
 #include "pui/Glyphs.h"
 #include "wvp/Platform.h"
 #include "wvp/PlaylistSort.h"
@@ -809,6 +810,12 @@ std::vector<pui::MenuItemDesc> PlaylistPanel::BuildItemMenu(int row) {
     };
     m.push_back(pui::MenuItemDesc::Separator());
     m.push_back(pui::MenuItemDesc::Sub(Tr(L"Copy", L"복사"), lists::AddToPlaylistItems(ctx_, pick, viewed_), G::Copy));
+    m.push_back(pui::MenuItemDesc::Item(Tr(L"Copy path", L"경로 복사"), [this, rows] {
+        const std::wstring text = plp::ItemPathsText(Items(), rows);
+        if (text.empty()) return;
+        pui::SetClipboardText(text);
+        ctx_.ShowToast(Tr(L"Copied", L"복사됨"));
+    }));
     m.push_back(pui::MenuItemDesc::Separator());
     m.push_back(Item(L"Move to top", L"맨 위로", PanelAction::MoveTop, !rows.empty()));
     m.push_back(Item(L"Move to bottom", L"맨 아래로", PanelAction::MoveBottom, !rows.empty()));

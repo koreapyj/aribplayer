@@ -50,6 +50,7 @@
 #include "Engine.h"
 #include "NativeMenuMac.h"
 #include "OpenFlowsMac.h"
+#include "PropertiesWindowMac.h"
 #include "SettingsWindowMac.h"
 #include "ShellView.h"
 #include "VideoView.h"
@@ -190,6 +191,7 @@ pui::Widget* FindById(pui::Widget* w, const std::wstring& id) {
     std::unique_ptr<puimac::CGRenderer> _renderer;
     std::unique_ptr<mainview::MainView> _mv;
     std::unique_ptr<mainview::SettingsWindow> _settings;
+    std::unique_ptr<mainview::PropertiesWindow> _props;
     std::unique_ptr<puimac::ThemeObserver> _themeObserver;
     NSTimer* _modelTick;
     NSString* _media;
@@ -500,6 +502,7 @@ static NSEventModifierFlags MacMods(unsigned m) {
         if (!s || s->_mv->IsMiniPlayer()) return;
         s->_window.level = on ? NSFloatingWindowLevel : NSNormalWindowLevel;
         if (s->_settings) s->_settings->KeepAbove();   // App::NoteTopmostReasserted
+        if (s->_props) s->_props->KeepAbove();
     };
     _mv->hooks.cursorAt = [weakSelf]() -> std::optional<pui::PointF> {
         AppDelegate* s = weakSelf;
@@ -512,6 +515,12 @@ static NSEventModifierFlags MacMods(unsigned m) {
     _mv->hooks.applyTheme = [weakSelf](pui::ThemeMode m, std::uint32_t) { [weakSelf setAppearance:m]; };
     _mv->hooks.miniPlayer = [weakSelf](bool on) { AppDelegate* s = weakSelf; if (s) { [s->_shell relayout]; if (!on) [s relayoutTrafficLightsSoon]; } };
     _mv->hooks.openSettings = [weakSelf] { [weakSelf openSettings]; };
+    _mv->hooks.showProperties = [weakSelf](std::vector<app::fx::PropSection> sections) {
+        AppDelegate* s = weakSelf;
+        if (!s) return;
+        if (!s->_props) s->_props = std::make_unique<mainview::PropertiesWindow>(*s->_mv);
+        s->_props->Show(std::move(sections));
+    };
     _mv->hooks.copyFrame = [](const wvp::BgraFrame& f) { [AppDelegate copyFrameToPasteboard:f]; };
     _mv->hooks.quit = [] { [NSApp terminate:nil]; };
     _mv->hooks.layoutChanged = [weakSelf] { AppDelegate* s = weakSelf; if (s && s->_shell) [s->_window invalidateCursorRectsForView:s->_shell]; };
@@ -526,6 +535,7 @@ static NSEventModifierFlags MacMods(unsigned m) {
         if (!s) return;
         [s->_shell applyTheme];
         if (s->_settings) s->_settings->ApplyTheme();
+        if (s->_props) s->_props->ApplyTheme();
     });
 
     // App::Create: settings (theme, placement), the restored playlist, then the window shows.
@@ -590,10 +600,15 @@ static NSEventModifierFlags MacMods(unsigned m) {
         // focus cycle put Settings above it; Settings goes back above it once the press is handled (Windows' order).
         _skipActivationPress = false;
         __weak AppDelegate* weakSelf = self;
-        dispatch_async(dispatch_get_main_queue(), ^{ AppDelegate* s = weakSelf; if (s && s->_settings) s->_settings->KeepAbove(); });
+        dispatch_async(dispatch_get_main_queue(), ^{
+            AppDelegate* s = weakSelf;
+            if (s && s->_settings) s->_settings->KeepAbove();
+            if (s && s->_props) s->_props->KeepAbove();
+        });
         return;
     }
     if (_settings) _settings->OnPlayerPressed();
+    if (_props) _props->OnPlayerPressed();
 }
 
 // The Settings window's focus cycle (App's WM_ACTIVATE from another process / WM_ACTIVATEAPP): the app came back from
@@ -602,6 +617,7 @@ static NSEventModifierFlags MacMods(unsigned m) {
     (void)n;
     _skipActivationPress = NSEvent.pressedMouseButtons != 0;
     if (_settings) _settings->StartFocusCycle();
+    if (_props) _props->StartFocusCycle();
 }
 
 - (void)applicationDidResignActive:(NSNotification*)n {
@@ -614,6 +630,7 @@ static NSEventModifierFlags MacMods(unsigned m) {
                      : m == pui::ThemeMode::Light ? [NSAppearance appearanceNamed:NSAppearanceNameAqua] : nil;
     [_shell applyTheme];
     if (_settings) _settings->ApplyTheme();
+    if (_props) _props->ApplyTheme();
     [self relayoutTrafficLightsSoon];
 }
 
@@ -730,8 +747,8 @@ static NSEventModifierFlags MacMods(unsigned m) {
 - (void)windowDidChangeScreen:(NSNotification*)n { (void)n; if (_mv) _mv->Eng().DisplayChanged(); }
 - (void)windowDidEndLiveResize:(NSNotification*)n { (void)n; [self layoutTrafficLights]; }
 - (void)windowDidBecomeKey:(NSNotification*)n { (void)n; [self layoutTrafficLights]; [_shell setNeedsDisplay:YES]; }
-- (void)windowDidMiniaturize:(NSNotification*)n { (void)n; if (_settings) _settings->OnPlayerMinimized(true); }
-- (void)windowDidDeminiaturize:(NSNotification*)n { (void)n; if (_settings) _settings->OnPlayerMinimized(false); }
+- (void)windowDidMiniaturize:(NSNotification*)n { (void)n; if (_settings) _settings->OnPlayerMinimized(true); if (_props) _props->OnPlayerMinimized(true); }
+- (void)windowDidDeminiaturize:(NSNotification*)n { (void)n; if (_settings) _settings->OnPlayerMinimized(false); if (_props) _props->OnPlayerMinimized(false); }
 - (void)windowDidResignKey:(NSNotification*)n { (void)n; [self layoutTrafficLights]; [_shell setNeedsDisplay:YES]; }
 - (void)windowDidEnterFullScreen:(NSNotification*)n { (void)n; _mv->SetFullscreenState(true); [_shell afterEvent]; }
 - (void)windowDidExitFullScreen:(NSNotification*)n { (void)n; _mv->SetFullscreenState(false); [self relayoutTrafficLightsSoon]; [_shell afterEvent]; }
@@ -744,8 +761,10 @@ static NSEventModifierFlags MacMods(unsigned m) {
     [_statsTimer invalidate];
     if (_pressMonitor) { [NSEvent removeMonitor:_pressMonitor]; _pressMonitor = nil; }
     if (_settings) _settings->Close();
+    if (_props) _props->Close();
     if (_mv) _mv->Shutdown();   // settings.json (window placement, current playlist), the resume position
     _settings.reset();
+    _props.reset();
     menuwindows::Detach();
     if (_mv) popupdismiss::Unwatch(_mv->host);
     _mv.reset();                // controller, then FfPlayer (ffp_destroy) and its presenter
@@ -2279,12 +2298,14 @@ struct AvSample { double avMs, audio, video, at; long long dropsLate; };
         for (const auto& n : dead) deadList += (deadList.empty() ? "" : ", ") + n;
         snprintf(what, sizeof what, "every shortcut the pui menu shows is a menu-bar key equivalent or in the key table (dead: %s)", deadList.empty() ? "none" : deadList.c_str());
         check(dead.empty() && !shown.empty(), what);
-        // ⌘I through the menu bar's key equivalents runs Properties (the dialog opens)
+        // ⌘I through the menu bar's key equivalents runs Properties (the window opens)
         NSEvent* cmdI = [NSEvent keyEventWithType:NSEventTypeKeyDown location:NSZeroPoint modifierFlags:NSEventModifierFlagCommand timestamp:0
                                      windowNumber:self->_window.windowNumber context:nil characters:@"i" charactersIgnoringModifiers:@"i" isARepeat:NO keyCode:34];
         const BOOL handled = [NSApp.mainMenu performKeyEquivalent:cmdI];
         [self after:0.3 run:^{
-            check(handled && mv->host.PopupCount() == 1, "⌘I (shown for Properties) opens the properties dialog through the menu bar");
+            check(handled && self->_props && self->_props->IsOpen() && mv->host.PopupCount() == 0,
+                  "⌘I (shown for Properties) opens the Properties window through the menu bar");
+            if (self->_props) self->_props->Close();
             mv->host.CloseAllPopups();
             // the mini player item's icon follows the mode
             mv->Execute(app::CommandId::ToggleMiniPlayer);
