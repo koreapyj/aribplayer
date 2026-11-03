@@ -113,8 +113,8 @@ std::string OptionValue(const wvp::OpenOptions& o, const std::string& key) {
     return {};
 }
 
-/// ARIBPLAYER_SELFTEST_EXPECT_SW_DECODE=1, for a machine whose VideoToolbox has no hardware H.264 / HEVC decoder (the
-/// macOS 14 CI VM): the H.264 and HEVC clips are checked on the planner's software decode path (no hwaccel, frame_path
+/// ARIBPLAYER_SELFTEST_EXPECT_SW_DECODE=1, for a machine whose VideoToolbox has no hardware H.264 / HEVC decoder (a
+/// CI VM): the H.264 and HEVC clips are checked on the planner's software decode path (no hwaccel, frame_path
 /// software, the S/W chip, system frames uploaded by the presenter) instead of VideoToolbox zero-copy. The startup step
 /// fails when VideoToolbox does report a hardware decoder.
 bool ExpectSoftwareDecode() {
@@ -3587,11 +3587,12 @@ typedef void (^ParityCheck)(bool, const char*);
         check(!self->_settings->PlayerInFront() && sw.level == F && settingsFront, what3);
         setMode(M::WhenPlaying);
         player->Pause();
-        [self waitFor:^bool { return player->State() == wvp::PlayerState::Paused; } seconds:3 then:^{
+        // The player's state is set on its own thread; the level follows when StateChanged reaches the main queue.
+        [self waitFor:^bool { return player->State() == wvp::PlayerState::Paused && self->_window.level == N && sw.level == N; } seconds:3 then:^{
             check(self->_window.level == N && sw.level == N && [self window:sw inFrontOf:self->_window],
                   "While playing + pause: the player leaves the band and Settings follows, still in front");
             player->Play();
-            [self waitFor:^bool { return player->State() == wvp::PlayerState::Playing; } seconds:3 then:^{
+            [self waitFor:^bool { return player->State() == wvp::PlayerState::Playing && self->_window.level == F && sw.level == F; } seconds:3 then:^{
                 check(self->_window.level == F && sw.level == F && [self window:sw inFrontOf:self->_window],
                       "playing again: both back in the band, Settings in front");
                 setMode(M::Disable);
